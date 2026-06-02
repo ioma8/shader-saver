@@ -22,6 +22,10 @@ import Metal
     #expect(ShaderSource.metal.contains("float2 zx = p.zx * float2x2(m.x, m.y, m.z, m.w);"))
 }
 
+@Test func shaderAddsSlightlyStrongerTimeDrivenTurbulence() {
+    #expect(ShaderSource.metal.contains("p += 1.08 * sin(p.yzx * d + t * 0.2) / d;"))
+}
+
 @Test func shaderSourceCompilesIntoMetalLibrary() throws {
     let device = try #require(MTLCreateSystemDefaultDevice())
     #expect(throws: Never.self) {

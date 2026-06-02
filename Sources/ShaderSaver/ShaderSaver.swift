@@ -204,7 +204,7 @@ enum ShaderSource {
             p.zx = zx;
             v = p;
             for (d = 1.0; d < i; d += d) {
-                p += sin(p.yzx * d) / d;
+                p += 1.08 * sin(p.yzx * d + t * 0.2) / d;
             }
             z += d = 0.2 * max(0.03 + abs((s = cos(3.0 * p.y))) * 0.1, length(v) - 1.0);
             o += (cos(s / 0.4 + p.y + float4(6.0, 1.0, 3.0, 0.0)) + 1.5) / d / z;
