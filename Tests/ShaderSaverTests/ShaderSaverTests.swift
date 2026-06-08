@@ -10,20 +10,40 @@ import Metal
 }
 
 @Test func shaderPreservesShadertoyCoordinateSemantics() {
-    #expect(ShaderSource.metal.contains("float4 FC = float4(fragCoord, 0.5, 1.0);"))
+    #expect(ShaderSource.metal.contains("float2 uv = (fragCoord - r * 0.5) / r.y;"))
+}
+
+@Test func shaderFadesTowardScreenEdges() {
+    #expect(ShaderSource.metal.contains("o.rgb *= 0.88 + 0.12 * exp(-length(uv) * 1.4);"))
+}
+
+@Test func shaderBreaksTheSphericalDistanceField() {
+    #expect(ShaderSource.metal.contains("float core = smoothstep(1.55, 0.15, length(q * float3(0.78, 1.02, 0.78)));"))
+    #expect(ShaderSource.metal.contains("float haze = smoothstep(2.1, 0.35, length(q * float3(0.58, 0.86, 0.58)));"))
 }
 
 @Test func shaderRunsAtHalfOriginalTimeSpeed() {
-    #expect(ShaderSource.metal.contains("float t = uniforms.time * 0.5;"))
+    #expect(ShaderSource.metal.contains("float t = uniforms.time / 10.0;"))
+    #expect(ShaderSource.metal.contains("float flow = uniforms.time * 0.22;"))
 }
 
 @Test func shaderUsesRawCosineMatrixInsteadOfRotationRewrite() {
-    #expect(ShaderSource.metal.contains("float4 m = cos(p.y + t + float4(0.0, 11.0, 33.0, 0.0));"))
-    #expect(ShaderSource.metal.contains("float2 zx = p.zx * float2x2(m.x, m.y, m.z, m.w);"))
+    #expect(ShaderSource.metal.contains("float2x2 rotation = float2x2(cos(t), -sin(t), sin(t), cos(t));"))
+    #expect(ShaderSource.metal.contains("ro.xz = rotation * ro.xz;"))
 }
 
 @Test func shaderAddsSlightlyStrongerTimeDrivenTurbulence() {
-    #expect(ShaderSource.metal.contains("p += 1.08 * sin(p.yzx * d + t * 0.2) / d;"))
+    #expect(ShaderSource.metal.contains("q += 0.35 * sin(q.yzx * 1.4 + flow);"))
+    #expect(ShaderSource.metal.contains("q += 0.22 * sin(q.zxy * 2.1 - flow * 0.8);"))
+    #expect(ShaderSource.metal.contains("q += 0.12 * sin(q.xyz * 4.0 + float3(flow * 1.1, -flow * 0.9, flow * 0.7));"))
+}
+
+@Test func shaderBlendsMultipleLiquidColorBands() {
+    #expect(ShaderSource.metal.contains("float swirlA = 0.5 + 0.5 * sin(q.x * 1.5 + q.y * 0.9 + flow * 0.8);"))
+    #expect(ShaderSource.metal.contains("float swirlB = 0.5 + 0.5 * sin(q.z * 1.9 - q.x * 0.7 - flow * 0.6);"))
+    #expect(ShaderSource.metal.contains("float3 colorA = float3(1.02, 0.34, 0.14);"))
+    #expect(ShaderSource.metal.contains("float3 colorB = float3(0.92, 0.18, 0.30);"))
+    #expect(ShaderSource.metal.contains("float3 colorC = float3(0.98, 0.72, 0.22);"))
 }
 
 @Test func shaderSourceCompilesIntoMetalLibrary() throws {

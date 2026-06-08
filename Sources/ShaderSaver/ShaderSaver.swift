@@ -190,27 +190,41 @@ enum ShaderSource {
         constant Uniforms& uniforms [[buffer(0)]]
     ) {
         float2 r = uniforms.resolution;
-        float t = uniforms.time * 0.5;
+        float t = uniforms.time / 10.0;
+        float flow = uniforms.time * 0.22;
         float2 fragCoord = in.position.xy;
-        float4 FC = float4(fragCoord, 0.5, 1.0);
+        float2 uv = (fragCoord - r * 0.5) / r.y;
+        float2x2 rotation = float2x2(cos(t), -sin(t), sin(t), cos(t));
+        float3 ro = float3(0.0, 0.0, -3.2);
+        float3 rd = normalize(float3(uv, 1.1));
+        ro.xz = rotation * ro.xz;
+        rd.xz = rotation * rd.xz;
         float4 o = float4(0.0);
 
-        for (float i = 0.0, z = 0.0, d = 0.0, s = 0.0; i++ < 1e2;) {
-            float3 v;
-            float3 p = z * normalize(FC.rgb * 2.0 - float3(r.x, r.y, r.y));
-            p.z += 2.0;
-            float4 m = cos(p.y + t + float4(0.0, 11.0, 33.0, 0.0));
-            float2 zx = p.zx * float2x2(m.x, m.y, m.z, m.w);
-            p.zx = zx;
-            v = p;
-            for (d = 1.0; d < i; d += d) {
-                p += 1.08 * sin(p.yzx * d + t * 0.2) / d;
-            }
-            z += d = 0.2 * max(0.03 + abs((s = cos(3.0 * p.y))) * 0.1, length(v) - 1.0);
-            o += (cos(s / 0.4 + p.y + float4(6.0, 1.0, 3.0, 0.0)) + 1.5) / d / z;
+        for (float i = 0.0, z = 0.0; i++ < 90.0;) {
+            float3 p = ro + rd * z;
+            float3 q = p;
+            q += 0.35 * sin(q.yzx * 1.4 + flow);
+            q += 0.22 * sin(q.zxy * 2.1 - flow * 0.8);
+            q += 0.12 * sin(q.xyz * 4.0 + float3(flow * 1.1, -flow * 0.9, flow * 0.7));
+
+            float core = smoothstep(1.55, 0.15, length(q * float3(0.78, 1.02, 0.78)));
+            float haze = smoothstep(2.1, 0.35, length(q * float3(0.58, 0.86, 0.58)));
+            float density = max(core, haze * 0.45);
+            float swirlA = 0.5 + 0.5 * sin(q.x * 1.5 + q.y * 0.9 + flow * 0.8);
+            float swirlB = 0.5 + 0.5 * sin(q.z * 1.9 - q.x * 0.7 - flow * 0.6);
+            float3 colorA = float3(1.02, 0.34, 0.14);
+            float3 colorB = float3(0.92, 0.18, 0.30);
+            float3 colorC = float3(0.98, 0.72, 0.22);
+            float3 color = mix(colorA, colorB, swirlA);
+            color = mix(color, colorC, swirlB * 0.38);
+
+            o.rgb += color * density * 0.05;
+            z += 0.045 + 0.02 * z;
         }
 
-        o = tanh(o / 1e4);
+        o = tanh(o * 1.75);
+        o.rgb *= 0.88 + 0.12 * exp(-length(uv) * 1.4);
         o.a = 1.0;
         return o;
     }
