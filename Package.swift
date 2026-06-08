@@ -15,6 +15,9 @@ let package = Package(
         .executableTarget(
             name: "STLViewer"
         ),
+        .executableTarget(
+            name: "ImageProcessor"
+        ),
         .testTarget(
             name: "ShaderSaverTests",
             dependencies: ["ShaderSaver"]
