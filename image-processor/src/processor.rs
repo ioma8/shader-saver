@@ -448,6 +448,13 @@ impl Processor {
         if q3 > 0.80 {
             self.highlights = (-(q3 - 0.80) * 250.0).clamp(-50.0, 0.0);
         }
+
+        // Contrast: a flat image bunches its quartiles together. Widen the
+        // interquartile range toward ~0.32 with the S-curve; never reduce.
+        let iqr = (q3 - q1).max(0.01);
+        if iqr < 0.32 {
+            self.contrast = ((0.32 / iqr - 1.0) * 45.0).clamp(0.0, 70.0);
+        }
     }
 
     pub fn load_image(&mut self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
