@@ -20,8 +20,8 @@ fn load_clamped(x: i32, y: i32, dims: vec2<u32>) -> vec4<f32> {
     return textureLoad(input_tex, vec2<i32>(cx, cy), 0);
 }
 
-// params: v0=contrast, v1=levels_black (0-255), v2=levels_white (0-255),
-//         v3=levels_gamma, v4=exposure (stops)
+// params: v0=contrast (-100..100), v1=levels_black (0-255),
+//         v2=levels_white (0-255), v3=levels_gamma, v4=exposure (stops)
 @compute @workgroup_size(8, 8)
 fn contrast_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = textureDimensions(input_tex);
@@ -39,8 +39,21 @@ fn contrast_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
     var rgb = clamp((exposed - black) / range, vec3<f32>(0.0), vec3<f32>(1.0));
     rgb = pow(rgb, vec3<f32>(1.0 / max(params.v3, 0.01)));
 
-    // Contrast S-curve around midpoint
-    rgb = clamp((rgb - 0.5) * params.v0 + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+    // Contrast: normalized logistic S-curve. Endpoints map exactly to 0 and 1
+    // (no clipping) and the curve approaches identity as the slider nears 0.
+    // Negative values apply the inverse sigmoid for smooth contrast reduction.
+    let cs = params.v0 * 0.01;
+    if abs(cs) > 0.001 {
+        let k  = abs(cs) * 10.0;
+        let s0 = 1.0 / (1.0 + exp(0.5 * k));
+        let s1 = 1.0 / (1.0 + exp(-0.5 * k));
+        if cs > 0.0 {
+            rgb = (1.0 / (1.0 + exp(-k * (rgb - 0.5))) - s0) / (s1 - s0);
+        } else {
+            let u = clamp(s0 + rgb * (s1 - s0), vec3<f32>(1e-5), vec3<f32>(1.0 - 1e-5));
+            rgb = 0.5 - log(1.0 / u - 1.0) / k;
+        }
+    }
 
     // Tone curve (Photoshop-style curves; identity LUT when no points added)
     rgb = vec3<f32>(curve_apply(rgb.r), curve_apply(rgb.g), curve_apply(rgb.b));

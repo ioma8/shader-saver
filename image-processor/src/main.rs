@@ -571,7 +571,7 @@ impl App {
 
                         slider_row!("EXPOSURE",            processor.exposure,            -3.0..=3.0,   0.0, false);
                         slider_row!("BRIGHTNESS",          processor.brightness,          -100.0..=100.0, 0.0, true);
-                        slider_row!("CONTRAST",            processor.contrast,            0.5..=2.0,    1.0, false);
+                        slider_row!("CONTRAST",            processor.contrast,            -100.0..=100.0, 0.0, true);
                         slider_row!("BOX BLUR RADIUS",     processor.blur_radius,         0.0..=15.0,   0.0, true);
                         slider_row!("UNSHARP STRENGTH",    processor.unsharp_strength,    0.0..=3.0,    0.0, false);
                         slider_row!("UNSHARP BLUR RADIUS", processor.unsharp_blur_radius, 1.0..=10.0,   2.0, true);
