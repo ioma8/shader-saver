@@ -530,8 +530,7 @@ impl App {
                             }
                         });
 
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new("IMAGE").small().color(egui::Color32::from_gray(140)));
+                        ui.add_space(6.0);
                         if ui.button("Open Image…").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("Image", &["png", "jpg", "jpeg", "tiff", "tif", "bmp"])
@@ -541,49 +540,60 @@ impl App {
                             }
                         }
                         ui.separator();
-                        ui.add_space(4.0);
+                        ui.spacing_mut().item_spacing.y = 3.0;
 
+                        // Compact one-line rows: fixed-width label left, slider right
                         macro_rules! slider_row {
                             ($label:expr, $field:expr, $range:expr, $default:expr, $integer:expr) => {{
-                                ui.label(egui::RichText::new($label).small().color(egui::Color32::from_gray(140)));
-                                let mut s = egui::Slider::new(&mut $field, $range).show_value(true);
-                                if $integer { s = s.integer(); }
-                                let r = ui.add(s);
-                                // r.double_clicked() only fires on the text input (click sense).
-                                // Also check raw input so double-clicking the track/thumb resets too.
-                                let double_clicked = r.double_clicked()
-                                    || ctx.input(|i| {
-                                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                                            && i.pointer
-                                                .interact_pos()
-                                                .map(|p| r.rect.contains(p))
-                                                .unwrap_or(false)
-                                    });
-                                if double_clicked {
-                                    $field = $default;
-                                    needs_process = true;
-                                } else if r.changed() {
-                                    needs_process = true;
-                                }
-                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(74.0, 18.0),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(egui::Label::new(
+                                                egui::RichText::new($label).small().color(egui::Color32::from_gray(140)),
+                                            ).truncate());
+                                        },
+                                    );
+                                    ui.spacing_mut().slider_width = ui.available_width() - 48.0;
+                                    let mut s = egui::Slider::new(&mut $field, $range).show_value(true);
+                                    if $integer { s = s.integer(); }
+                                    let r = ui.add(s);
+                                    // r.double_clicked() only fires on the text input (click sense).
+                                    // Also check raw input so double-clicking the track/thumb resets too.
+                                    let double_clicked = r.double_clicked()
+                                        || ctx.input(|i| {
+                                            i.pointer.button_double_clicked(egui::PointerButton::Primary)
+                                                && i.pointer
+                                                    .interact_pos()
+                                                    .map(|p| r.rect.contains(p))
+                                                    .unwrap_or(false)
+                                        });
+                                    if double_clicked {
+                                        $field = $default;
+                                        needs_process = true;
+                                    } else if r.changed() {
+                                        needs_process = true;
+                                    }
+                                });
                             }};
                         }
 
-                        slider_row!("EXPOSURE",            processor.exposure,            -3.0..=3.0,   0.0, false);
-                        slider_row!("BRIGHTNESS",          processor.brightness,          -100.0..=100.0, 0.0, true);
-                        slider_row!("CONTRAST",            processor.contrast,            -100.0..=100.0, 0.0, true);
-                        slider_row!("BOX BLUR RADIUS",     processor.blur_radius,         0.0..=15.0,   0.0, true);
-                        slider_row!("UNSHARP STRENGTH",    processor.unsharp_strength,    0.0..=3.0,    0.0, false);
-                        slider_row!("UNSHARP BLUR RADIUS", processor.unsharp_blur_radius, 1.0..=10.0,   2.0, true);
-
+                        slider_row!("TEMP",       processor.wb_temp,    -100.0..=100.0, 0.0, true);
+                        slider_row!("TINT",       processor.wb_tint,    -100.0..=100.0, 0.0, true);
                         ui.separator();
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new("TONE").small().color(egui::Color32::from_gray(140)));
-                        ui.add_space(4.0);
+                        slider_row!("EXPOSURE",   processor.exposure,   -3.0..=3.0,     0.0, false);
+                        slider_row!("BRIGHTNESS", processor.brightness, -100.0..=100.0, 0.0, true);
+                        slider_row!("CONTRAST",   processor.contrast,   -100.0..=100.0, 0.0, true);
+                        ui.separator();
                         slider_row!("BLACKS",     processor.blacks,     -100.0..=100.0, 0.0, true);
                         slider_row!("SHADOWS",    processor.shadows,    -100.0..=100.0, 0.0, true);
                         slider_row!("HIGHLIGHTS", processor.highlights, -100.0..=100.0, 0.0, true);
                         slider_row!("WHITES",     processor.whites,     -100.0..=100.0, 0.0, true);
+                        ui.separator();
+                        slider_row!("BLUR",       processor.blur_radius,         0.0..=15.0, 0.0, true);
+                        slider_row!("SHARPEN",    processor.unsharp_strength,    0.0..=3.0,  0.0, false);
+                        slider_row!("SHARP RAD",  processor.unsharp_blur_radius, 1.0..=10.0, 2.0, true);
 
                         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                             ui.add_space(8.0);

@@ -21,23 +21,46 @@ fn load_clamped(x: i32, y: i32, dims: vec2<u32>) -> vec4<f32> {
 }
 
 // params: v0=contrast (-100..100), v1=levels_black (0-255),
-//         v2=levels_white (0-255), v3=levels_gamma, v4=exposure (stops)
+//         v2=levels_white (0-255), v3=levels_gamma, v4=exposure (stops),
+//         v5=wb temperature (-100..100), v6=wb tint (-100..100)
+// All tonal math (levels, gamma, contrast, curve) runs on LUMINANCE and is
+// applied back as a uniform RGB scale, so colors never shift. Only white
+// balance touches channels individually — that is its job.
 @compute @workgroup_size(8, 8)
 fn contrast_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = textureDimensions(input_tex);
     if gid.x >= dims.x || gid.y >= dims.y { return; }
     let c = textureLoad(input_tex, vec2<i32>(gid.xy), 0);
+    let lum_w = vec3<f32>(0.2126, 0.7152, 0.0722);
 
     // Exposure: 2^ev gain in linear light. Values here are gamma-encoded, and
     // with a power-law gamma that is exactly a 2^(ev/2.2) scale on them.
-    let exposed = c.rgb * exp2(params.v4 * 0.4545);
+    var rgb = c.rgb * exp2(params.v4 * 0.4545);
+
+    // White balance: temperature (blue↔yellow) and tint (green↔magenta).
+    // Linear-light channel gains, normalized to unit luminance so overall
+    // brightness stays put, then converted to gamma-encoded gains.
+    let t = params.v5 * 0.01;
+    let g = params.v6 * 0.01;
+    if abs(t) > 0.001 || abs(g) > 0.001 {
+        var gains = vec3<f32>(
+            1.0 + 0.30 * t + 0.10 * g,
+            1.0 - 0.20 * g,
+            1.0 - 0.30 * t + 0.10 * g,
+        );
+        gains = gains / dot(lum_w, gains);
+        rgb = rgb * pow(max(gains, vec3<f32>(0.0)), vec3<f32>(0.4545));
+    }
+
+    // From here on: operate on luminance only
+    let lum = dot(rgb, lum_w);
 
     // Levels: remap [black, white] → [0, 1] then apply midtone gamma
     let black = params.v1 / 255.0;
     let white = params.v2 / 255.0;
     let range = max(white - black, 0.001);
-    var rgb = clamp((exposed - black) / range, vec3<f32>(0.0), vec3<f32>(1.0));
-    rgb = pow(rgb, vec3<f32>(1.0 / max(params.v3, 0.01)));
+    var l = clamp((lum - black) / range, 0.0, 1.0);
+    l = pow(l, 1.0 / max(params.v3, 0.01));
 
     // Contrast: normalized logistic S-curve. Endpoints map exactly to 0 and 1
     // (no clipping) and the curve approaches identity as the slider nears 0.
@@ -48,16 +71,20 @@ fn contrast_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
         let s0 = 1.0 / (1.0 + exp(0.5 * k));
         let s1 = 1.0 / (1.0 + exp(-0.5 * k));
         if cs > 0.0 {
-            rgb = (1.0 / (1.0 + exp(-k * (rgb - 0.5))) - s0) / (s1 - s0);
+            l = (1.0 / (1.0 + exp(-k * (l - 0.5))) - s0) / (s1 - s0);
         } else {
-            let u = clamp(s0 + rgb * (s1 - s0), vec3<f32>(1e-5), vec3<f32>(1.0 - 1e-5));
-            rgb = 0.5 - log(1.0 / u - 1.0) / k;
+            let u = clamp(s0 + l * (s1 - s0), 1e-5, 1.0 - 1e-5);
+            l = 0.5 - log(1.0 / u - 1.0) / k;
         }
     }
 
     // Tone curve (Photoshop-style curves; identity LUT when no points added)
-    rgb = vec3<f32>(curve_apply(rgb.r), curve_apply(rgb.g), curve_apply(rgb.b));
-    textureStore(output_tex, vec2<i32>(gid.xy), vec4<f32>(rgb, c.a));
+    l = curve_apply(l);
+
+    // Apply the luminance change as a hue-preserving uniform scale
+    let scale = select(l / lum, 1.0, lum < 0.001);
+    let outc = clamp(rgb * scale, vec3<f32>(0.0), vec3<f32>(1.0));
+    textureStore(output_tex, vec2<i32>(gid.xy), vec4<f32>(outc, c.a));
 }
 
 // Separable box blur — horizontal pass (params.v0 = radius)
