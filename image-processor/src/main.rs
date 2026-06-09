@@ -546,16 +546,22 @@ impl App {
                         macro_rules! slider_row {
                             ($label:expr, $field:expr, $range:expr, $default:expr, $integer:expr) => {{
                                 ui.horizontal(|ui| {
-                                    ui.allocate_ui_with_layout(
+                                    // Fixed-size label slot painted directly, so every
+                                    // slider starts and ends at the same x.
+                                    let (lrect, _) = ui.allocate_exact_size(
                                         egui::vec2(74.0, 18.0),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            ui.add(egui::Label::new(
-                                                egui::RichText::new($label).small().color(egui::Color32::from_gray(140)),
-                                            ).truncate());
-                                        },
+                                        egui::Sense::hover(),
                                     );
-                                    ui.spacing_mut().slider_width = ui.available_width() - 48.0;
+                                    ui.painter().text(
+                                        lrect.left_center(),
+                                        egui::Align2::LEFT_CENTER,
+                                        $label,
+                                        egui::FontId::proportional(10.0),
+                                        egui::Color32::from_gray(140),
+                                    );
+                                    ui.spacing_mut().interact_size.x = 46.0;
+                                    ui.spacing_mut().slider_width =
+                                        ui.available_width() - 46.0 - ui.spacing().item_spacing.x * 2.0;
                                     let mut s = egui::Slider::new(&mut $field, $range).show_value(true);
                                     if $integer { s = s.integer(); }
                                     let r = ui.add(s);
