@@ -1,7 +1,9 @@
 use std::path::Path;
 
 // Everything that defines an image's edit, serialized to SQLite as JSON.
+// serde(default) keeps old DB rows loadable when new fields are added.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(default)]
 pub struct EditState {
     pub exposure: f32,
     pub brightness: f32,
@@ -18,6 +20,8 @@ pub struct EditState {
     pub shadows: f32,
     pub highlights: f32,
     pub whites: f32,
+    pub vignette: f32,
+    pub vignette_mid: f32,
     pub curve_points: Vec<[f32; 2]>,
 }
 
@@ -39,6 +43,8 @@ impl Default for EditState {
             shadows: 0.0,
             highlights: 0.0,
             whites: 0.0,
+            vignette: 0.0,
+            vignette_mid: 50.0,
             curve_points: vec![[0.0, 0.0], [1.0, 1.0]],
         }
     }
@@ -87,6 +93,8 @@ pub struct Processor {
     pub highlights: f32,
     pub whites: f32,
     pub brightness: f32,
+    pub vignette: f32,     // -100..100, negative darkens corners
+    pub vignette_mid: f32, // 0..100, where the falloff starts
     // Tone curve control points, normalized [0,1]², sorted by x.
     // Always at least the two endpoints; identity = [[0,0],[1,1]].
     pub curve_points: Vec<[f32; 2]>,
@@ -272,6 +280,8 @@ impl Processor {
             highlights: 0.0,
             whites: 0.0,
             brightness: 0.0,
+            vignette: 0.0,
+            vignette_mid: 50.0,
             curve_points: vec![[0.0, 0.0], [1.0, 1.0]],
         }
     }
@@ -355,6 +365,8 @@ impl Processor {
             shadows: self.shadows,
             highlights: self.highlights,
             whites: self.whites,
+            vignette: self.vignette,
+            vignette_mid: self.vignette_mid,
             curve_points: self.curve_points.clone(),
         }
     }
@@ -375,11 +387,67 @@ impl Processor {
         self.shadows = s.shadows;
         self.highlights = s.highlights;
         self.whites = s.whites;
+        self.vignette = s.vignette;
+        self.vignette_mid = s.vignette_mid;
         self.curve_points = if s.curve_points.len() >= 2 {
             s.curve_points.clone()
         } else {
             vec![[0.0, 0.0], [1.0, 1.0]]
         };
+    }
+
+    // Derive auto adjustments from the luminance histogram. Call with the
+    // histogram of the UNEDITED image (reset + process first).
+    pub fn auto_adjust(&mut self) {
+        let total: u64 = self.histogram.iter().map(|&c| c as u64).sum();
+        if total == 0 {
+            return;
+        }
+        // Luminance value (0-255) below which fraction p of all pixels fall
+        let pct = |p: f64| -> f32 {
+            let target = (total as f64 * p) as u64;
+            let mut cum = 0u64;
+            for (i, &c) in self.histogram.iter().enumerate() {
+                cum += c as u64;
+                if cum >= target {
+                    return i as f32;
+                }
+            }
+            255.0
+        };
+
+        // Levels: trim the empty tails, clipping 0.1% of pixels per side
+        let mut black = pct(0.001);
+        let mut white = pct(0.999);
+        if white - black < 32.0 {
+            // Degenerate histogram (flat/synthetic image) — clamp gently
+            black = black.min(64.0);
+            white = white.max(192.0);
+        }
+        self.levels_black = black.clamp(0.0, 254.0);
+        self.levels_white = white.clamp(self.levels_black + 1.0, 255.0);
+
+        // Where key percentiles land AFTER the levels remap
+        let remap = |v: f32| ((v - black) / (white - black).max(1.0)).clamp(0.0, 1.0);
+
+        // Brightness: pick the Schlick bias that moves the median to ~0.45
+        let m = remap(pct(0.5));
+        if m > 0.02 && m < 0.98 {
+            let target = 0.45;
+            let b = 1.0 / (2.0 + (m / target - 1.0) / (1.0 - m));
+            self.brightness = ((b - 0.5) / 0.0025).clamp(-60.0, 60.0);
+        }
+
+        // Open shadows if the lower quartile is crushed; recover highlights
+        // if the upper quartile crowds the white point
+        let q1 = remap(pct(0.25));
+        if q1 < 0.20 {
+            self.shadows = ((0.20 - q1) * 250.0).clamp(0.0, 50.0);
+        }
+        let q3 = remap(pct(0.75));
+        if q3 > 0.80 {
+            self.highlights = (-(q3 - 0.80) * 250.0).clamp(-50.0, 0.0);
+        }
     }
 
     pub fn load_image(&mut self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
@@ -470,7 +538,7 @@ impl Processor {
         };
 
         queue.write_buffer(&self.contrast_buf, 0, bytemuck::cast_slice(&[self.contrast, self.levels_black, self.levels_white, self.levels_gamma, self.exposure, self.wb_temp, self.wb_tint, 0f32]));
-        queue.write_buffer(&self.tonal_buf,    0, bytemuck::cast_slice(&[self.blacks, self.shadows, self.highlights, self.whites, self.brightness, 0f32, 0f32, 0f32]));
+        queue.write_buffer(&self.tonal_buf,    0, bytemuck::cast_slice(&[self.blacks, self.shadows, self.highlights, self.whites, self.brightness, self.vignette, self.vignette_mid, 0f32]));
         queue.write_buffer(&self.blur_buf,     0, bytemuck::cast_slice(&[self.blur_radius, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32]));
         queue.write_buffer(&self.sharpen_buf,  0, bytemuck::cast_slice(&[self.unsharp_strength, self.unsharp_blur_radius, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32]));
         let lut = self.curve_lut();

@@ -16,6 +16,7 @@ use winit::window::{Window, WindowId};
 const KEY_OPEN_PATH: &str = "open_path";
 const KEY_EXPORT_PATH: &str = "export_path";
 const KEY_SCAN_DIR: &str = "scan_dir";
+const KEY_AUTO: &str = "auto_adjust";
 
 // ---- Edit persistence (SQLite, one JSON row per image path) ----
 
@@ -344,7 +345,7 @@ impl App {
         let original_tex_id = self.original_tex_id;
 
         // Scoped egui frame — all field borrows dropped at end of block
-        let (shapes, textures_delta, pixels_per_point, open_path, export_path, scan_dir, needs_process) = {
+        let (shapes, textures_delta, pixels_per_point, open_path, export_path, scan_dir, auto_req, mut needs_process) = {
             let window      = self.window.as_ref().unwrap();
             let egui_state  = self.egui_state.as_mut().unwrap();
             let processor   = self.processor.as_mut().unwrap();
@@ -819,14 +820,23 @@ impl App {
                         });
 
                         ui.add_space(6.0);
-                        if ui.button("Open Image…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Images", &imgload::all_exts())
-                                .pick_file()
-                            {
-                                ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_OPEN_PATH), path));
+                        ui.horizontal(|ui| {
+                            if ui.button("Open Image…").clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Images", &imgload::all_exts())
+                                    .pick_file()
+                                {
+                                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_OPEN_PATH), path));
+                                }
                             }
-                        }
+                            if ui
+                                .add_enabled(processor.has_image(), egui::Button::new("Auto"))
+                                .on_hover_text("Auto levels + brightness/shadows/highlights")
+                                .clicked()
+                            {
+                                ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_AUTO), true));
+                            }
+                        });
                         ui.separator();
                         ui.spacing_mut().item_spacing.y = 3.0;
 
@@ -888,6 +898,9 @@ impl App {
                         slider_row!("BLUR",       processor.blur_radius,         0.0..=15.0, 0.0, true);
                         slider_row!("SHARPEN",    processor.unsharp_strength,    0.0..=3.0,  0.0, false);
                         slider_row!("SHARP RAD",  processor.unsharp_blur_radius, 1.0..=10.0, 2.0, true);
+                        ui.separator();
+                        slider_row!("VIGNETTE",   processor.vignette,     -100.0..=100.0, 0.0,  true);
+                        slider_row!("VIG MID",    processor.vignette_mid, 0.0..=100.0,    50.0, true);
 
                         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                             ui.add_space(8.0);
@@ -1049,9 +1062,11 @@ impl App {
                 self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_EXPORT_PATH)));
             let scan_dir: Option<PathBuf> =
                 self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_SCAN_DIR)));
+            let auto_req: Option<bool> =
+                self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_AUTO)));
 
             (full_output.shapes, full_output.textures_delta, full_output.pixels_per_point,
-             open_path, export_path, scan_dir, needs_process)
+             open_path, export_path, scan_dir, auto_req.is_some(), needs_process)
         }; // all field borrows dropped here
 
         // File ops
@@ -1064,6 +1079,20 @@ impl App {
         if let Some(path) = export_path {
             if let (Some(proc), Some(gpu)) = (&self.processor, &self.gpu) {
                 proc.export(&path, &gpu.device, &gpu.queue);
+            }
+        }
+
+        // Auto adjust: reset to neutral, refresh the histogram from the
+        // original image, derive the auto values, then let the normal
+        // needs_process path re-process and persist them.
+        if auto_req {
+            if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
+                if proc.has_image() {
+                    proc.apply_edit_state(&EditState::default());
+                    proc.process(&gpu.device, &gpu.queue);
+                    proc.auto_adjust();
+                    needs_process = true;
+                }
             }
         }
 

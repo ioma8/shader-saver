@@ -147,7 +147,8 @@ fn sharpen_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Tonal adjustments — params: v0..v3 = blacks, shadows, highlights, whites
-// (each -100..100), v4 = brightness (-100..100).
+// (each -100..100), v4 = brightness (-100..100),
+// v5 = vignette amount (-100..100), v6 = vignette midpoint (0..100).
 // Lightroom-style zones: shadows/highlights are endpoint-anchored bumps,
 // blacks/whites shift the endpoints themselves. Brightness is a Schlick
 // bias curve on luminance (Capture One-style midtone lift, endpoints fixed).
@@ -160,7 +161,7 @@ fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = textureLoad(input_tex, vec2<i32>(gid.xy), 0);
 
     if params.v0 == 0.0 && params.v1 == 0.0 && params.v2 == 0.0
-        && params.v3 == 0.0 && params.v4 == 0.0 {
+        && params.v3 == 0.0 && params.v4 == 0.0 && params.v5 == 0.0 {
         textureStore(output_tex, vec2<i32>(gid.xy), c);
         return;
     }
@@ -200,6 +201,19 @@ fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Proportional RGB scale preserves hue; fall back to 1.0 for near-black pixels
     let scale = select(new_lum / lum, 1.0, lum < 0.001);
-    textureStore(output_tex, vec2<i32>(gid.xy),
-        vec4<f32>(clamp(c.rgb * scale, vec3<f32>(0.0), vec3<f32>(1.0)), c.a));
+    var rgb = clamp(c.rgb * scale, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Vignette: radial falloff from the midpoint to the corners.
+    // Negative darkens the corners (classic), positive brightens.
+    let vig = params.v5 * 0.01;
+    if abs(vig) > 0.001 {
+        let dimf = vec2<f32>(f32(dims.x), f32(dims.y));
+        let p = (vec2<f32>(f32(gid.x), f32(gid.y)) + 0.5) / dimf * 2.0 - 1.0;
+        let r = length(p) * 0.70710678; // 0 at center, 1 at the corner
+        let mid = clamp(params.v6 * 0.01, 0.05, 0.95);
+        let fall = smoothstep(mid, 1.0, r);
+        rgb = clamp(rgb * (1.0 + vig * fall), vec3<f32>(0.0), vec3<f32>(1.0));
+    }
+
+    textureStore(output_tex, vec2<i32>(gid.xy), vec4<f32>(rgb, c.a));
 }
