@@ -64,7 +64,7 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("Image Processor")
-            .with_inner_size(PhysicalSize::new(1400u32, 900u32))
+            .with_inner_size(PhysicalSize::new(1800u32, 1100u32))
             .with_min_inner_size(PhysicalSize::new(700u32, 500u32));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
