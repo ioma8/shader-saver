@@ -1,0 +1,12 @@
+[package]
+name = "stl-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "22"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.28"
+rfd = "0.14"
+pollster = "0.3"
