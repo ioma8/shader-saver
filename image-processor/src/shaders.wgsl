@@ -102,7 +102,8 @@ fn sharpen_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Tonal adjustments — params: blacks, shadows, highlights, whites (each -100..100)
-// Zone weights form a partition of unity: at any luminance their sum == 1.
+// Lightroom-style zones: shadows/highlights are endpoint-anchored bumps,
+// blacks/whites shift the endpoints themselves.
 // Adjustment is applied as a luminance-proportional scale to preserve hue.
 @compute @workgroup_size(8, 8)
 fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -116,22 +117,31 @@ fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Scale: ÷100 maps slider range to [-1,1], ×0.4 sets max luminance shift to ±0.4
-    let blacks     = params.v0 * 0.004;
-    let shadows    = params.v1 * 0.004;
-    let highlights = params.v2 * 0.004;
-    let whites     = params.v3 * 0.004;
+    // ÷100 maps slider range to [-1, 1]
+    let blacks     = params.v0 * 0.01;
+    let shadows    = params.v1 * 0.01;
+    let highlights = params.v2 * 0.01;
+    let whites     = params.v3 * 0.01;
 
     let lum = dot(c.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let inv = 1.0 - lum;
 
-    // Four overlapping bands that partition luminance [0, 1] — weights sum to 1.0
-    let w_blacks     = 1.0 - smoothstep(0.0, 0.33, lum);
-    let w_shadows    = smoothstep(0.0, 0.33, lum) * (1.0 - smoothstep(0.33, 0.66, lum));
-    let w_highlights = smoothstep(0.33, 0.66, lum) * (1.0 - smoothstep(0.66, 1.0, lum));
-    let w_whites     = smoothstep(0.66, 1.0, lum);
+    // Shadows/highlights: polynomial bumps zero at BOTH endpoints, so the black
+    // and white points stay anchored (no haze when lifting shadows). Peaks are
+    // at lum 0.25 / 0.75 with broad falloff covering roughly half the range.
+    // 9.4815 = 1 / (0.25 * 0.75^3) normalizes the peak to 1.0.
+    let w_shadows    = 9.4815 * lum * inv * inv * inv;
+    let w_highlights = 9.4815 * lum * lum * lum * inv;
 
-    let delta   = w_blacks * blacks + w_shadows * shadows
-                + w_highlights * highlights + w_whites * whites;
+    // Blacks/whites: tight falloff from the endpoints — these intentionally
+    // move the black/white points themselves (clipping-style control).
+    let w_blacks = inv * inv * inv * inv * inv * inv;
+    let w_whites = lum * lum * lum * lum * lum * lum;
+
+    let delta = blacks * 0.25 * w_blacks
+              + shadows * 0.35 * w_shadows
+              + highlights * 0.35 * w_highlights
+              + whites * 0.25 * w_whites;
     let new_lum = clamp(lum + delta, 0.0, 1.0);
 
     // Proportional RGB scale preserves hue; fall back to 1.0 for near-black pixels
