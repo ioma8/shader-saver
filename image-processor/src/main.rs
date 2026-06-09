@@ -269,6 +269,44 @@ impl App {
                             painter.add(egui::Shape::Mesh(mesh));
                         }
 
+                        // Gradient strip + level markers
+                        let strip_h  = 8.0;
+                        let marker_h = 8.0;
+                        let (strip_area, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), strip_h + marker_h),
+                            egui::Sense::hover(),
+                        );
+                        let sp = ui.painter_at(strip_area);
+                        let grad = egui::Rect::from_min_size(strip_area.min, egui::vec2(strip_area.width(), strip_h));
+
+                        // Black → white gradient
+                        let uv = egui::epaint::WHITE_UV;
+                        let mut gm = egui::Mesh::default();
+                        let gv = gm.vertices.len() as u32;
+                        gm.vertices.extend([
+                            egui::epaint::Vertex { pos: grad.left_top(),     uv, color: egui::Color32::BLACK },
+                            egui::epaint::Vertex { pos: grad.right_top(),    uv, color: egui::Color32::WHITE },
+                            egui::epaint::Vertex { pos: grad.right_bottom(), uv, color: egui::Color32::WHITE },
+                            egui::epaint::Vertex { pos: grad.left_bottom(),  uv, color: egui::Color32::BLACK },
+                        ]);
+                        gm.indices.extend_from_slice(&[gv, gv+1, gv+2, gv, gv+2, gv+3]);
+                        sp.add(egui::Shape::Mesh(gm));
+
+                        // Triangle markers (pointing up, sitting below the gradient strip)
+                        let w   = strip_area.width();
+                        let ty  = grad.bottom();
+                        let by  = strip_area.bottom();
+                        let mk  = |cx: f32, fill: egui::Color32| {
+                            let cx = cx.clamp(strip_area.left() + 5.0, strip_area.right() - 5.0);
+                            egui::Shape::convex_polygon(
+                                vec![egui::pos2(cx, ty), egui::pos2(cx - 5.0, by), egui::pos2(cx + 5.0, by)],
+                                fill,
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                            )
+                        };
+                        sp.add(mk(strip_area.left() + (processor.levels_black / 255.0) * w, egui::Color32::from_gray(20)));
+                        sp.add(mk(strip_area.left() + (processor.levels_white / 255.0) * w, egui::Color32::WHITE));
+
                         ui.add_space(10.0);
                         ui.label(egui::RichText::new("IMAGE").small().color(egui::Color32::from_gray(140)));
                         if ui.button("Open Image…").clicked() {
@@ -307,6 +345,14 @@ impl App {
                                 ui.add_space(8.0);
                             }};
                         }
+
+                        ui.label(egui::RichText::new("LEVELS").small().color(egui::Color32::from_gray(140)));
+                        ui.add_space(4.0);
+                        slider_row!("IN BLACK",  processor.levels_black, 0.0..=254.0, 0.0,   true);
+                        slider_row!("IN WHITE",  processor.levels_white, 1.0..=255.0, 255.0, true);
+                        slider_row!("MIDTONES",  processor.levels_gamma, 0.1..=5.0,   1.0,   false);
+                        ui.separator();
+                        ui.add_space(4.0);
 
                         slider_row!("CONTRAST",            processor.contrast,            0.5..=2.0,    1.0, false);
                         slider_row!("BOX BLUR RADIUS",     processor.blur_radius,         0.0..=15.0,   0.0, true);

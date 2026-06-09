@@ -11,12 +11,22 @@ fn load_clamped(x: i32, y: i32, dims: vec2<u32>) -> vec4<f32> {
     return textureLoad(input_tex, vec2<i32>(cx, cy), 0);
 }
 
+// params: v0=contrast, v1=levels_black (0-255), v2=levels_white (0-255), v3=levels_gamma
 @compute @workgroup_size(8, 8)
 fn contrast_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = textureDimensions(input_tex);
     if gid.x >= dims.x || gid.y >= dims.y { return; }
     let c = textureLoad(input_tex, vec2<i32>(gid.xy), 0);
-    let rgb = clamp((c.rgb - 0.5) * params.v0 + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Levels: remap [black, white] → [0, 1] then apply midtone gamma
+    let black = params.v1 / 255.0;
+    let white = params.v2 / 255.0;
+    let range = max(white - black, 0.001);
+    var rgb = clamp((c.rgb - black) / range, vec3<f32>(0.0), vec3<f32>(1.0));
+    rgb = pow(rgb, vec3<f32>(1.0 / max(params.v3, 0.01)));
+
+    // Contrast S-curve around midpoint
+    rgb = clamp((rgb - 0.5) * params.v0 + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
     textureStore(output_tex, vec2<i32>(gid.xy), vec4<f32>(rgb, c.a));
 }
 

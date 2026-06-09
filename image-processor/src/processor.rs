@@ -28,6 +28,9 @@ pub struct Processor {
 
     pub image_size: Option<(u32, u32)>,
     pub contrast: f32,
+    pub levels_black: f32,  // 0–255
+    pub levels_white: f32,  // 0–255
+    pub levels_gamma: f32,  // 0.1–10.0
     pub blur_radius: f32,
     pub unsharp_strength: f32,
     pub unsharp_blur_radius: f32,
@@ -187,6 +190,9 @@ impl Processor {
             histogram: [0u32; 256],
             image_size: None,
             contrast: 1.0,
+            levels_black: 0.0,
+            levels_white: 255.0,
+            levels_gamma: 1.0,
             blur_radius: 0.0,
             unsharp_strength: 0.0,
             unsharp_blur_radius: 2.0,
@@ -285,7 +291,7 @@ impl Processor {
             return;
         };
 
-        queue.write_buffer(&self.contrast_buf, 0, bytemuck::cast_slice(&[self.contrast, 0f32, 0f32, 0f32]));
+        queue.write_buffer(&self.contrast_buf, 0, bytemuck::cast_slice(&[self.contrast, self.levels_black, self.levels_white, self.levels_gamma]));
         queue.write_buffer(&self.tonal_buf,    0, bytemuck::cast_slice(&[self.blacks, self.shadows, self.highlights, self.whites]));
         queue.write_buffer(&self.blur_buf,     0, bytemuck::cast_slice(&[self.blur_radius, 0f32, 0f32, 0f32]));
         queue.write_buffer(&self.sharpen_buf,  0, bytemuck::cast_slice(&[self.unsharp_strength, self.unsharp_blur_radius, 0f32, 0f32]));
