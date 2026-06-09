@@ -38,6 +38,8 @@ struct App {
     zoom_offset: egui::Vec2, // image top-left relative to panel top-left
     // Hold-to-show-original: only activates after 300 ms so double-clicks don't trigger it
     preview_hold_start: Option<f64>,
+    // Which levels handle is being dragged: 0=black, 1=gamma, 2=white
+    levels_drag: Option<usize>,
 }
 
 impl App {
@@ -56,6 +58,7 @@ impl App {
             zoom_scale: 1.0,
             zoom_offset: egui::Vec2::ZERO,
             preview_hold_start: None,
+            levels_drag: None,
         }
     }
 }
@@ -202,6 +205,7 @@ impl App {
             let zoom_scale        = &mut self.zoom_scale;
             let zoom_offset       = &mut self.zoom_offset;
             let preview_hold_start = &mut self.preview_hold_start;
+            let levels_drag       = &mut self.levels_drag;
             let raw_input   = egui_state.take_egui_input(window);
             let mut needs_process = false;
 
@@ -269,15 +273,62 @@ impl App {
                             painter.add(egui::Shape::Mesh(mesh));
                         }
 
-                        // Gradient strip + level markers
-                        let strip_h  = 8.0;
-                        let marker_h = 8.0;
-                        let (strip_area, _) = ui.allocate_exact_size(
+                        // Levels: gradient strip with draggable handles (black / gamma / white)
+                        const GAMMA_LOG_RANGE: f32 = 1.609_438; // ln(5): handle maps gamma 0.2..5, center = 1.0
+                        let strip_h  = 10.0;
+                        let marker_h = 12.0;
+                        let (strip_area, strip_resp) = ui.allocate_exact_size(
                             egui::vec2(ui.available_width(), strip_h + marker_h),
-                            egui::Sense::hover(),
+                            egui::Sense::click_and_drag(),
                         );
                         let sp = ui.painter_at(strip_area);
                         let grad = egui::Rect::from_min_size(strip_area.min, egui::vec2(strip_area.width(), strip_h));
+
+                        let w = strip_area.width();
+                        let x_of = |v: f32| strip_area.left() + (v / 255.0) * w;
+                        let black_x = x_of(processor.levels_black);
+                        let white_x = x_of(processor.levels_white);
+                        // Gamma handle position between black/white, log-symmetric so center = 1.0
+                        let gamma_t = (0.5 - processor.levels_gamma.ln() / (2.0 * GAMMA_LOG_RANGE)).clamp(0.0, 1.0);
+                        let gamma_x = black_x + gamma_t * (white_x - black_x);
+
+                        // Interaction: grab nearest handle on drag start, follow pointer while dragging
+                        if strip_resp.drag_started() {
+                            if let Some(p) = strip_resp.interact_pointer_pos() {
+                                let dists = [(p.x - black_x).abs(), (p.x - gamma_x).abs(), (p.x - white_x).abs()];
+                                *levels_drag = dists
+                                    .iter()
+                                    .enumerate()
+                                    .min_by(|a, b| a.1.total_cmp(b.1))
+                                    .map(|(i, _)| i);
+                            }
+                        }
+                        if strip_resp.dragged() {
+                            if let (Some(h), Some(p)) = (*levels_drag, strip_resp.interact_pointer_pos()) {
+                                let v = ((p.x - strip_area.left()) / w * 255.0).clamp(0.0, 255.0);
+                                match h {
+                                    0 => processor.levels_black = v.round().clamp(0.0, processor.levels_white - 1.0),
+                                    2 => processor.levels_white = v.round().clamp(processor.levels_black + 1.0, 255.0),
+                                    _ => {
+                                        let t = ((p.x - black_x) / (white_x - black_x).max(1.0)).clamp(0.0, 1.0);
+                                        processor.levels_gamma = ((0.5 - t) * 2.0 * GAMMA_LOG_RANGE).exp();
+                                    }
+                                }
+                                needs_process = true;
+                            }
+                        }
+                        if strip_resp.drag_stopped() {
+                            *levels_drag = None;
+                        }
+                        if strip_resp.double_clicked() {
+                            processor.levels_black = 0.0;
+                            processor.levels_white = 255.0;
+                            processor.levels_gamma = 1.0;
+                            needs_process = true;
+                        }
+                        if strip_resp.hovered() || levels_drag.is_some() {
+                            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
 
                         // Black → white gradient
                         let uv = egui::epaint::WHITE_UV;
@@ -292,20 +343,66 @@ impl App {
                         gm.indices.extend_from_slice(&[gv, gv+1, gv+2, gv, gv+2, gv+3]);
                         sp.add(egui::Shape::Mesh(gm));
 
-                        // Triangle markers (pointing up, sitting below the gradient strip)
-                        let w   = strip_area.width();
-                        let ty  = grad.bottom();
-                        let by  = strip_area.bottom();
-                        let mk  = |cx: f32, fill: egui::Color32| {
-                            let cx = cx.clamp(strip_area.left() + 5.0, strip_area.right() - 5.0);
+                        // Which handle to highlight: dragged one, or nearest within reach when hovering
+                        let highlight = (*levels_drag).or_else(|| {
+                            strip_resp.hover_pos().and_then(|p| {
+                                let dists = [(p.x - black_x).abs(), (p.x - gamma_x).abs(), (p.x - white_x).abs()];
+                                dists
+                                    .iter()
+                                    .enumerate()
+                                    .min_by(|a, b| a.1.total_cmp(b.1))
+                                    .filter(|(_, d)| **d < 14.0)
+                                    .map(|(i, _)| i)
+                            })
+                        });
+
+                        // Triangle handles (pointing up, sitting below the gradient strip)
+                        let ty = grad.bottom();
+                        let by = strip_area.bottom();
+                        let mk = |cx: f32, fill: egui::Color32, hot: bool| {
+                            let cx = cx.clamp(strip_area.left() + 6.0, strip_area.right() - 6.0);
+                            let stroke = if hot {
+                                egui::Stroke::new(1.5, egui::Color32::from_gray(220))
+                            } else {
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(110))
+                            };
                             egui::Shape::convex_polygon(
-                                vec![egui::pos2(cx, ty), egui::pos2(cx - 5.0, by), egui::pos2(cx + 5.0, by)],
+                                vec![egui::pos2(cx, ty), egui::pos2(cx - 6.0, by), egui::pos2(cx + 6.0, by)],
                                 fill,
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
+                                stroke,
                             )
                         };
-                        sp.add(mk(strip_area.left() + (processor.levels_black / 255.0) * w, egui::Color32::from_gray(20)));
-                        sp.add(mk(strip_area.left() + (processor.levels_white / 255.0) * w, egui::Color32::WHITE));
+                        sp.add(mk(black_x, egui::Color32::from_gray(20),  highlight == Some(0)));
+                        sp.add(mk(gamma_x, egui::Color32::from_gray(128), highlight == Some(1)));
+                        sp.add(mk(white_x, egui::Color32::WHITE,          highlight == Some(2)));
+
+                        // Numeric value boxes: black | gamma | white
+                        ui.add_space(2.0);
+                        ui.columns(3, |cols| {
+                            let mut changed = false;
+                            cols[0].with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                changed |= ui.add(
+                                    egui::DragValue::new(&mut processor.levels_black)
+                                        .range(0.0..=254.0).speed(1.0).max_decimals(0),
+                                ).changed();
+                            });
+                            cols[1].with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                                changed |= ui.add(
+                                    egui::DragValue::new(&mut processor.levels_gamma)
+                                        .range(0.1..=5.0).speed(0.01).fixed_decimals(2),
+                                ).changed();
+                            });
+                            cols[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                changed |= ui.add(
+                                    egui::DragValue::new(&mut processor.levels_white)
+                                        .range(1.0..=255.0).speed(1.0).max_decimals(0),
+                                ).changed();
+                            });
+                            if changed {
+                                processor.levels_black = processor.levels_black.min(processor.levels_white - 1.0);
+                                needs_process = true;
+                            }
+                        });
 
                         ui.add_space(10.0);
                         ui.label(egui::RichText::new("IMAGE").small().color(egui::Color32::from_gray(140)));
@@ -345,14 +442,6 @@ impl App {
                                 ui.add_space(8.0);
                             }};
                         }
-
-                        ui.label(egui::RichText::new("LEVELS").small().color(egui::Color32::from_gray(140)));
-                        ui.add_space(4.0);
-                        slider_row!("IN BLACK",  processor.levels_black, 0.0..=254.0, 0.0,   true);
-                        slider_row!("IN WHITE",  processor.levels_white, 1.0..=255.0, 255.0, true);
-                        slider_row!("MIDTONES",  processor.levels_gamma, 0.1..=5.0,   1.0,   false);
-                        ui.separator();
-                        ui.add_space(4.0);
 
                         slider_row!("CONTRAST",            processor.contrast,            0.5..=2.0,    1.0, false);
                         slider_row!("BOX BLUR RADIUS",     processor.blur_radius,         0.0..=15.0,   0.0, true);
