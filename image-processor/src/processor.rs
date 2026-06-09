@@ -20,6 +20,12 @@ pub struct Processor {
     blur_buf: wgpu::Buffer,
     sharpen_buf: wgpu::Buffer,
 
+    histogram_bgl: wgpu::BindGroupLayout,
+    histogram_pipeline: wgpu::ComputePipeline,
+    histogram_buf: wgpu::Buffer,
+    histogram_staging: wgpu::Buffer,
+    pub histogram: [u32; 256],
+
     pub image_size: Option<(u32, u32)>,
     pub contrast: f32,
     pub blur_radius: f32,
@@ -100,6 +106,63 @@ impl Processor {
             })
         };
 
+        let histogram_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let histogram_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(include_str!("histogram.wgsl").into()),
+        });
+        let histogram_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&histogram_bgl],
+            push_constant_ranges: &[],
+        });
+        let histogram_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&histogram_pl),
+            module: &histogram_shader,
+            entry_point: "histogram_pass",
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let histogram_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 1024, // 256 bins × 4 bytes
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let histogram_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 1024,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             contrast_pipeline: make_pipeline("contrast_pass"),
             tonal_pipeline: make_pipeline("tonal_pass"),
@@ -117,6 +180,11 @@ impl Processor {
             tonal_buf: make_buf(16),
             blur_buf: make_buf(16),
             sharpen_buf: make_buf(16),
+            histogram_bgl,
+            histogram_pipeline,
+            histogram_buf,
+            histogram_staging,
+            histogram: [0u32; 256],
             image_size: None,
             contrast: 1.0,
             blur_radius: 0.0,
@@ -205,7 +273,7 @@ impl Processor {
     // Pipeline: contrast → sharpen → blur_h → blur_v
     // Sharpen operates on the contrast-adjusted image (pre-blur) so the unsharp
     // mask anchors off clean signal, independent of the box-blur slider.
-    pub fn process(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    pub fn process(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let (Some(input), Some(t1), Some(t2), Some(t3), Some(t4), Some(output)) = (
             self.input_tex.as_ref(),
             self.tex1.as_ref(),
@@ -267,6 +335,39 @@ impl Processor {
         dispatch(&self.blur_v_pipeline,   &blur_v_bg);
 
         queue.submit([encoder.finish()]);
+
+        // Histogram: reset bins, dispatch over the output, copy 1 KB to staging, sync readback.
+        // Separate submission so the blur_v write is visible before histogram reads output.
+        queue.write_buffer(&self.histogram_buf, 0, &[0u8; 1024]);
+        let hist_view = output.create_view(&Default::default());
+        let hist_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.histogram_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hist_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: self.histogram_buf.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&self.histogram_pipeline);
+            pass.set_bind_group(0, &hist_bg, &[]);
+            pass.dispatch_workgroups((w + 15) / 16, (h + 15) / 16, 1);
+        }
+        enc.copy_buffer_to_buffer(&self.histogram_buf, 0, &self.histogram_staging, 0, 1024);
+        queue.submit([enc.finish()]);
+
+        let slice = self.histogram_staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        device.poll(wgpu::Maintain::Wait);
+        if rx.recv().unwrap().is_ok() {
+            let data = slice.get_mapped_range();
+            self.histogram.copy_from_slice(bytemuck::cast_slice(&data));
+            drop(data);
+        }
+        self.histogram_staging.unmap();
     }
 
     pub fn export(&self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) {

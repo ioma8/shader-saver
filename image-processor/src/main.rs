@@ -210,8 +210,33 @@ impl App {
                     .exact_width(260.0)
                     .resizable(false)
                     .show(ctx, |ui| {
-                        ui.add_space(16.0);
+                        // Luminance histogram
+                        let hist_size = egui::vec2(ui.available_width(), 90.0);
+                        let (hist_rect, _) = ui.allocate_exact_size(hist_size, egui::Sense::hover());
+                        let painter = ui.painter_at(hist_rect);
+                        painter.rect_filled(hist_rect, 0.0, egui::Color32::from_gray(12));
 
+                        if processor.has_image() {
+                            let hist = &processor.histogram;
+                            let max = hist.iter().copied().max().unwrap_or(1).max(1) as f32;
+                            let log_max = (max + 1.0).ln().max(1.0);
+                            let bar_w = hist_rect.width() / 256.0;
+                            for (i, &count) in hist.iter().enumerate() {
+                                let h = ((count as f32 + 1.0).ln() / log_max) * hist_rect.height();
+                                if h < 0.5 { continue; }
+                                let x = hist_rect.left() + i as f32 * bar_w;
+                                painter.rect_filled(
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(x, hist_rect.bottom() - h),
+                                        egui::pos2(x + bar_w.ceil(), hist_rect.bottom()),
+                                    ),
+                                    0.0,
+                                    egui::Color32::from_gray(190),
+                                );
+                            }
+                        }
+
+                        ui.add_space(10.0);
                         ui.label(egui::RichText::new("IMAGE").small().color(egui::Color32::from_gray(140)));
                         if ui.button("Open Image…").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
@@ -431,7 +456,7 @@ impl App {
 
         // Process once per frame if any slider changed
         if needs_process {
-            if let (Some(proc), Some(gpu)) = (self.processor.as_ref(), self.gpu.as_ref()) {
+            if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
                 proc.process(&gpu.device, &gpu.queue);
             }
             self.output_dirty = true;
