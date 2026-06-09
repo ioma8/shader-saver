@@ -14,6 +14,20 @@ use winit::window::{Window, WindowId};
 
 const KEY_OPEN_PATH: &str = "open_path";
 const KEY_EXPORT_PATH: &str = "export_path";
+const KEY_SCAN_DIR: &str = "scan_dir";
+
+const IMAGE_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "tiff", "tif", "bmp"];
+
+#[derive(PartialEq, Clone, Copy)]
+enum View {
+    Browse,
+    Edit,
+}
+
+struct ThumbEntry {
+    path: PathBuf,
+    tex: Option<egui::TextureHandle>,
+}
 
 struct GpuState {
     device: wgpu::Device,
@@ -42,6 +56,12 @@ struct App {
     levels_drag: Option<usize>,
     // Index of the curve control point being dragged
     curve_drag: Option<usize>,
+    // Tabs: thumbnail browser / edit view
+    view: View,
+    browse_dir: Option<PathBuf>,
+    thumbs: Vec<ThumbEntry>,
+    thumb_rx: Option<std::sync::mpsc::Receiver<(usize, egui::ColorImage)>>,
+    current_path: Option<PathBuf>,
 }
 
 impl App {
@@ -62,6 +82,11 @@ impl App {
             preview_hold_start: None,
             levels_drag: None,
             curve_drag: None,
+            view: View::Browse,
+            browse_dir: None,
+            thumbs: Vec::new(),
+            thumb_rx: None,
+            current_path: None,
         }
     }
 }
@@ -100,6 +125,18 @@ impl ApplicationHandler for App {
         self.processor = Some(processor);
         self.window = Some(window);
         self.gpu = Some(gpu);
+
+        // CLI: open an image (or browse a folder) passed as the first argument
+        if self.current_path.is_none() && self.browse_dir.is_none() {
+            if let Some(arg) = std::env::args().nth(1) {
+                let p = PathBuf::from(arg);
+                if p.is_file() {
+                    self.register_image(&p);
+                } else if p.is_dir() {
+                    self.scan_folder(&p);
+                }
+            }
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -146,6 +183,46 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    // List the folder's images and decode thumbnails on a background thread;
+    // results stream in through thumb_rx and are uploaded as egui textures.
+    fn scan_folder(&mut self, dir: &std::path::Path) {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| {
+                        p.extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| IMAGE_EXTS.contains(&e.to_lowercase().as_str()))
+                            .unwrap_or(false)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        paths.sort();
+
+        self.browse_dir = Some(dir.to_owned());
+        self.thumbs = paths
+            .iter()
+            .map(|p| ThumbEntry { path: p.clone(), tex: None })
+            .collect();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.thumb_rx = Some(rx); // dropping the old rx makes a stale loader thread stop
+        let ctx = self.egui_ctx.clone();
+        std::thread::spawn(move || {
+            for (i, p) in paths.into_iter().enumerate() {
+                let Ok(img) = image::open(&p) else { continue };
+                let t = img.thumbnail(220, 220).to_rgba8();
+                let (w, h) = t.dimensions();
+                let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &t);
+                if tx.send((i, ci)).is_err() {
+                    break;
+                }
+                ctx.request_repaint();
+            }
+        });
+    }
+
     fn register_image(&mut self, path: &std::path::Path) {
         let Some(gpu) = &self.gpu else { return };
         let Some(processor) = &mut self.processor else { return };
@@ -172,6 +249,15 @@ impl App {
 
             self.output_dirty = true;
             self.zoom_fit = true; // reset to fit when a new image is loaded
+            self.view = View::Edit;
+            self.current_path = Some(path.to_owned());
+
+            // Populate the browser with the image's folder
+            if let Some(parent) = path.parent() {
+                if self.browse_dir.as_deref() != Some(parent) {
+                    self.scan_folder(parent);
+                }
+            }
         }
     }
 
@@ -181,6 +267,19 @@ impl App {
             || self.processor.is_none()
         {
             return;
+        }
+
+        // Upload any thumbnails the loader thread has finished
+        if let Some(rx) = &self.thumb_rx {
+            while let Ok((i, img)) = rx.try_recv() {
+                if let Some(entry) = self.thumbs.get_mut(i) {
+                    entry.tex = Some(self.egui_ctx.load_texture(
+                        format!("thumb{i}"),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+            }
         }
 
         let frame = {
@@ -200,7 +299,7 @@ impl App {
         let original_tex_id = self.original_tex_id;
 
         // Scoped egui frame — all field borrows dropped at end of block
-        let (shapes, textures_delta, pixels_per_point, open_path, export_path, needs_process) = {
+        let (shapes, textures_delta, pixels_per_point, open_path, export_path, scan_dir, needs_process) = {
             let window      = self.window.as_ref().unwrap();
             let egui_state  = self.egui_state.as_mut().unwrap();
             let processor   = self.processor.as_mut().unwrap();
@@ -210,10 +309,154 @@ impl App {
             let preview_hold_start = &mut self.preview_hold_start;
             let levels_drag       = &mut self.levels_drag;
             let curve_drag        = &mut self.curve_drag;
+            let view              = &mut self.view;
+            let thumbs            = &self.thumbs;
+            let browse_dir        = &self.browse_dir;
+            let current_path      = &self.current_path;
             let raw_input   = egui_state.take_egui_input(window);
             let mut needs_process = false;
 
             let full_output = self.egui_ctx.run(raw_input, |ctx| {
+                egui::TopBottomPanel::top("tabs").exact_height(34.0).show(ctx, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.add_space(4.0);
+                        ui.selectable_value(view, View::Browse, "  Browse  ");
+                        ui.selectable_value(view, View::Edit, "  Edit  ");
+                    });
+                });
+
+                if *view == View::Browse {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none().fill(egui::Color32::from_gray(24)))
+                        .show(ctx, |ui| {
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(6.0);
+                                if ui.button("Open Folder…").clicked() {
+                                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                        ctx.data_mut(|d| {
+                                            d.insert_temp(egui::Id::new(KEY_SCAN_DIR), dir)
+                                        });
+                                    }
+                                }
+                                if let Some(dir) = browse_dir {
+                                    ui.label(
+                                        egui::RichText::new(dir.display().to_string())
+                                            .small()
+                                            .color(egui::Color32::from_gray(140)),
+                                    );
+                                }
+                            });
+                            ui.add_space(6.0);
+                            ui.separator();
+
+                            if thumbs.is_empty() {
+                                ui.centered_and_justified(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Open a folder (or an image) to browse thumbnails",
+                                        )
+                                        .color(egui::Color32::from_gray(140)),
+                                    );
+                                });
+                                return;
+                            }
+
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.add_space(6.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    let cell = egui::vec2(168.0, 152.0);
+                                    for entry in thumbs {
+                                        let (rect, resp) =
+                                            ui.allocate_exact_size(cell, egui::Sense::click());
+                                        if !ui.is_rect_visible(rect) {
+                                            continue;
+                                        }
+                                        let p = ui.painter_at(rect);
+                                        p.rect_filled(rect.shrink(2.0), 4.0, egui::Color32::from_gray(16));
+
+                                        let img_area = egui::Rect::from_min_max(
+                                            rect.min + egui::vec2(6.0, 6.0),
+                                            egui::pos2(rect.max.x - 6.0, rect.max.y - 24.0),
+                                        );
+                                        if let Some(tex) = &entry.tex {
+                                            let ts = tex.size_vec2();
+                                            let s = (img_area.width() / ts.x)
+                                                .min(img_area.height() / ts.y)
+                                                .min(1.0);
+                                            let ir = egui::Rect::from_center_size(
+                                                img_area.center(),
+                                                ts * s,
+                                            );
+                                            p.image(
+                                                tex.id(),
+                                                ir,
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(0.0, 0.0),
+                                                    egui::pos2(1.0, 1.0),
+                                                ),
+                                                egui::Color32::WHITE,
+                                            );
+                                        } else {
+                                            p.text(
+                                                img_area.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                "…",
+                                                egui::FontId::proportional(18.0),
+                                                egui::Color32::from_gray(90),
+                                            );
+                                        }
+
+                                        let name = entry
+                                            .path
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or("");
+                                        let mut label = name.to_owned();
+                                        if label.len() > 22 {
+                                            label.truncate(20);
+                                            label.push('…');
+                                        }
+                                        p.text(
+                                            egui::pos2(rect.center().x, rect.max.y - 13.0),
+                                            egui::Align2::CENTER_CENTER,
+                                            label,
+                                            egui::FontId::proportional(10.0),
+                                            egui::Color32::from_gray(170),
+                                        );
+
+                                        let selected =
+                                            current_path.as_deref() == Some(entry.path.as_path());
+                                        if selected {
+                                            p.rect_stroke(
+                                                rect.shrink(2.0),
+                                                4.0,
+                                                egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 140, 255)),
+                                            );
+                                        } else if resp.hovered() {
+                                            p.rect_stroke(
+                                                rect.shrink(2.0),
+                                                4.0,
+                                                egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+                                            );
+                                        }
+
+                                        if resp.clicked() {
+                                            ctx.data_mut(|d| {
+                                                d.insert_temp(
+                                                    egui::Id::new(KEY_OPEN_PATH),
+                                                    entry.path.clone(),
+                                                )
+                                            });
+                                        }
+                                    }
+                                });
+                                ui.add_space(6.0);
+                            });
+                        });
+                    return;
+                }
+
                 egui::SidePanel::right("controls")
                     .exact_width(260.0)
                     .resizable(false)
@@ -751,12 +994,17 @@ impl App {
                 self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_OPEN_PATH)));
             let export_path: Option<PathBuf> =
                 self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_EXPORT_PATH)));
+            let scan_dir: Option<PathBuf> =
+                self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_SCAN_DIR)));
 
             (full_output.shapes, full_output.textures_delta, full_output.pixels_per_point,
-             open_path, export_path, needs_process)
+             open_path, export_path, scan_dir, needs_process)
         }; // all field borrows dropped here
 
         // File ops
+        if let Some(dir) = scan_dir {
+            self.scan_folder(&dir);
+        }
         if let Some(path) = open_path {
             self.register_image(&path);
         }
