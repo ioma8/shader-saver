@@ -376,11 +376,11 @@ impl App {
                         sp.add(mk(gamma_x, egui::Color32::from_gray(128), highlight == Some(1)));
                         sp.add(mk(white_x, egui::Color32::WHITE,          highlight == Some(2)));
 
-                        // Numeric value boxes: black | gamma | white
+                        // Numeric value boxes: black | gamma | white (single compact row)
                         ui.add_space(2.0);
                         ui.columns(3, |cols| {
                             let mut changed = false;
-                            cols[0].with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            cols[0].with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                                 changed |= ui.add(
                                     egui::DragValue::new(&mut processor.levels_black)
                                         .range(0.0..=254.0).speed(1.0).max_decimals(0),
@@ -392,7 +392,7 @@ impl App {
                                         .range(0.1..=5.0).speed(0.01).fixed_decimals(2),
                                 ).changed();
                             });
-                            cols[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            cols[2].with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
                                 changed |= ui.add(
                                     egui::DragValue::new(&mut processor.levels_white)
                                         .range(1.0..=255.0).speed(1.0).max_decimals(0),
