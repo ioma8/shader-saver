@@ -221,19 +221,23 @@ impl App {
                             let max = hist.iter().copied().max().unwrap_or(1).max(1) as f32;
                             let log_max = (max + 1.0).ln().max(1.0);
                             let bar_w = hist_rect.width() / 256.0;
+
+                            // Build a closed polygon: bottom-left → silhouette → bottom-right
+                            let mut pts = Vec::with_capacity(258);
+                            pts.push(egui::pos2(hist_rect.left(), hist_rect.bottom()));
                             for (i, &count) in hist.iter().enumerate() {
                                 let h = ((count as f32 + 1.0).ln() / log_max) * hist_rect.height();
-                                if h < 0.5 { continue; }
-                                let x = hist_rect.left() + i as f32 * bar_w;
-                                painter.rect_filled(
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(x, hist_rect.bottom() - h),
-                                        egui::pos2(x + bar_w.ceil(), hist_rect.bottom()),
-                                    ),
-                                    0.0,
-                                    egui::Color32::from_gray(190),
-                                );
+                                let x = hist_rect.left() + (i as f32 + 0.5) * bar_w;
+                                pts.push(egui::pos2(x, hist_rect.bottom() - h));
                             }
+                            pts.push(egui::pos2(hist_rect.right(), hist_rect.bottom()));
+
+                            painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                                points: pts,
+                                closed: true,
+                                fill: egui::Color32::from_gray(190),
+                                stroke: egui::epaint::PathStroke::NONE,
+                            }));
                         }
 
                         ui.add_space(10.0);
