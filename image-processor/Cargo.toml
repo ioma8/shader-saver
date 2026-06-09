@@ -1,0 +1,15 @@
+[package]
+name = "image-processor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "22"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+egui = "0.29"
+egui-wgpu = "0.29"
+egui-winit = "0.29"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp"] }
+rfd = "0.14"
+pollster = "0.3"
