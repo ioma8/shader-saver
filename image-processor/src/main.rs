@@ -40,6 +40,8 @@ struct App {
     preview_hold_start: Option<f64>,
     // Which levels handle is being dragged: 0=black, 1=gamma, 2=white
     levels_drag: Option<usize>,
+    // Index of the curve control point being dragged
+    curve_drag: Option<usize>,
 }
 
 impl App {
@@ -59,6 +61,7 @@ impl App {
             zoom_offset: egui::Vec2::ZERO,
             preview_hold_start: None,
             levels_drag: None,
+            curve_drag: None,
         }
     }
 }
@@ -206,6 +209,7 @@ impl App {
             let zoom_offset       = &mut self.zoom_offset;
             let preview_hold_start = &mut self.preview_hold_start;
             let levels_drag       = &mut self.levels_drag;
+            let curve_drag        = &mut self.curve_drag;
             let raw_input   = egui_state.take_egui_input(window);
             let mut needs_process = false;
 
@@ -214,9 +218,10 @@ impl App {
                     .exact_width(260.0)
                     .resizable(false)
                     .show(ctx, |ui| {
-                        // Luminance histogram
-                        let hist_size = egui::vec2(ui.available_width(), 90.0);
-                        let (hist_rect, _) = ui.allocate_exact_size(hist_size, egui::Sense::hover());
+                        // Luminance histogram + curves editor
+                        let hist_size = egui::vec2(ui.available_width(), 150.0);
+                        let (hist_rect, hist_resp) =
+                            ui.allocate_exact_size(hist_size, egui::Sense::click_and_drag());
                         let painter = ui.painter_at(hist_rect);
                         painter.rect_filled(hist_rect, 0.0, egui::Color32::from_gray(12));
 
@@ -271,6 +276,127 @@ impl App {
                             ]);
 
                             painter.add(egui::Shape::Mesh(mesh));
+                        }
+
+                        // ---- Curves editor (Photoshop-style) overlaid on the histogram ----
+                        let to_screen = |p: [f32; 2]| {
+                            egui::pos2(
+                                hist_rect.left() + p[0] * hist_rect.width(),
+                                hist_rect.bottom() - p[1] * hist_rect.height(),
+                            )
+                        };
+                        let to_norm = |p: egui::Pos2| {
+                            [
+                                ((p.x - hist_rect.left()) / hist_rect.width()).clamp(0.0, 1.0),
+                                ((hist_rect.bottom() - p.y) / hist_rect.height()).clamp(0.0, 1.0),
+                            ]
+                        };
+                        let nearest_point = |pts: &[[f32; 2]], mp: egui::Pos2| {
+                            pts.iter()
+                                .enumerate()
+                                .map(|(i, &p)| (i, to_screen(p).distance(mp)))
+                                .min_by(|a, b| a.1.total_cmp(&b.1))
+                                .filter(|(_, d)| *d < 10.0)
+                                .map(|(i, _)| i)
+                        };
+                        const MIN_DX: f32 = 0.01;
+
+                        // Grab an existing point or create one (click or drag start)
+                        if hist_resp.drag_started() || hist_resp.clicked() {
+                            if let Some(mp) = hist_resp.interact_pointer_pos() {
+                                let pts = &mut processor.curve_points;
+                                let idx = nearest_point(pts, mp).unwrap_or_else(|| {
+                                    let np = to_norm(mp);
+                                    let idx = pts.iter().position(|p| p[0] > np[0]).unwrap_or(pts.len());
+                                    pts.insert(idx, np);
+                                    needs_process = true;
+                                    idx
+                                });
+                                *curve_drag = Some(idx);
+                            }
+                        }
+                        if hist_resp.dragged() {
+                            if let (Some(i), Some(mp)) = (*curve_drag, hist_resp.interact_pointer_pos()) {
+                                let pts = &mut processor.curve_points;
+                                let np = to_norm(mp);
+                                let last = pts.len() - 1;
+                                let x = if i == 0 {
+                                    np[0].min(pts[1][0] - MIN_DX).max(0.0)
+                                } else if i == last {
+                                    np[0].max(pts[last - 1][0] + MIN_DX).min(1.0)
+                                } else {
+                                    np[0].clamp(pts[i - 1][0] + MIN_DX, pts[i + 1][0] - MIN_DX)
+                                };
+                                pts[i] = [x, np[1]];
+                                needs_process = true;
+                            }
+                        }
+                        if hist_resp.drag_stopped() {
+                            // Releasing a point well outside the box deletes it (endpoints stay)
+                            if let (Some(i), Some(mp)) = (*curve_drag, ctx.pointer_interact_pos()) {
+                                let pts = &mut processor.curve_points;
+                                if i != 0 && i != pts.len() - 1 && !hist_rect.expand(25.0).contains(mp) {
+                                    pts.remove(i);
+                                    needs_process = true;
+                                }
+                            }
+                            *curve_drag = None;
+                        }
+                        // Right-click removes a point; double-click resets the whole curve
+                        if hist_resp.secondary_clicked() {
+                            if let Some(mp) = hist_resp.interact_pointer_pos() {
+                                let pts = &mut processor.curve_points;
+                                if let Some(i) = nearest_point(pts, mp) {
+                                    if i != 0 && i != pts.len() - 1 {
+                                        pts.remove(i);
+                                        needs_process = true;
+                                    }
+                                }
+                            }
+                        }
+                        if hist_resp.double_clicked() {
+                            processor.curve_points = vec![[0.0, 0.0], [1.0, 1.0]];
+                            *curve_drag = None;
+                            needs_process = true;
+                        }
+
+                        // Quarter grid lines
+                        let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(34));
+                        for f in [0.25f32, 0.5, 0.75] {
+                            let x = hist_rect.left() + f * hist_rect.width();
+                            let y = hist_rect.top() + f * hist_rect.height();
+                            painter.line_segment([egui::pos2(x, hist_rect.top()), egui::pos2(x, hist_rect.bottom())], grid);
+                            painter.line_segment([egui::pos2(hist_rect.left(), y), egui::pos2(hist_rect.right(), y)], grid);
+                        }
+
+                        // The curve itself, sampled from the same LUT the shader uses
+                        let lut = processor.curve_lut();
+                        let curve_pts: Vec<egui::Pos2> = (0..=128)
+                            .map(|i| {
+                                let t = i as f32 / 128.0;
+                                to_screen([t, lut[((t * 255.0) as usize).min(255)]])
+                            })
+                            .collect();
+                        painter.add(egui::Shape::line(
+                            curve_pts,
+                            egui::Stroke::new(1.5, egui::Color32::from_gray(230)),
+                        ));
+
+                        // Control points
+                        let hover_idx = hist_resp
+                            .hover_pos()
+                            .and_then(|mp| nearest_point(&processor.curve_points, mp));
+                        for (i, &p) in processor.curve_points.iter().enumerate() {
+                            let hot = *curve_drag == Some(i) || (curve_drag.is_none() && hover_idx == Some(i));
+                            let (r, fill) = if hot {
+                                (4.5, egui::Color32::WHITE)
+                            } else {
+                                (3.5, egui::Color32::from_gray(200))
+                            };
+                            painter.circle(to_screen(p), r, fill, egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+                        }
+                        if hover_idx.is_some() || curve_drag.is_some() {
+                            ctx.set_cursor_icon(egui::CursorIcon::Grab);
                         }
 
                         // Levels: gradient strip with draggable handles (black / gamma / white)

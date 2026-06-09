@@ -3,6 +3,15 @@
 
 struct Params { v0: f32, v1: f32, v2: f32, v3: f32 }
 @group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read> curve_lut: array<f32, 256>;
+
+// Tone curve lookup with linear interpolation between LUT entries
+fn curve_apply(v: f32) -> f32 {
+    let x = clamp(v, 0.0, 1.0) * 255.0;
+    let i = u32(floor(x));
+    let j = min(i + 1u, 255u);
+    return mix(curve_lut[i], curve_lut[j], x - f32(i));
+}
 
 // Shared helper — clamp-to-edge load used by all passes
 fn load_clamped(x: i32, y: i32, dims: vec2<u32>) -> vec4<f32> {
@@ -27,6 +36,9 @@ fn contrast_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Contrast S-curve around midpoint
     rgb = clamp((rgb - 0.5) * params.v0 + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // Tone curve (Photoshop-style curves; identity LUT when no points added)
+    rgb = vec3<f32>(curve_apply(rgb.r), curve_apply(rgb.g), curve_apply(rgb.b));
     textureStore(output_tex, vec2<i32>(gid.xy), vec4<f32>(rgb, c.a));
 }
 

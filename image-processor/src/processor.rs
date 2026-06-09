@@ -19,6 +19,7 @@ pub struct Processor {
     tonal_buf: wgpu::Buffer,
     blur_buf: wgpu::Buffer,
     sharpen_buf: wgpu::Buffer,
+    curve_buf: wgpu::Buffer,
 
     histogram_bgl: wgpu::BindGroupLayout,
     histogram_pipeline: wgpu::ComputePipeline,
@@ -38,6 +39,9 @@ pub struct Processor {
     pub shadows: f32,
     pub highlights: f32,
     pub whites: f32,
+    // Tone curve control points, normalized [0,1]², sorted by x.
+    // Always at least the two endpoints; identity = [[0,0],[1,1]].
+    pub curve_points: Vec<[f32; 2]>,
 }
 
 impl Processor {
@@ -75,6 +79,16 @@ impl Processor {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -183,6 +197,12 @@ impl Processor {
             tonal_buf: make_buf(16),
             blur_buf: make_buf(16),
             sharpen_buf: make_buf(16),
+            curve_buf: device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: 1024, // 256 LUT entries × 4 bytes
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
             histogram_bgl,
             histogram_pipeline,
             histogram_buf,
@@ -200,7 +220,70 @@ impl Processor {
             shadows: 0.0,
             highlights: 0.0,
             whites: 0.0,
+            curve_points: vec![[0.0, 0.0], [1.0, 1.0]],
         }
+    }
+
+    // Natural cubic spline through the control points, sampled into a 256-entry
+    // LUT. Flat extension outside the endpoint x-range, values clamped to [0,1].
+    pub fn curve_lut(&self) -> [f32; 256] {
+        let pts = &self.curve_points;
+        let n = pts.len();
+        let mut lut = [0f32; 256];
+        if n < 2 {
+            for (i, v) in lut.iter_mut().enumerate() {
+                *v = i as f32 / 255.0;
+            }
+            return lut;
+        }
+
+        // Second derivatives with natural boundary (m[0] = m[n-1] = 0),
+        // solved with the Thomas algorithm.
+        let mut m = vec![0f32; n];
+        if n > 2 {
+            let mut b = vec![1f32; n];
+            let mut c = vec![0f32; n];
+            let mut d = vec![0f32; n];
+            for i in 1..n - 1 {
+                let h0 = (pts[i][0] - pts[i - 1][0]).max(1e-4);
+                let h1 = (pts[i + 1][0] - pts[i][0]).max(1e-4);
+                let a_i = h0;
+                b[i] = 2.0 * (h0 + h1);
+                c[i] = h1;
+                d[i] = 6.0 * ((pts[i + 1][1] - pts[i][1]) / h1 - (pts[i][1] - pts[i - 1][1]) / h0);
+                let w = a_i / b[i - 1];
+                b[i] -= w * c[i - 1];
+                d[i] -= w * d[i - 1];
+            }
+            for i in (1..n - 1).rev() {
+                m[i] = (d[i] - c[i] * m[i + 1]) / b[i];
+            }
+        }
+
+        let mut seg = 0;
+        for (i, v) in lut.iter_mut().enumerate() {
+            let x = i as f32 / 255.0;
+            let y = if x <= pts[0][0] {
+                pts[0][1]
+            } else if x >= pts[n - 1][0] {
+                pts[n - 1][1]
+            } else {
+                while seg < n - 2 && pts[seg + 1][0] < x {
+                    seg += 1;
+                }
+                let (x0, y0) = (pts[seg][0], pts[seg][1]);
+                let (x1, y1) = (pts[seg + 1][0], pts[seg + 1][1]);
+                let h = (x1 - x0).max(1e-4);
+                let t0 = x1 - x;
+                let t1 = x - x0;
+                m[seg] * t0 * t0 * t0 / (6.0 * h)
+                    + m[seg + 1] * t1 * t1 * t1 / (6.0 * h)
+                    + (y0 / h - m[seg] * h / 6.0) * t0
+                    + (y1 / h - m[seg + 1] * h / 6.0) * t1
+            };
+            *v = y.clamp(0.0, 1.0);
+        }
+        lut
     }
 
     pub fn load_image(&mut self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
@@ -295,6 +378,8 @@ impl Processor {
         queue.write_buffer(&self.tonal_buf,    0, bytemuck::cast_slice(&[self.blacks, self.shadows, self.highlights, self.whites]));
         queue.write_buffer(&self.blur_buf,     0, bytemuck::cast_slice(&[self.blur_radius, 0f32, 0f32, 0f32]));
         queue.write_buffer(&self.sharpen_buf,  0, bytemuck::cast_slice(&[self.unsharp_strength, self.unsharp_blur_radius, 0f32, 0f32]));
+        let lut = self.curve_lut();
+        queue.write_buffer(&self.curve_buf, 0, bytemuck::cast_slice(&lut[..]));
 
         let iv  = input.create_view(&Default::default());
         let t1v = t1.create_view(&Default::default());
@@ -304,6 +389,7 @@ impl Processor {
         let ov  = output.create_view(&Default::default());
 
         let bgl = &self.compute_bgl;
+        let curve_buf = &self.curve_buf;
         let make_bg = |in_view: &wgpu::TextureView, out_view: &wgpu::TextureView, buf: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -312,6 +398,7 @@ impl Processor {
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(in_view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(out_view) },
                     wgpu::BindGroupEntry { binding: 2, resource: buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: curve_buf.as_entire_binding() },
                 ],
             })
         };
