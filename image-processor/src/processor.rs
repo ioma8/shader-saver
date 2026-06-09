@@ -2,6 +2,7 @@ use std::path::Path;
 
 pub struct Processor {
     contrast_pipeline: wgpu::ComputePipeline,
+    tonal_pipeline: wgpu::ComputePipeline,
     sharpen_pipeline: wgpu::ComputePipeline,
     blur_h_pipeline: wgpu::ComputePipeline,
     blur_v_pipeline: wgpu::ComputePipeline,
@@ -9,11 +10,13 @@ pub struct Processor {
 
     input_tex: Option<wgpu::Texture>,
     tex1: Option<wgpu::Texture>, // contrast output
-    tex2: Option<wgpu::Texture>, // sharpen output
-    tex3: Option<wgpu::Texture>, // blur_h output
+    tex2: Option<wgpu::Texture>, // tonal output
+    tex3: Option<wgpu::Texture>, // sharpen output
+    tex4: Option<wgpu::Texture>, // blur_h output
     output_tex: Option<wgpu::Texture>, // blur_v output (final)
 
     contrast_buf: wgpu::Buffer,
+    tonal_buf: wgpu::Buffer,
     blur_buf: wgpu::Buffer,
     sharpen_buf: wgpu::Buffer,
 
@@ -22,6 +25,10 @@ pub struct Processor {
     pub blur_radius: f32,
     pub unsharp_strength: f32,
     pub unsharp_blur_radius: f32,
+    pub blacks: f32,
+    pub shadows: f32,
+    pub highlights: f32,
+    pub whites: f32,
 }
 
 impl Processor {
@@ -95,6 +102,7 @@ impl Processor {
 
         Self {
             contrast_pipeline: make_pipeline("contrast_pass"),
+            tonal_pipeline: make_pipeline("tonal_pass"),
             sharpen_pipeline: make_pipeline("sharpen_pass"),
             blur_h_pipeline: make_pipeline("blur_h_pass"),
             blur_v_pipeline: make_pipeline("blur_v_pass"),
@@ -103,15 +111,21 @@ impl Processor {
             tex1: None,
             tex2: None,
             tex3: None,
+            tex4: None,
             output_tex: None,
-            contrast_buf: make_buf(8),
-            blur_buf: make_buf(8),
-            sharpen_buf: make_buf(8),
+            contrast_buf: make_buf(16),
+            tonal_buf: make_buf(16),
+            blur_buf: make_buf(16),
+            sharpen_buf: make_buf(16),
             image_size: None,
             contrast: 1.0,
             blur_radius: 0.0,
             unsharp_strength: 0.0,
             unsharp_blur_radius: 2.0,
+            blacks: 0.0,
+            shadows: 0.0,
+            highlights: 0.0,
+            whites: 0.0,
         }
     }
 
@@ -162,6 +176,7 @@ impl Processor {
         self.tex1 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex2 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex3 = Some(make_intermediate(wgpu::TextureUsages::empty()));
+        self.tex4 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.output_tex = Some(make_intermediate(wgpu::TextureUsages::COPY_SRC));
         self.image_size = Some((width, height));
 
@@ -191,24 +206,27 @@ impl Processor {
     // Sharpen operates on the contrast-adjusted image (pre-blur) so the unsharp
     // mask anchors off clean signal, independent of the box-blur slider.
     pub fn process(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let (Some(input), Some(t1), Some(t2), Some(t3), Some(output)) = (
+        let (Some(input), Some(t1), Some(t2), Some(t3), Some(t4), Some(output)) = (
             self.input_tex.as_ref(),
             self.tex1.as_ref(),
             self.tex2.as_ref(),
             self.tex3.as_ref(),
+            self.tex4.as_ref(),
             self.output_tex.as_ref(),
         ) else {
             return;
         };
 
-        queue.write_buffer(&self.contrast_buf, 0, bytemuck::cast_slice(&[self.contrast, 0f32]));
-        queue.write_buffer(&self.blur_buf, 0, bytemuck::cast_slice(&[self.blur_radius, 0f32]));
-        queue.write_buffer(&self.sharpen_buf, 0, bytemuck::cast_slice(&[self.unsharp_strength, self.unsharp_blur_radius]));
+        queue.write_buffer(&self.contrast_buf, 0, bytemuck::cast_slice(&[self.contrast, 0f32, 0f32, 0f32]));
+        queue.write_buffer(&self.tonal_buf,    0, bytemuck::cast_slice(&[self.blacks, self.shadows, self.highlights, self.whites]));
+        queue.write_buffer(&self.blur_buf,     0, bytemuck::cast_slice(&[self.blur_radius, 0f32, 0f32, 0f32]));
+        queue.write_buffer(&self.sharpen_buf,  0, bytemuck::cast_slice(&[self.unsharp_strength, self.unsharp_blur_radius, 0f32, 0f32]));
 
         let iv  = input.create_view(&Default::default());
         let t1v = t1.create_view(&Default::default());
         let t2v = t2.create_view(&Default::default());
         let t3v = t3.create_view(&Default::default());
+        let t4v = t4.create_view(&Default::default());
         let ov  = output.create_view(&Default::default());
 
         let bgl = &self.compute_bgl;
@@ -224,10 +242,11 @@ impl Processor {
             })
         };
 
-        let contrast_bg = make_bg(&iv,  &t1v, &self.contrast_buf); // input  → t1
-        let sharpen_bg  = make_bg(&t1v, &t2v, &self.sharpen_buf);  // t1     → t2
-        let blur_h_bg   = make_bg(&t2v, &t3v, &self.blur_buf);     // t2     → t3
-        let blur_v_bg   = make_bg(&t3v, &ov,  &self.blur_buf);     // t3     → output
+        let contrast_bg = make_bg(&iv,  &t1v, &self.contrast_buf); // input → t1
+        let tonal_bg    = make_bg(&t1v, &t2v, &self.tonal_buf);    // t1    → t2
+        let sharpen_bg  = make_bg(&t2v, &t3v, &self.sharpen_buf);  // t2    → t3
+        let blur_h_bg   = make_bg(&t3v, &t4v, &self.blur_buf);     // t3    → t4
+        let blur_v_bg   = make_bg(&t4v, &ov,  &self.blur_buf);     // t4    → output
 
         let (w, h) = self.image_size.unwrap();
         let wg = ((w + 7) / 8, (h + 7) / 8);
@@ -242,6 +261,7 @@ impl Processor {
         };
 
         dispatch(&self.contrast_pipeline, &contrast_bg);
+        dispatch(&self.tonal_pipeline,    &tonal_bg);
         dispatch(&self.sharpen_pipeline,  &sharpen_bg);
         dispatch(&self.blur_h_pipeline,   &blur_h_bg);
         dispatch(&self.blur_v_pipeline,   &blur_v_bg);

@@ -250,10 +250,19 @@ impl App {
                             }};
                         }
 
-                        slider_row!("CONTRAST",            processor.contrast,            0.5..=2.0,  1.0, false);
-                        slider_row!("BOX BLUR RADIUS",     processor.blur_radius,         0.0..=15.0, 0.0, true);
-                        slider_row!("UNSHARP STRENGTH",    processor.unsharp_strength,    0.0..=3.0,  0.0, false);
-                        slider_row!("UNSHARP BLUR RADIUS", processor.unsharp_blur_radius, 1.0..=10.0, 2.0, true);
+                        slider_row!("CONTRAST",            processor.contrast,            0.5..=2.0,    1.0, false);
+                        slider_row!("BOX BLUR RADIUS",     processor.blur_radius,         0.0..=15.0,   0.0, true);
+                        slider_row!("UNSHARP STRENGTH",    processor.unsharp_strength,    0.0..=3.0,    0.0, false);
+                        slider_row!("UNSHARP BLUR RADIUS", processor.unsharp_blur_radius, 1.0..=10.0,   2.0, true);
+
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("TONE").small().color(egui::Color32::from_gray(140)));
+                        ui.add_space(4.0);
+                        slider_row!("BLACKS",     processor.blacks,     -100.0..=100.0, 0.0, true);
+                        slider_row!("SHADOWS",    processor.shadows,    -100.0..=100.0, 0.0, true);
+                        slider_row!("HIGHLIGHTS", processor.highlights, -100.0..=100.0, 0.0, true);
+                        slider_row!("WHITES",     processor.whites,     -100.0..=100.0, 0.0, true);
 
                         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                             ui.add_space(8.0);
