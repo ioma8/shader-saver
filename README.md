@@ -1,6 +1,12 @@
 # shader-saver
 
-Two Metal GPU projects in one Swift package.
+GPU graphics experiments: two Metal projects in a Swift package, plus a Rust image editor.
+
+## Image Processor
+
+A real-time GPU image editor (Rust, wgpu compute shaders + egui): thumbnail
+browser, RAW support, levels/curves/tonal adjustments, auto-correction, and
+SQLite-persisted edits. See [image-processor/README.md](image-processor/README.md).
 
 ## STLViewer
 
