@@ -6,7 +6,7 @@ use std::sync::Arc;
 use egui_wgpu::ScreenDescriptor;
 use processor::Processor;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -67,8 +67,8 @@ impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("Image Processor")
-            .with_inner_size(PhysicalSize::new(1800u32, 1100u32))
-            .with_min_inner_size(PhysicalSize::new(700u32, 500u32));
+            .with_inner_size(LogicalSize::new(1600.0, 1000.0))
+            .with_min_inner_size(LogicalSize::new(900.0, 700.0));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
         let gpu = pollster::block_on(init_gpu(Arc::clone(&window)));
