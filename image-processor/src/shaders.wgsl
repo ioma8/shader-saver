@@ -1,7 +1,7 @@
 @group(0) @binding(0) var input_tex:  texture_2d<f32>;
 @group(0) @binding(1) var output_tex: texture_storage_2d<rgba8unorm, write>;
 
-struct Params { v0: f32, v1: f32, v2: f32, v3: f32 }
+struct Params { v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32, v6: f32, v7: f32 }
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var<storage, read> curve_lut: array<f32, 256>;
 
@@ -101,9 +101,11 @@ fn sharpen_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
         clamp(orig + (orig - blur) * params.v0, vec4<f32>(0.0), vec4<f32>(1.0)));
 }
 
-// Tonal adjustments — params: blacks, shadows, highlights, whites (each -100..100)
+// Tonal adjustments — params: v0..v3 = blacks, shadows, highlights, whites
+// (each -100..100), v4 = brightness (-100..100).
 // Lightroom-style zones: shadows/highlights are endpoint-anchored bumps,
-// blacks/whites shift the endpoints themselves.
+// blacks/whites shift the endpoints themselves. Brightness is a Schlick
+// bias curve on luminance (Capture One-style midtone lift, endpoints fixed).
 // Adjustment is applied as a luminance-proportional scale to preserve hue.
 @compute @workgroup_size(8, 8)
 fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -112,7 +114,8 @@ fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let c = textureLoad(input_tex, vec2<i32>(gid.xy), 0);
 
-    if params.v0 == 0.0 && params.v1 == 0.0 && params.v2 == 0.0 && params.v3 == 0.0 {
+    if params.v0 == 0.0 && params.v1 == 0.0 && params.v2 == 0.0
+        && params.v3 == 0.0 && params.v4 == 0.0 {
         textureStore(output_tex, vec2<i32>(gid.xy), c);
         return;
     }
@@ -124,25 +127,31 @@ fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
     let whites     = params.v3 * 0.01;
 
     let lum = dot(c.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let inv = 1.0 - lum;
+
+    // Brightness: Schlick bias on luminance. b=0.5 is identity; ±100 moves
+    // mid-gray to 0.75/0.25 while black and white points stay fixed.
+    let b = 0.5 + params.v4 * 0.0025;
+    let lum_b = lum / ((1.0 / b - 2.0) * (1.0 - lum) + 1.0);
+
+    let inv = 1.0 - lum_b;
 
     // Shadows/highlights: polynomial bumps zero at BOTH endpoints, so the black
     // and white points stay anchored (no haze when lifting shadows). Peaks are
     // at lum 0.25 / 0.75 with broad falloff covering roughly half the range.
     // 9.4815 = 1 / (0.25 * 0.75^3) normalizes the peak to 1.0.
-    let w_shadows    = 9.4815 * lum * inv * inv * inv;
-    let w_highlights = 9.4815 * lum * lum * lum * inv;
+    let w_shadows    = 9.4815 * lum_b * inv * inv * inv;
+    let w_highlights = 9.4815 * lum_b * lum_b * lum_b * inv;
 
     // Blacks/whites: tight falloff from the endpoints — these intentionally
     // move the black/white points themselves (clipping-style control).
     let w_blacks = inv * inv * inv * inv * inv * inv;
-    let w_whites = lum * lum * lum * lum * lum * lum;
+    let w_whites = lum_b * lum_b * lum_b * lum_b * lum_b * lum_b;
 
     let delta = blacks * 0.25 * w_blacks
               + shadows * 0.35 * w_shadows
               + highlights * 0.35 * w_highlights
               + whites * 0.25 * w_whites;
-    let new_lum = clamp(lum + delta, 0.0, 1.0);
+    let new_lum = clamp(lum_b + delta, 0.0, 1.0);
 
     // Proportional RGB scale preserves hue; fall back to 1.0 for near-black pixels
     let scale = select(new_lum / lum, 1.0, lum < 0.001);

@@ -569,6 +569,7 @@ impl App {
                             }};
                         }
 
+                        slider_row!("BRIGHTNESS",          processor.brightness,          -100.0..=100.0, 0.0, true);
                         slider_row!("CONTRAST",            processor.contrast,            0.5..=2.0,    1.0, false);
                         slider_row!("BOX BLUR RADIUS",     processor.blur_radius,         0.0..=15.0,   0.0, true);
                         slider_row!("UNSHARP STRENGTH",    processor.unsharp_strength,    0.0..=3.0,    0.0, false);

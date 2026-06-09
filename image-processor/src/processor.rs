@@ -39,6 +39,7 @@ pub struct Processor {
     pub shadows: f32,
     pub highlights: f32,
     pub whites: f32,
+    pub brightness: f32,
     // Tone curve control points, normalized [0,1]², sorted by x.
     // Always at least the two endpoints; identity = [[0,0],[1,1]].
     pub curve_points: Vec<[f32; 2]>,
@@ -193,10 +194,10 @@ impl Processor {
             tex3: None,
             tex4: None,
             output_tex: None,
-            contrast_buf: make_buf(16),
-            tonal_buf: make_buf(16),
-            blur_buf: make_buf(16),
-            sharpen_buf: make_buf(16),
+            contrast_buf: make_buf(32),
+            tonal_buf: make_buf(32),
+            blur_buf: make_buf(32),
+            sharpen_buf: make_buf(32),
             curve_buf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: 1024, // 256 LUT entries × 4 bytes
@@ -220,6 +221,7 @@ impl Processor {
             shadows: 0.0,
             highlights: 0.0,
             whites: 0.0,
+            brightness: 0.0,
             curve_points: vec![[0.0, 0.0], [1.0, 1.0]],
         }
     }
@@ -374,10 +376,10 @@ impl Processor {
             return;
         };
 
-        queue.write_buffer(&self.contrast_buf, 0, bytemuck::cast_slice(&[self.contrast, self.levels_black, self.levels_white, self.levels_gamma]));
-        queue.write_buffer(&self.tonal_buf,    0, bytemuck::cast_slice(&[self.blacks, self.shadows, self.highlights, self.whites]));
-        queue.write_buffer(&self.blur_buf,     0, bytemuck::cast_slice(&[self.blur_radius, 0f32, 0f32, 0f32]));
-        queue.write_buffer(&self.sharpen_buf,  0, bytemuck::cast_slice(&[self.unsharp_strength, self.unsharp_blur_radius, 0f32, 0f32]));
+        queue.write_buffer(&self.contrast_buf, 0, bytemuck::cast_slice(&[self.contrast, self.levels_black, self.levels_white, self.levels_gamma, 0f32, 0f32, 0f32, 0f32]));
+        queue.write_buffer(&self.tonal_buf,    0, bytemuck::cast_slice(&[self.blacks, self.shadows, self.highlights, self.whites, self.brightness, 0f32, 0f32, 0f32]));
+        queue.write_buffer(&self.blur_buf,     0, bytemuck::cast_slice(&[self.blur_radius, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32]));
+        queue.write_buffer(&self.sharpen_buf,  0, bytemuck::cast_slice(&[self.unsharp_strength, self.unsharp_blur_radius, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32]));
         let lut = self.curve_lut();
         queue.write_buffer(&self.curve_buf, 0, bytemuck::cast_slice(&lut[..]));
 
