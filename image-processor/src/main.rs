@@ -36,6 +36,8 @@ struct App {
     zoom_fit: bool,
     zoom_scale: f32,
     zoom_offset: egui::Vec2, // image top-left relative to panel top-left
+    // Hold-to-show-original: only activates after 300 ms so double-clicks don't trigger it
+    preview_hold_start: Option<f64>,
 }
 
 impl App {
@@ -53,6 +55,7 @@ impl App {
             zoom_fit: true,
             zoom_scale: 1.0,
             zoom_offset: egui::Vec2::ZERO,
+            preview_hold_start: None,
         }
     }
 }
@@ -195,9 +198,10 @@ impl App {
             let window      = self.window.as_ref().unwrap();
             let egui_state  = self.egui_state.as_mut().unwrap();
             let processor   = self.processor.as_mut().unwrap();
-            let zoom_fit    = &mut self.zoom_fit;
-            let zoom_scale  = &mut self.zoom_scale;
-            let zoom_offset = &mut self.zoom_offset;
+            let zoom_fit          = &mut self.zoom_fit;
+            let zoom_scale        = &mut self.zoom_scale;
+            let zoom_offset       = &mut self.zoom_offset;
+            let preview_hold_start = &mut self.preview_hold_start;
             let raw_input   = egui_state.take_egui_input(window);
             let mut needs_process = false;
 
@@ -226,7 +230,17 @@ impl App {
                                 let mut s = egui::Slider::new(&mut $field, $range).show_value(true);
                                 if $integer { s = s.integer(); }
                                 let r = ui.add(s);
-                                if r.double_clicked() {
+                                // r.double_clicked() only fires on the text input (click sense).
+                                // Also check raw input so double-clicking the track/thumb resets too.
+                                let double_clicked = r.double_clicked()
+                                    || ctx.input(|i| {
+                                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
+                                            && i.pointer
+                                                .interact_pos()
+                                                .map(|p| r.rect.contains(p))
+                                                .unwrap_or(false)
+                                    });
+                                if double_clicked {
                                     $field = $default;
                                     needs_process = true;
                                 } else if r.changed() {
@@ -280,8 +294,26 @@ impl App {
                             egui::Sense::click_and_drag(),
                         );
 
+                        let is_dragging = response.dragged();
+                        let now = ctx.input(|i| i.time);
+
+                        // Track how long the mouse button has been held (without dragging).
+                        // Reset on drag so panning never accidentally shows the original.
+                        if is_dragging {
+                            *preview_hold_start = None;
+                        } else if response.is_pointer_button_down_on() && preview_hold_start.is_none() {
+                            *preview_hold_start = Some(now);
+                        } else if !response.is_pointer_button_down_on() {
+                            *preview_hold_start = None;
+                        }
+
+                        // Only show original after 300 ms — fast double-clicks finish in ~200–400 ms
+                        // and won't reach the threshold, so they don't flash the original.
+                        let held_long_enough = preview_hold_start
+                            .map(|t| now - t > 0.3)
+                            .unwrap_or(false);
                         let show_original = ctx.input(|i| i.key_down(egui::Key::Space))
-                            || response.is_pointer_button_down_on();
+                            || held_long_enough;
                         let tex_id = if show_original { original_tex_id } else { image_tex_id };
 
                         if let Some(tid) = tex_id {
@@ -300,6 +332,11 @@ impl App {
                                 } else {
                                     (*zoom_offset, *zoom_scale)
                                 };
+
+                                // Pan when zoomed — drag translates the image offset
+                                if is_dragging && !*zoom_fit {
+                                    *zoom_offset += response.drag_delta();
+                                }
 
                                 let img_rect = egui::Rect::from_min_size(
                                     panel_rect.min + img_offset,
@@ -342,16 +379,13 @@ impl App {
                                         .unwrap_or(panel_rect.center());
                                     let c = cursor - panel_rect.min;
                                     let factor = (1.0_f32 + scroll * 0.003).clamp(0.8, 1.25);
-                                    let new_scale = (img_scale * factor).clamp(0.05, 20.0);
+                                    // Clamp minimum to fit_scale so scrolling out never goes smaller than fit
+                                    let new_scale = (img_scale * factor).clamp(fit_scale, 20.0);
                                     let ratio = new_scale / img_scale;
                                     *zoom_offset = c - (c - img_offset) * ratio;
                                     *zoom_scale = new_scale;
-                                    *zoom_fit = false;
-
-                                    // Snap back to fit when within 3% of fit scale
-                                    if (new_scale / fit_scale - 1.0).abs() < 0.03 {
-                                        *zoom_fit = true;
-                                    }
+                                    // Snap to fit mode when at or very near the fit scale
+                                    *zoom_fit = new_scale <= fit_scale * 1.03;
                                 }
                             }
                         } else {

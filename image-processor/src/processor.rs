@@ -130,7 +130,7 @@ impl Processor {
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
         });
         queue.write_texture(
             input_tex.as_image_copy(),
@@ -154,7 +154,7 @@ impl Processor {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::STORAGE_BINDING
                     | extra,
-                view_formats: &[],
+                view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
             })
         };
 
@@ -170,11 +170,17 @@ impl Processor {
     }
 
     pub fn output_view(&self) -> Option<wgpu::TextureView> {
-        self.output_tex.as_ref().map(|t| t.create_view(&Default::default()))
+        self.output_tex.as_ref().map(|t| t.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            ..Default::default()
+        }))
     }
 
     pub fn input_view(&self) -> Option<wgpu::TextureView> {
-        self.input_tex.as_ref().map(|t| t.create_view(&Default::default()))
+        self.input_tex.as_ref().map(|t| t.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            ..Default::default()
+        }))
     }
 
     pub fn has_image(&self) -> bool {
