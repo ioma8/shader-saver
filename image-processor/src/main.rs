@@ -207,6 +207,13 @@ impl App {
                         processor.process(&gpu.device, &gpu.queue);
                     }
 
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new("UNSHARP BLUR RADIUS").small().weak());
+                    let ubr = ui.add(egui::Slider::new(&mut processor.unsharp_blur_radius, 1.0..=10.0).integer().show_value(true));
+                    if ubr.changed() {
+                        processor.process(&gpu.device, &gpu.queue);
+                    }
+
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                         ui.add_space(8.0);
                         if ui.add_enabled(processor.has_image(), egui::Button::new("Export PNG…").min_size(egui::vec2(228.0, 0.0))).clicked() {

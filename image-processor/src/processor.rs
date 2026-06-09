@@ -19,6 +19,7 @@ pub struct Processor {
     pub contrast: f32,
     pub blur_radius: f32,
     pub unsharp_strength: f32,
+    pub unsharp_blur_radius: f32,
 }
 
 impl Processor {
@@ -81,10 +82,10 @@ impl Processor {
             })
         };
 
-        let make_buf = || {
+        let make_buf = |size: u64| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: 4,
+                size,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             })
@@ -99,13 +100,14 @@ impl Processor {
             tex1: None,
             tex2: None,
             output_tex: None,
-            contrast_buf: make_buf(),
-            blur_buf: make_buf(),
-            sharpen_buf: make_buf(),
+            contrast_buf: make_buf(8),
+            blur_buf: make_buf(8),
+            sharpen_buf: make_buf(8),
             image_size: None,
             contrast: 1.0,
             blur_radius: 0.0,
             unsharp_strength: 0.0,
+            unsharp_blur_radius: 2.0,
         }
     }
 
@@ -180,9 +182,9 @@ impl Processor {
             return;
         };
 
-        queue.write_buffer(&self.contrast_buf, 0, bytemuck::cast_slice(&[self.contrast]));
-        queue.write_buffer(&self.blur_buf, 0, bytemuck::cast_slice(&[self.blur_radius]));
-        queue.write_buffer(&self.sharpen_buf, 0, bytemuck::cast_slice(&[self.unsharp_strength]));
+        queue.write_buffer(&self.contrast_buf, 0, bytemuck::cast_slice(&[self.contrast, 0f32]));
+        queue.write_buffer(&self.blur_buf, 0, bytemuck::cast_slice(&[self.blur_radius, 0f32]));
+        queue.write_buffer(&self.sharpen_buf, 0, bytemuck::cast_slice(&[self.unsharp_strength, self.unsharp_blur_radius]));
 
         let iv = input.create_view(&Default::default());
         let t1v = t1.create_view(&Default::default());

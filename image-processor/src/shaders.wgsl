@@ -1,7 +1,7 @@
 @group(0) @binding(0) var input_tex:  texture_2d<f32>;
 @group(0) @binding(1) var output_tex: texture_storage_2d<rgba8unorm, write>;
 
-struct Params { value: f32 }
+struct Params { value: f32, value2: f32 }
 @group(0) @binding(2) var<uniform> params: Params;
 
 @compute @workgroup_size(8, 8)
@@ -48,8 +48,9 @@ fn sharpen_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     var blur = vec4<f32>(0.0);
     var count = 0.0;
-    for (var x = -2; x <= 2; x++) {
-        for (var y = -2; y <= 2; y++) {
+    let mask_radius = i32(params.value2);
+    for (var x = -mask_radius; x <= mask_radius; x++) {
+        for (var y = -mask_radius; y <= mask_radius; y++) {
             let coord = vec2<i32>(
                 clamp(i32(gid.x) + x, 0, i32(dims.x) - 1),
                 clamp(i32(gid.y) + y, 0, i32(dims.y) - 1),
