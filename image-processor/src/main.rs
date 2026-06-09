@@ -7,10 +7,13 @@ use egui_wgpu::ScreenDescriptor;
 use processor::Processor;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{WindowEvent};
+use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+const KEY_OPEN_PATH: &str = "open_path";
+const KEY_EXPORT_PATH: &str = "export_path";
 
 struct GpuState {
     device: wgpu::Device,
@@ -27,6 +30,12 @@ struct App {
     egui_renderer: Option<egui_wgpu::Renderer>,
     processor: Option<Processor>,
     image_tex_id: Option<egui::TextureId>,
+    original_tex_id: Option<egui::TextureId>,
+    output_dirty: bool,
+    // Zoom state
+    zoom_fit: bool,
+    zoom_scale: f32,
+    zoom_offset: egui::Vec2, // image top-left relative to panel top-left
 }
 
 impl App {
@@ -39,39 +48,21 @@ impl App {
             egui_renderer: None,
             processor: None,
             image_tex_id: None,
+            original_tex_id: None,
+            output_dirty: false,
+            zoom_fit: true,
+            zoom_scale: 1.0,
+            zoom_offset: egui::Vec2::ZERO,
         }
     }
-
-    fn load_image(&mut self, path: &std::path::Path) {
-        let Some(gpu) = &self.gpu else { return };
-        let Some(processor) = &mut self.processor else { return };
-        let Some(egui_renderer) = &mut self.egui_renderer else { return };
-
-        if processor.load_image(path, &gpu.device, &gpu.queue) {
-            let view = processor.output_view().unwrap();
-            if let Some(old_id) = self.image_tex_id.take() {
-                egui_renderer.free_texture(&old_id);
-            }
-            self.image_tex_id = Some(egui_renderer.register_native_texture(
-                &gpu.device,
-                &view,
-                wgpu::FilterMode::Linear,
-            ));
-            if let Some(window) = &self.window {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image-processor");
-                window.set_title(name);
-            }
-        }
-    }
-
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title("Image Processor")
-            .with_inner_size(PhysicalSize::new(980u32, 600u32))
-            .with_min_inner_size(PhysicalSize::new(600u32, 400u32));
+            .with_inner_size(PhysicalSize::new(1400u32, 900u32))
+            .with_min_inner_size(PhysicalSize::new(700u32, 500u32));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
         let gpu = pollster::block_on(init_gpu(Arc::clone(&window)));
@@ -86,6 +77,12 @@ impl ApplicationHandler for App {
             Some(gpu.device.limits().max_texture_dimension_2d as usize),
         );
 
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = egui::Color32::from_gray(28);
+        visuals.window_fill = egui::Color32::from_gray(28);
+        visuals.override_text_color = Some(egui::Color32::from_gray(220));
+        self.egui_ctx.set_visuals(visuals);
+
         let egui_renderer = egui_wgpu::Renderer::new(&gpu.device, format, None, 1, false);
         let processor = Processor::new(&gpu.device);
 
@@ -97,7 +94,6 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
-        // Forward events to egui first
         if let (Some(state), Some(window)) = (&mut self.egui_state, &self.window) {
             let response = state.on_window_event(window, &event);
             if response.consumed {
@@ -122,7 +118,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::DroppedFile(path) => {
                 let path = path.clone();
-                self.load_image(&path);
+                self.register_image(&path);
             }
 
             WindowEvent::RedrawRequested => {
@@ -141,162 +137,292 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    fn register_image(&mut self, path: &std::path::Path) {
+        let Some(gpu) = &self.gpu else { return };
+        let Some(processor) = &mut self.processor else { return };
+        let Some(egui_renderer) = &mut self.egui_renderer else { return };
+
+        if processor.load_image(path, &gpu.device, &gpu.queue) {
+            if let Some(id) = self.image_tex_id.take() { egui_renderer.free_texture(&id); }
+            if let Some(id) = self.original_tex_id.take() { egui_renderer.free_texture(&id); }
+
+            let output_view = processor.output_view().unwrap();
+            let input_view  = processor.input_view().unwrap();
+
+            self.image_tex_id = Some(egui_renderer.register_native_texture(
+                &gpu.device, &output_view, wgpu::FilterMode::Linear,
+            ));
+            self.original_tex_id = Some(egui_renderer.register_native_texture(
+                &gpu.device, &input_view, wgpu::FilterMode::Linear,
+            ));
+
+            if let Some(window) = &self.window {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image-processor");
+                window.set_title(name);
+            }
+
+            self.output_dirty = true;
+            self.zoom_fit = true; // reset to fit when a new image is loaded
+        }
+    }
+
     fn render(&mut self) {
-        let (Some(gpu), Some(window), Some(egui_state), Some(egui_renderer), Some(processor)) = (
-            self.gpu.as_mut(),
-            self.window.as_ref(),
-            self.egui_state.as_mut(),
-            self.egui_renderer.as_mut(),
-            self.processor.as_mut(),
-        ) else {
+        if self.gpu.is_none() || self.window.is_none()
+            || self.egui_state.is_none() || self.egui_renderer.is_none()
+            || self.processor.is_none()
+        {
             return;
-        };
+        }
 
-        let frame = match gpu.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                gpu.surface.configure(&gpu.device, &gpu.config);
-                return;
-            }
-            Err(e) => {
-                eprintln!("surface error: {e}");
-                return;
+        let frame = {
+            let gpu = self.gpu.as_mut().unwrap();
+            match gpu.surface.get_current_texture() {
+                Ok(f) => f,
+                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                    gpu.surface.configure(&gpu.device, &gpu.config);
+                    return;
+                }
+                Err(e) => { eprintln!("surface error: {e}"); return; }
             }
         };
-
         let frame_view = frame.texture.create_view(&Default::default());
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
 
-        // --- Build egui UI ---
-        let raw_input = egui_state.take_egui_input(window);
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            egui::SidePanel::right("controls")
-                .exact_width(260.0)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.add_space(16.0);
-                    ui.label(egui::RichText::new("IMAGE").small().weak());
-                    if ui.button("Open Image…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Image", &["png", "jpg", "jpeg", "tiff", "tif", "bmp"])
-                            .pick_file()
-                        {
-                            // defer to after egui frame — store path
-                            ctx.data_mut(|d| d.insert_temp(egui::Id::new("open_path"), path));
-                        }
-                    }
-                    ui.separator();
+        let image_tex_id    = self.image_tex_id;
+        let original_tex_id = self.original_tex_id;
 
-                    ui.label(egui::RichText::new("CONTRAST").small().weak());
-                    let cr = ui.add(egui::Slider::new(&mut processor.contrast, 0.1..=3.0).show_value(true));
-                    if cr.changed() {
-                        processor.process(&gpu.device, &gpu.queue);
-                    }
+        // Scoped egui frame — all field borrows dropped at end of block
+        let (shapes, textures_delta, pixels_per_point, open_path, export_path, needs_process) = {
+            let window      = self.window.as_ref().unwrap();
+            let egui_state  = self.egui_state.as_mut().unwrap();
+            let processor   = self.processor.as_mut().unwrap();
+            let zoom_fit    = &mut self.zoom_fit;
+            let zoom_scale  = &mut self.zoom_scale;
+            let zoom_offset = &mut self.zoom_offset;
+            let raw_input   = egui_state.take_egui_input(window);
+            let mut needs_process = false;
 
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("BOX BLUR RADIUS").small().weak());
-                    let br = ui.add(egui::Slider::new(&mut processor.blur_radius, 0.0..=15.0).integer().show_value(true));
-                    if br.changed() {
-                        processor.process(&gpu.device, &gpu.queue);
-                    }
+            let full_output = self.egui_ctx.run(raw_input, |ctx| {
+                egui::SidePanel::right("controls")
+                    .exact_width(260.0)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        ui.add_space(16.0);
 
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("UNSHARP STRENGTH").small().weak());
-                    let sr = ui.add(egui::Slider::new(&mut processor.unsharp_strength, 0.0..=3.0).show_value(true));
-                    if sr.changed() {
-                        processor.process(&gpu.device, &gpu.queue);
-                    }
-
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("UNSHARP BLUR RADIUS").small().weak());
-                    let ubr = ui.add(egui::Slider::new(&mut processor.unsharp_blur_radius, 1.0..=10.0).integer().show_value(true));
-                    if ubr.changed() {
-                        processor.process(&gpu.device, &gpu.queue);
-                    }
-
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.add_space(8.0);
-                        if ui.add_enabled(processor.has_image(), egui::Button::new("Export PNG…").min_size(egui::vec2(228.0, 0.0))).clicked() {
+                        ui.label(egui::RichText::new("IMAGE").small().color(egui::Color32::from_gray(140)));
+                        if ui.button("Open Image…").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("PNG", &["png"])
-                                .set_file_name("output.png")
-                                .save_file()
+                                .add_filter("Image", &["png", "jpg", "jpeg", "tiff", "tif", "bmp"])
+                                .pick_file()
                             {
-                                ctx.data_mut(|d| d.insert_temp(egui::Id::new("export_path"), path));
+                                ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_OPEN_PATH), path));
                             }
                         }
                         ui.separator();
-                    });
-                });
+                        ui.add_space(4.0);
 
-            egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(egui::Color32::from_gray(30)))
-                .show(ctx, |ui| {
-                    if let Some(tex_id) = self.image_tex_id {
-                        let available = ui.available_size();
-                        if let Some((iw, ih)) = processor.image_size {
-                            let scale = (available.x / iw as f32).min(available.y / ih as f32);
-                            let display = egui::vec2(iw as f32 * scale, ih as f32 * scale);
-                            ui.centered_and_justified(|ui| {
-                                ui.image(egui::load::SizedTexture::new(tex_id, display));
-                            });
+                        macro_rules! slider_row {
+                            ($label:expr, $field:expr, $range:expr, $default:expr, $integer:expr) => {{
+                                ui.label(egui::RichText::new($label).small().color(egui::Color32::from_gray(140)));
+                                let mut s = egui::Slider::new(&mut $field, $range).show_value(true);
+                                if $integer { s = s.integer(); }
+                                let r = ui.add(s);
+                                if r.double_clicked() {
+                                    $field = $default;
+                                    needs_process = true;
+                                } else if r.changed() {
+                                    needs_process = true;
+                                }
+                                ui.add_space(8.0);
+                            }};
                         }
-                    } else {
-                        ui.centered_and_justified(|ui| {
-                            ui.label(egui::RichText::new("Drop an image here or use Open Image…").weak());
+
+                        slider_row!("CONTRAST",            processor.contrast,            0.5..=2.0,  1.0, false);
+                        slider_row!("BOX BLUR RADIUS",     processor.blur_radius,         0.0..=15.0, 0.0, true);
+                        slider_row!("UNSHARP STRENGTH",    processor.unsharp_strength,    0.0..=3.0,  0.0, false);
+                        slider_row!("UNSHARP BLUR RADIUS", processor.unsharp_blur_radius, 1.0..=10.0, 2.0, true);
+
+                        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                            ui.add_space(8.0);
+                            if ui.add_enabled(
+                                processor.has_image(),
+                                egui::Button::new("Export PNG…").min_size(egui::vec2(228.0, 0.0)),
+                            ).clicked() {
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("PNG", &["png"])
+                                    .set_file_name("output.png")
+                                    .save_file()
+                                {
+                                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_EXPORT_PATH), path));
+                                }
+                            }
+                            ui.separator();
+
+                            if processor.has_image() {
+                                ui.label(
+                                    egui::RichText::new("Scroll: zoom · Double-click: 100% / fit · Hold/Space: original")
+                                        .small()
+                                        .color(egui::Color32::from_gray(120)),
+                                );
+                            }
                         });
-                    }
-                });
-        });
+                    });
 
-        egui_state.handle_platform_output(window, full_output.platform_output);
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(egui::Color32::from_gray(30)))
+                    .show(ctx, |ui| {
+                        let panel_rect = ui.max_rect();
+                        let panel_size = panel_rect.size();
 
-        // Handle deferred file operations
-        let open_path: Option<PathBuf> = self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new("open_path")));
-        let export_path: Option<PathBuf> = self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new("export_path")));
+                        // Full-panel interaction: captures clicks, double-clicks, hover for zoom
+                        let response = ui.interact(
+                            panel_rect,
+                            ui.id().with("img_area"),
+                            egui::Sense::click_and_drag(),
+                        );
 
+                        let show_original = ctx.input(|i| i.key_down(egui::Key::Space))
+                            || response.is_pointer_button_down_on();
+                        let tex_id = if show_original { original_tex_id } else { image_tex_id };
+
+                        if let Some(tid) = tex_id {
+                            if let Some((iw, ih)) = processor.image_size {
+                                let iw = iw as f32;
+                                let ih = ih as f32;
+                                let fit_scale = (panel_size.x / iw).min(panel_size.y / ih);
+
+                                let (img_offset, img_scale) = if *zoom_fit {
+                                    let fw = iw * fit_scale;
+                                    let fh = ih * fit_scale;
+                                    (egui::vec2(
+                                        (panel_size.x - fw) / 2.0,
+                                        (panel_size.y - fh) / 2.0,
+                                    ), fit_scale)
+                                } else {
+                                    (*zoom_offset, *zoom_scale)
+                                };
+
+                                let img_rect = egui::Rect::from_min_size(
+                                    panel_rect.min + img_offset,
+                                    egui::vec2(iw * img_scale, ih * img_scale),
+                                );
+
+                                ui.painter()
+                                    .with_clip_rect(panel_rect)
+                                    .image(
+                                        tid,
+                                        img_rect,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+
+                                // Double-click: toggle fit ↔ 100%
+                                if response.double_clicked() {
+                                    if *zoom_fit {
+                                        let cursor = response.hover_pos()
+                                            .unwrap_or(panel_rect.center());
+                                        let c = cursor - panel_rect.min;
+                                        // Image pixel under cursor
+                                        let img_px = (c - img_offset) / img_scale;
+                                        // At 100%, top-left = cursor - img_px * 1.0
+                                        *zoom_offset = c - img_px;
+                                        *zoom_scale = 1.0;
+                                        *zoom_fit = false;
+                                    } else {
+                                        *zoom_fit = true;
+                                    }
+                                }
+
+                                // Scroll: zoom at cursor
+                                let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                                if scroll.abs() > 0.5 && response.hovered() {
+                                    let cursor = response.hover_pos()
+                                        .unwrap_or(panel_rect.center());
+                                    let c = cursor - panel_rect.min;
+                                    let factor = (1.0_f32 + scroll * 0.003).clamp(0.8, 1.25);
+                                    let new_scale = (img_scale * factor).clamp(0.05, 20.0);
+                                    let ratio = new_scale / img_scale;
+                                    *zoom_offset = c - (c - img_offset) * ratio;
+                                    *zoom_scale = new_scale;
+                                    *zoom_fit = false;
+
+                                    // Snap back to fit when within 3% of fit scale
+                                    if (new_scale / fit_scale - 1.0).abs() < 0.03 {
+                                        *zoom_fit = true;
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.painter().text(
+                                panel_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Drop an image here or use Open Image…",
+                                egui::FontId::proportional(14.0),
+                                egui::Color32::from_gray(140),
+                            );
+                        }
+                    });
+            });
+
+            egui_state.handle_platform_output(window, full_output.platform_output);
+            let open_path: Option<PathBuf> =
+                self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_OPEN_PATH)));
+            let export_path: Option<PathBuf> =
+                self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_EXPORT_PATH)));
+
+            (full_output.shapes, full_output.textures_delta, full_output.pixels_per_point,
+             open_path, export_path, needs_process)
+        }; // all field borrows dropped here
+
+        // File ops
         if let Some(path) = open_path {
-            let (device, queue) = (&gpu.device, &gpu.queue);
-            if let Some(proc) = &mut self.processor {
-                if proc.load_image(&path, device, queue) {
-                    let view = proc.output_view().unwrap();
-                    if let Some(old) = self.image_tex_id.take() {
-                        egui_renderer.free_texture(&old);
-                    }
-                    self.image_tex_id = Some(egui_renderer.register_native_texture(device, &view, wgpu::FilterMode::Linear));
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image-processor");
-                    window.set_title(name);
-                }
-            }
+            self.register_image(&path);
         }
-
         if let Some(path) = export_path {
-            if let Some(proc) = &self.processor {
+            if let (Some(proc), Some(gpu)) = (&self.processor, &self.gpu) {
                 proc.export(&path, &gpu.device, &gpu.queue);
             }
         }
 
-        // After process(), refresh texture binding if image exists
-        // (output texture contents changed, egui needs to know the view may be stale)
-        if let (Some(proc), Some(tex_id)) = (&self.processor, self.image_tex_id) {
-            if let Some(view) = proc.output_view() {
-                egui_renderer.update_egui_texture_from_wgpu_texture(
-                    &gpu.device,
-                    &view,
-                    wgpu::FilterMode::Linear,
-                    tex_id,
-                );
+        // Process once per frame if any slider changed
+        if needs_process {
+            if let (Some(proc), Some(gpu)) = (self.processor.as_ref(), self.gpu.as_ref()) {
+                proc.process(&gpu.device, &gpu.queue);
             }
+            self.output_dirty = true;
         }
 
-        // Render egui
+        // Refresh output texture only when GPU output changed
+        if self.output_dirty {
+            if let (Some(proc), Some(tex_id)) = (&self.processor, self.image_tex_id) {
+                if let (Some(view), Some(er), Some(gpu)) = (
+                    proc.output_view(),
+                    self.egui_renderer.as_mut(),
+                    self.gpu.as_ref(),
+                ) {
+                    er.update_egui_texture_from_wgpu_texture(
+                        &gpu.device, &view, wgpu::FilterMode::Linear, tex_id,
+                    );
+                }
+            }
+            self.output_dirty = false;
+        }
+
+        // wgpu render
+        let gpu           = self.gpu.as_mut().unwrap();
+        let window        = self.window.as_ref().unwrap();
+        let egui_renderer = self.egui_renderer.as_mut().unwrap();
+
         let size = window.inner_size();
         let screen_descriptor = ScreenDescriptor {
             size_in_pixels: [size.width, size.height],
             pixels_per_point: window.scale_factor() as f32,
         };
-        let tris = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
-        for (id, delta) in full_output.textures_delta.set {
+        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let tris = self.egui_ctx.tessellate(shapes, pixels_per_point);
+        for (id, delta) in textures_delta.set {
             egui_renderer.update_texture(&gpu.device, &gpu.queue, id, &delta);
         }
         egui_renderer.update_buffers(&gpu.device, &gpu.queue, &mut encoder, &tris, &screen_descriptor);
@@ -309,7 +435,7 @@ impl App {
                         view: &frame_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.12, g: 0.12, b: 0.12, a: 1.0 }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.11, g: 0.11, b: 0.11, a: 1.0 }),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -320,7 +446,7 @@ impl App {
             egui_renderer.render(&mut pass, &tris, &screen_descriptor);
         }
 
-        for id in full_output.textures_delta.free {
+        for id in textures_delta.free {
             egui_renderer.free_texture(&id);
         }
 

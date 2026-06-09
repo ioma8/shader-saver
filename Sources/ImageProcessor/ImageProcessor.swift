@@ -19,12 +19,12 @@ final class GPUProcessor: NSObject, MTKViewDelegate {
     private let queue: MTLCommandQueue
     private let contrastPipeline: MTLComputePipelineState
     private let blurPipeline: MTLComputePipelineState
-    private let unsharpPipeline: MTLComputePipelineState
+    private let sharpenPipeline: MTLComputePipelineState
     private let displayPipeline: MTLRenderPipelineState
 
     private var inputTexture: MTLTexture?
     private var tex1: MTLTexture?        // post-contrast
-    private var tex2: MTLTexture?        // post-blur
+    private var tex2: MTLTexture?        // post-sharpen
     private var outputTexture: MTLTexture?
     private var imageAspect: Float = 1.0
 
@@ -41,8 +41,8 @@ final class GPUProcessor: NSObject, MTKViewDelegate {
             function: library.makeFunction(name: "contrastKernel")!)
         blurPipeline     = try! device.makeComputePipelineState(
             function: library.makeFunction(name: "boxBlurKernel")!)
-        unsharpPipeline  = try! device.makeComputePipelineState(
-            function: library.makeFunction(name: "unsharpKernel")!)
+        sharpenPipeline  = try! device.makeComputePipelineState(
+            function: library.makeFunction(name: "sharpenKernel")!)
 
         let pd = MTLRenderPipelineDescriptor()
         pd.vertexFunction   = library.makeFunction(name: "passthroughVertex")
@@ -105,16 +105,18 @@ final class GPUProcessor: NSObject, MTKViewDelegate {
             $0.setBytes(&contrast, length: 4, index: 0)
         }
 
-        var radius = settings.blurRadius
-        computePass(blurPipeline) {
+        // Pass 2: sharpen — reads clean contrast image so unsharp mask anchors off original signal
+        var strength = settings.unsharpStrength
+        computePass(sharpenPipeline) {
             $0.setTexture(t1, index: 0); $0.setTexture(t2, index: 1)
-            $0.setBytes(&radius, length: 4, index: 0)
+            $0.setBytes(&strength, length: 4, index: 0)
         }
 
-        var strength = settings.unsharpStrength
-        computePass(unsharpPipeline) {
-            $0.setTexture(t1, index: 0); $0.setTexture(t2, index: 1); $0.setTexture(output, index: 2)
-            $0.setBytes(&strength, length: 4, index: 0)
+        // Pass 3: box blur applied after sharpening
+        var radius = settings.blurRadius
+        computePass(blurPipeline) {
+            $0.setTexture(t2, index: 0); $0.setTexture(output, index: 1)
+            $0.setBytes(&radius, length: 4, index: 0)
         }
 
         cb.commit()
@@ -240,16 +242,29 @@ final class GPUProcessor: NSObject, MTKViewDelegate {
         output.write(sum / count, gid);
     }
 
-    kernel void unsharpKernel(
-        texture2d<float, access::read>  original [[texture(0)]],
-        texture2d<float, access::read>  blurred  [[texture(1)]],
-        texture2d<float, access::write> output   [[texture(2)]],
+    // Sharpening via unsharp mask — does its own inline 5x5 blur for the mask,
+    // so it's independent of the blur slider.
+    kernel void sharpenKernel(
+        texture2d<float, access::read>  input    [[texture(0)]],
+        texture2d<float, access::write> output   [[texture(1)]],
         constant float&                 strength [[buffer(0)]],
         uint2 gid [[thread_position_in_grid]]
     ) {
-        if (gid.x >= original.get_width() || gid.y >= original.get_height()) return;
-        float4 orig = original.read(gid);
-        float4 blur = blurred.read(gid);
+        if (gid.x >= input.get_width() || gid.y >= input.get_height()) return;
+        float4 orig = input.read(gid);
+        if (strength == 0.0) { output.write(orig, gid); return; }
+        float4 blur  = float4(0);
+        float  count = 0;
+        for (int x = -2; x <= 2; x++) {
+            for (int y = -2; y <= 2; y++) {
+                uint2 coord = uint2(
+                    clamp((int)gid.x + x, 0, (int)input.get_width()  - 1),
+                    clamp((int)gid.y + y, 0, (int)input.get_height() - 1));
+                blur  += input.read(coord);
+                count += 1.0;
+            }
+        }
+        blur /= count;
         output.write(clamp(orig + (orig - blur) * strength, 0.0, 1.0), gid);
     }
 

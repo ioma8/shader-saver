@@ -2,14 +2,16 @@ use std::path::Path;
 
 pub struct Processor {
     contrast_pipeline: wgpu::ComputePipeline,
-    blur_pipeline: wgpu::ComputePipeline,
     sharpen_pipeline: wgpu::ComputePipeline,
+    blur_h_pipeline: wgpu::ComputePipeline,
+    blur_v_pipeline: wgpu::ComputePipeline,
     compute_bgl: wgpu::BindGroupLayout,
 
     input_tex: Option<wgpu::Texture>,
-    tex1: Option<wgpu::Texture>,
-    tex2: Option<wgpu::Texture>,
-    output_tex: Option<wgpu::Texture>,
+    tex1: Option<wgpu::Texture>, // contrast output
+    tex2: Option<wgpu::Texture>, // sharpen output
+    tex3: Option<wgpu::Texture>, // blur_h output
+    output_tex: Option<wgpu::Texture>, // blur_v output (final)
 
     contrast_buf: wgpu::Buffer,
     blur_buf: wgpu::Buffer,
@@ -93,12 +95,14 @@ impl Processor {
 
         Self {
             contrast_pipeline: make_pipeline("contrast_pass"),
-            blur_pipeline: make_pipeline("blur_pass"),
             sharpen_pipeline: make_pipeline("sharpen_pass"),
+            blur_h_pipeline: make_pipeline("blur_h_pass"),
+            blur_v_pipeline: make_pipeline("blur_v_pass"),
             compute_bgl,
             input_tex: None,
             tex1: None,
             tex2: None,
+            tex3: None,
             output_tex: None,
             contrast_buf: make_buf(8),
             blur_buf: make_buf(8),
@@ -157,6 +161,7 @@ impl Processor {
         self.input_tex = Some(input_tex);
         self.tex1 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex2 = Some(make_intermediate(wgpu::TextureUsages::empty()));
+        self.tex3 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.output_tex = Some(make_intermediate(wgpu::TextureUsages::COPY_SRC));
         self.image_size = Some((width, height));
 
@@ -168,15 +173,23 @@ impl Processor {
         self.output_tex.as_ref().map(|t| t.create_view(&Default::default()))
     }
 
+    pub fn input_view(&self) -> Option<wgpu::TextureView> {
+        self.input_tex.as_ref().map(|t| t.create_view(&Default::default()))
+    }
+
     pub fn has_image(&self) -> bool {
         self.input_tex.is_some()
     }
 
+    // Pipeline: contrast → sharpen → blur_h → blur_v
+    // Sharpen operates on the contrast-adjusted image (pre-blur) so the unsharp
+    // mask anchors off clean signal, independent of the box-blur slider.
     pub fn process(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let (Some(input), Some(t1), Some(t2), Some(output)) = (
+        let (Some(input), Some(t1), Some(t2), Some(t3), Some(output)) = (
             self.input_tex.as_ref(),
             self.tex1.as_ref(),
             self.tex2.as_ref(),
+            self.tex3.as_ref(),
             self.output_tex.as_ref(),
         ) else {
             return;
@@ -186,50 +199,47 @@ impl Processor {
         queue.write_buffer(&self.blur_buf, 0, bytemuck::cast_slice(&[self.blur_radius, 0f32]));
         queue.write_buffer(&self.sharpen_buf, 0, bytemuck::cast_slice(&[self.unsharp_strength, self.unsharp_blur_radius]));
 
-        let iv = input.create_view(&Default::default());
+        let iv  = input.create_view(&Default::default());
         let t1v = t1.create_view(&Default::default());
         let t2v = t2.create_view(&Default::default());
-        let ov = output.create_view(&Default::default());
+        let t3v = t3.create_view(&Default::default());
+        let ov  = output.create_view(&Default::default());
 
         let bgl = &self.compute_bgl;
-        let make_bg = |input_view: &wgpu::TextureView, out_view: &wgpu::TextureView, buf: &wgpu::Buffer| {
+        let make_bg = |in_view: &wgpu::TextureView, out_view: &wgpu::TextureView, buf: &wgpu::Buffer| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input_view) },
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(in_view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(out_view) },
                     wgpu::BindGroupEntry { binding: 2, resource: buf.as_entire_binding() },
                 ],
             })
         };
 
-        let contrast_bg = make_bg(&iv, &t1v, &self.contrast_buf);
-        let blur_bg = make_bg(&t1v, &t2v, &self.blur_buf);
-        let sharpen_bg = make_bg(&t2v, &ov, &self.sharpen_buf);
+        let contrast_bg = make_bg(&iv,  &t1v, &self.contrast_buf); // input  → t1
+        let sharpen_bg  = make_bg(&t1v, &t2v, &self.sharpen_buf);  // t1     → t2
+        let blur_h_bg   = make_bg(&t2v, &t3v, &self.blur_buf);     // t2     → t3
+        let blur_v_bg   = make_bg(&t3v, &ov,  &self.blur_buf);     // t3     → output
 
         let (w, h) = self.image_size.unwrap();
         let wg = ((w + 7) / 8, (h + 7) / 8);
 
         let mut encoder = device.create_command_encoder(&Default::default());
-        {
+
+        let mut dispatch = |pipeline: &wgpu::ComputePipeline, bg: &wgpu::BindGroup| {
             let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.contrast_pipeline);
-            pass.set_bind_group(0, &contrast_bg, &[]);
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(wg.0, wg.1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.blur_pipeline);
-            pass.set_bind_group(0, &blur_bg, &[]);
-            pass.dispatch_workgroups(wg.0, wg.1, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.sharpen_pipeline);
-            pass.set_bind_group(0, &sharpen_bg, &[]);
-            pass.dispatch_workgroups(wg.0, wg.1, 1);
-        }
+        };
+
+        dispatch(&self.contrast_pipeline, &contrast_bg);
+        dispatch(&self.sharpen_pipeline,  &sharpen_bg);
+        dispatch(&self.blur_h_pipeline,   &blur_h_bg);
+        dispatch(&self.blur_v_pipeline,   &blur_v_bg);
+
         queue.submit([encoder.finish()]);
     }
 
@@ -269,17 +279,24 @@ impl Processor {
         device.poll(wgpu::Maintain::Wait);
         if rx.recv().unwrap().is_err() { return; }
 
-        let data = slice.get_mapped_range();
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-        for row in 0..height {
-            let start = (row * bytes_per_row) as usize;
-            pixels.extend_from_slice(&data[start..start + (width * 4) as usize]);
-        }
-        drop(data);
+        // Copy pixel data out of the mapped range so we can unmap before the file write
+        let pixels: Vec<u8> = {
+            let data = slice.get_mapped_range();
+            let mut out = Vec::with_capacity((width * height * 4) as usize);
+            for row in 0..height {
+                let start = (row * bytes_per_row) as usize;
+                out.extend_from_slice(&data[start..start + (width * 4) as usize]);
+            }
+            out
+        };
         staging.unmap();
 
-        if let Some(img) = image::RgbaImage::from_raw(width, height, pixels) {
-            img.save(path).ok();
-        }
+        // File I/O on a background thread so the main thread is unblocked
+        let path = path.to_owned();
+        std::thread::spawn(move || {
+            if let Some(img) = image::RgbaImage::from_raw(width, height, pixels) {
+                img.save(path).ok();
+            }
+        });
     }
 }
