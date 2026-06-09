@@ -10,6 +10,10 @@ bytemuck = { version = "1", features = ["derive"] }
 egui = "0.29"
 egui-wgpu = "0.29"
 egui-winit = "0.29"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp", "webp", "gif"] }
 rfd = "0.14"
 pollster = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+imagepipe = "0.5"

@@ -1,10 +1,11 @@
+mod imgload;
 mod processor;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui_wgpu::ScreenDescriptor;
-use processor::Processor;
+use processor::{EditState, Processor};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::WindowEvent;
@@ -16,7 +17,47 @@ const KEY_OPEN_PATH: &str = "open_path";
 const KEY_EXPORT_PATH: &str = "export_path";
 const KEY_SCAN_DIR: &str = "scan_dir";
 
-const IMAGE_EXTS: [&str; 6] = ["png", "jpg", "jpeg", "tiff", "tif", "bmp"];
+// ---- Edit persistence (SQLite, one JSON row per image path) ----
+
+fn open_db() -> Option<rusqlite::Connection> {
+    let home = std::env::var_os("HOME")?;
+    let dir = PathBuf::from(home).join(".image-processor");
+    std::fs::create_dir_all(&dir).ok()?;
+    let conn = rusqlite::Connection::open(dir.join("edits.db")).ok()?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS edits (
+            path    TEXT PRIMARY KEY,
+            params  TEXT NOT NULL,
+            updated INTEGER NOT NULL
+        );",
+    )
+    .ok()?;
+    Some(conn)
+}
+
+fn save_edits(conn: &rusqlite::Connection, path: &Path, state: &EditState) {
+    let Ok(json) = serde_json::to_string(state) else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let _ = conn.execute(
+        "INSERT INTO edits (path, params, updated) VALUES (?1, ?2, ?3)
+         ON CONFLICT(path) DO UPDATE SET params = ?2, updated = ?3",
+        rusqlite::params![path.to_string_lossy(), json, now],
+    );
+}
+
+fn load_edits(conn: &rusqlite::Connection, path: &Path) -> Option<EditState> {
+    let json: String = conn
+        .query_row(
+            "SELECT params FROM edits WHERE path = ?1",
+            rusqlite::params![path.to_string_lossy()],
+            |row| row.get(0),
+        )
+        .ok()?;
+    serde_json::from_str(&json).ok()
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum View {
@@ -62,6 +103,7 @@ struct App {
     thumbs: Vec<ThumbEntry>,
     thumb_rx: Option<std::sync::mpsc::Receiver<(usize, egui::ColorImage)>>,
     current_path: Option<PathBuf>,
+    db: Option<rusqlite::Connection>,
 }
 
 impl App {
@@ -87,6 +129,7 @@ impl App {
             thumbs: Vec::new(),
             thumb_rx: None,
             current_path: None,
+            db: open_db(),
         }
     }
 }
@@ -189,12 +232,7 @@ impl App {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
             .map(|rd| {
                 rd.filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| {
-                        p.extension()
-                            .and_then(|e| e.to_str())
-                            .map(|e| IMAGE_EXTS.contains(&e.to_lowercase().as_str()))
-                            .unwrap_or(false)
-                    })
+                    .filter(|p| imgload::is_supported(p))
                     .collect()
             })
             .unwrap_or_default();
@@ -211,8 +249,7 @@ impl App {
         let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
             for (i, p) in paths.into_iter().enumerate() {
-                let Ok(img) = image::open(&p) else { continue };
-                let t = img.thumbnail(220, 220).to_rgba8();
+                let Some(t) = imgload::load_rgba(&p, 220) else { continue };
                 let (w, h) = t.dimensions();
                 let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &t);
                 if tx.send((i, ci)).is_err() {
@@ -227,6 +264,14 @@ impl App {
         let Some(gpu) = &self.gpu else { return };
         let Some(processor) = &mut self.processor else { return };
         let Some(egui_renderer) = &mut self.egui_renderer else { return };
+
+        // Restore this image's saved edits (or defaults) before the first process
+        let state = self
+            .db
+            .as_ref()
+            .and_then(|db| load_edits(db, path))
+            .unwrap_or_default();
+        processor.apply_edit_state(&state);
 
         if processor.load_image(path, &gpu.device, &gpu.queue) {
             if let Some(id) = self.image_tex_id.take() { egui_renderer.free_texture(&id); }
@@ -776,7 +821,7 @@ impl App {
                         ui.add_space(6.0);
                         if ui.button("Open Image…").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Image", &["png", "jpg", "jpeg", "tiff", "tif", "bmp"])
+                                .add_filter("Images", &imgload::all_exts())
                                 .pick_file()
                             {
                                 ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_OPEN_PATH), path));
@@ -857,6 +902,14 @@ impl App {
                                 {
                                     ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_EXPORT_PATH), path));
                                 }
+                            }
+                            // bottom_up layout: added after Export, so it sits above it
+                            if ui.add_enabled(
+                                processor.has_image(),
+                                egui::Button::new("Reset All Edits").min_size(egui::vec2(228.0, 0.0)),
+                            ).clicked() {
+                                processor.apply_edit_state(&EditState::default());
+                                needs_process = true; // re-process + persist the reset
                             }
                             ui.separator();
 
@@ -1014,10 +1067,15 @@ impl App {
             }
         }
 
-        // Process once per frame if any slider changed
+        // Process once per frame if any slider changed, and persist the edit
         if needs_process {
             if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
                 proc.process(&gpu.device, &gpu.queue);
+            }
+            if let (Some(db), Some(path), Some(proc)) =
+                (&self.db, &self.current_path, &self.processor)
+            {
+                save_edits(db, path, &proc.edit_state());
             }
             self.output_dirty = true;
         }

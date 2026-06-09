@@ -1,5 +1,49 @@
 use std::path::Path;
 
+// Everything that defines an image's edit, serialized to SQLite as JSON.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct EditState {
+    pub exposure: f32,
+    pub brightness: f32,
+    pub contrast: f32,
+    pub wb_temp: f32,
+    pub wb_tint: f32,
+    pub levels_black: f32,
+    pub levels_white: f32,
+    pub levels_gamma: f32,
+    pub blur_radius: f32,
+    pub unsharp_strength: f32,
+    pub unsharp_blur_radius: f32,
+    pub blacks: f32,
+    pub shadows: f32,
+    pub highlights: f32,
+    pub whites: f32,
+    pub curve_points: Vec<[f32; 2]>,
+}
+
+impl Default for EditState {
+    fn default() -> Self {
+        Self {
+            exposure: 0.0,
+            brightness: 0.0,
+            contrast: 0.0,
+            wb_temp: 0.0,
+            wb_tint: 0.0,
+            levels_black: 0.0,
+            levels_white: 255.0,
+            levels_gamma: 1.0,
+            blur_radius: 0.0,
+            unsharp_strength: 0.0,
+            unsharp_blur_radius: 2.0,
+            blacks: 0.0,
+            shadows: 0.0,
+            highlights: 0.0,
+            whites: 0.0,
+            curve_points: vec![[0.0, 0.0], [1.0, 1.0]],
+        }
+    }
+}
+
 pub struct Processor {
     contrast_pipeline: wgpu::ComputePipeline,
     tonal_pipeline: wgpu::ComputePipeline,
@@ -294,10 +338,53 @@ impl Processor {
         lut
     }
 
+    pub fn edit_state(&self) -> EditState {
+        EditState {
+            exposure: self.exposure,
+            brightness: self.brightness,
+            contrast: self.contrast,
+            wb_temp: self.wb_temp,
+            wb_tint: self.wb_tint,
+            levels_black: self.levels_black,
+            levels_white: self.levels_white,
+            levels_gamma: self.levels_gamma,
+            blur_radius: self.blur_radius,
+            unsharp_strength: self.unsharp_strength,
+            unsharp_blur_radius: self.unsharp_blur_radius,
+            blacks: self.blacks,
+            shadows: self.shadows,
+            highlights: self.highlights,
+            whites: self.whites,
+            curve_points: self.curve_points.clone(),
+        }
+    }
+
+    pub fn apply_edit_state(&mut self, s: &EditState) {
+        self.exposure = s.exposure;
+        self.brightness = s.brightness;
+        self.contrast = s.contrast;
+        self.wb_temp = s.wb_temp;
+        self.wb_tint = s.wb_tint;
+        self.levels_black = s.levels_black;
+        self.levels_white = s.levels_white;
+        self.levels_gamma = s.levels_gamma;
+        self.blur_radius = s.blur_radius;
+        self.unsharp_strength = s.unsharp_strength;
+        self.unsharp_blur_radius = s.unsharp_blur_radius;
+        self.blacks = s.blacks;
+        self.shadows = s.shadows;
+        self.highlights = s.highlights;
+        self.whites = s.whites;
+        self.curve_points = if s.curve_points.len() >= 2 {
+            s.curve_points.clone()
+        } else {
+            vec![[0.0, 0.0], [1.0, 1.0]]
+        };
+    }
+
     pub fn load_image(&mut self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
-        let img = match image::open(path) {
-            Ok(i) => i.to_rgba8(),
-            Err(_) => return false,
+        let Some(img) = crate::imgload::load_rgba(path, 0) else {
+            return false;
         };
         let (width, height) = img.dimensions();
 
