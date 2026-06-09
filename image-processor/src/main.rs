@@ -220,24 +220,53 @@ impl App {
                             let hist = &processor.histogram;
                             let max = hist.iter().copied().max().unwrap_or(1).max(1) as f32;
                             let log_max = (max + 1.0).ln().max(1.0);
-                            let bar_w = hist_rect.width() / 256.0;
+                            let bar_w  = hist_rect.width() / 256.0;
+                            let b      = hist_rect.bottom();
+                            let color  = egui::Color32::from_gray(190);
+                            let uv     = egui::epaint::WHITE_UV;
 
-                            // Build a closed polygon: bottom-left → silhouette → bottom-right
-                            let mut pts = Vec::with_capacity(258);
-                            pts.push(egui::pos2(hist_rect.left(), hist_rect.bottom()));
-                            for (i, &count) in hist.iter().enumerate() {
-                                let h = ((count as f32 + 1.0).ln() / log_max) * hist_rect.height();
-                                let x = hist_rect.left() + (i as f32 + 0.5) * bar_w;
-                                pts.push(egui::pos2(x, hist_rect.bottom() - h));
+                            let hs: Vec<f32> = hist.iter().map(|&c| {
+                                ((c as f32 + 1.0).ln() / log_max) * hist_rect.height()
+                            }).collect();
+                            let cx = |i: usize| hist_rect.left() + (i as f32 + 0.5) * bar_w;
+
+                            // Explicit mesh: left cap + 255 trapezoids + right cap.
+                            // Bypasses PathShape tessellation so fill is always correct.
+                            let mut mesh = egui::Mesh::default();
+                            let push3 = |m: &mut egui::Mesh, p: [egui::Pos2; 3]| {
+                                let v = m.vertices.len() as u32;
+                                for pos in p { m.vertices.push(egui::epaint::Vertex { pos, uv, color }); }
+                                m.indices.extend_from_slice(&[v, v+1, v+2]);
+                            };
+                            let push4 = |m: &mut egui::Mesh, p: [egui::Pos2; 4]| {
+                                let v = m.vertices.len() as u32;
+                                for pos in p { m.vertices.push(egui::epaint::Vertex { pos, uv, color }); }
+                                m.indices.extend_from_slice(&[v, v+1, v+2, v, v+2, v+3]);
+                            };
+
+                            // Left cap triangle
+                            push3(&mut mesh, [
+                                egui::pos2(hist_rect.left(), b),
+                                egui::pos2(cx(0), b - hs[0]),
+                                egui::pos2(cx(0), b),
+                            ]);
+                            // Trapezoids between adjacent bin centers
+                            for i in 0..255 {
+                                push4(&mut mesh, [
+                                    egui::pos2(cx(i),   b - hs[i]),
+                                    egui::pos2(cx(i+1), b - hs[i+1]),
+                                    egui::pos2(cx(i+1), b),
+                                    egui::pos2(cx(i),   b),
+                                ]);
                             }
-                            pts.push(egui::pos2(hist_rect.right(), hist_rect.bottom()));
+                            // Right cap triangle
+                            push3(&mut mesh, [
+                                egui::pos2(cx(255), b - hs[255]),
+                                egui::pos2(hist_rect.right(), b),
+                                egui::pos2(cx(255), b),
+                            ]);
 
-                            painter.add(egui::Shape::Path(egui::epaint::PathShape {
-                                points: pts,
-                                closed: true,
-                                fill: egui::Color32::from_gray(190),
-                                stroke: egui::epaint::PathStroke::NONE,
-                            }));
+                            painter.add(egui::Shape::Mesh(mesh));
                         }
 
                         ui.add_space(10.0);
