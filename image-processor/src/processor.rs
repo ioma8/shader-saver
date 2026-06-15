@@ -59,10 +59,10 @@ pub struct Processor {
     compute_bgl: wgpu::BindGroupLayout,
 
     input_tex: Option<wgpu::Texture>,
-    tex1: Option<wgpu::Texture>, // contrast output
-    tex2: Option<wgpu::Texture>, // tonal output
-    tex3: Option<wgpu::Texture>, // sharpen output
-    tex4: Option<wgpu::Texture>, // blur_h output
+    tex1: Option<wgpu::Texture>,       // contrast output
+    tex2: Option<wgpu::Texture>,       // tonal output
+    tex3: Option<wgpu::Texture>,       // sharpen output
+    tex4: Option<wgpu::Texture>,       // blur_h output
     output_tex: Option<wgpu::Texture>, // blur_v output (final)
 
     contrast_buf: wgpu::Buffer,
@@ -78,13 +78,13 @@ pub struct Processor {
     pub histogram: [u32; 256],
 
     pub image_size: Option<(u32, u32)>,
-    pub exposure: f32, // stops
-    pub contrast: f32, // -100..100, 0 = neutral
-    pub wb_temp: f32,  // -100..100, blue ↔ yellow
-    pub wb_tint: f32,  // -100..100, green ↔ magenta
-    pub levels_black: f32,  // 0–255
-    pub levels_white: f32,  // 0–255
-    pub levels_gamma: f32,  // 0.1–10.0
+    pub exposure: f32,     // stops
+    pub contrast: f32,     // -100..100, 0 = neutral
+    pub wb_temp: f32,      // -100..100, blue ↔ yellow
+    pub wb_tint: f32,      // -100..100, green ↔ magenta
+    pub levels_black: f32, // 0–255
+    pub levels_white: f32, // 0–255
+    pub levels_gamma: f32, // 0.1–10.0
     pub blur_radius: f32,
     pub unsharp_strength: f32,
     pub unsharp_blur_radius: f32,
@@ -457,15 +457,21 @@ impl Processor {
         }
     }
 
-    pub fn load_image(&mut self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
-        let Some(img) = crate::imgload::load_rgba(path, 0) else {
-            return false;
-        };
+    pub fn upload_rgba(
+        &mut self,
+        img: &image::RgbaImage,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
         let (width, height) = img.dimensions();
 
         let input_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -481,13 +487,21 @@ impl Processor {
                 bytes_per_row: Some(4 * width),
                 rows_per_image: None,
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
 
         let make_intermediate = |extra: wgpu::TextureUsages| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -508,21 +522,24 @@ impl Processor {
         self.image_size = Some((width, height));
 
         self.process(device, queue);
-        true
     }
 
     pub fn output_view(&self) -> Option<wgpu::TextureView> {
-        self.output_tex.as_ref().map(|t| t.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-            ..Default::default()
-        }))
+        self.output_tex.as_ref().map(|t| {
+            t.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                ..Default::default()
+            })
+        })
     }
 
     pub fn input_view(&self) -> Option<wgpu::TextureView> {
-        self.input_tex.as_ref().map(|t| t.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
-            ..Default::default()
-        }))
+        self.input_tex.as_ref().map(|t| {
+            t.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                ..Default::default()
+            })
+        })
     }
 
     pub fn has_image(&self) -> bool {
@@ -544,40 +561,96 @@ impl Processor {
             return;
         };
 
-        queue.write_buffer(&self.contrast_buf, 0, bytemuck::cast_slice(&[self.contrast, self.levels_black, self.levels_white, self.levels_gamma, self.exposure, self.wb_temp, self.wb_tint, 0f32]));
-        queue.write_buffer(&self.tonal_buf,    0, bytemuck::cast_slice(&[self.blacks, self.shadows, self.highlights, self.whites, self.brightness, self.vignette, self.vignette_mid, 0f32]));
-        queue.write_buffer(&self.blur_buf,     0, bytemuck::cast_slice(&[self.blur_radius, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32]));
-        queue.write_buffer(&self.sharpen_buf,  0, bytemuck::cast_slice(&[self.unsharp_strength, self.unsharp_blur_radius, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32]));
+        queue.write_buffer(
+            &self.contrast_buf,
+            0,
+            bytemuck::cast_slice(&[
+                self.contrast,
+                self.levels_black,
+                self.levels_white,
+                self.levels_gamma,
+                self.exposure,
+                self.wb_temp,
+                self.wb_tint,
+                0f32,
+            ]),
+        );
+        queue.write_buffer(
+            &self.tonal_buf,
+            0,
+            bytemuck::cast_slice(&[
+                self.blacks,
+                self.shadows,
+                self.highlights,
+                self.whites,
+                self.brightness,
+                self.vignette,
+                self.vignette_mid,
+                0f32,
+            ]),
+        );
+        queue.write_buffer(
+            &self.blur_buf,
+            0,
+            bytemuck::cast_slice(&[self.blur_radius, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32]),
+        );
+        queue.write_buffer(
+            &self.sharpen_buf,
+            0,
+            bytemuck::cast_slice(&[
+                self.unsharp_strength,
+                self.unsharp_blur_radius,
+                0f32,
+                0f32,
+                0f32,
+                0f32,
+                0f32,
+                0f32,
+            ]),
+        );
         let lut = self.curve_lut();
         queue.write_buffer(&self.curve_buf, 0, bytemuck::cast_slice(&lut[..]));
 
-        let iv  = input.create_view(&Default::default());
+        let iv = input.create_view(&Default::default());
         let t1v = t1.create_view(&Default::default());
         let t2v = t2.create_view(&Default::default());
         let t3v = t3.create_view(&Default::default());
         let t4v = t4.create_view(&Default::default());
-        let ov  = output.create_view(&Default::default());
+        let ov = output.create_view(&Default::default());
 
         let bgl = &self.compute_bgl;
         let curve_buf = &self.curve_buf;
-        let make_bg = |in_view: &wgpu::TextureView, out_view: &wgpu::TextureView, buf: &wgpu::Buffer| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(in_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(out_view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: curve_buf.as_entire_binding() },
-                ],
-            })
-        };
+        let make_bg =
+            |in_view: &wgpu::TextureView, out_view: &wgpu::TextureView, buf: &wgpu::Buffer| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(in_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(out_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: curve_buf.as_entire_binding(),
+                        },
+                    ],
+                })
+            };
 
-        let contrast_bg = make_bg(&iv,  &t1v, &self.contrast_buf); // input → t1
-        let tonal_bg    = make_bg(&t1v, &t2v, &self.tonal_buf);    // t1    → t2
-        let sharpen_bg  = make_bg(&t2v, &t3v, &self.sharpen_buf);  // t2    → t3
-        let blur_h_bg   = make_bg(&t3v, &t4v, &self.blur_buf);     // t3    → t4
-        let blur_v_bg   = make_bg(&t4v, &ov,  &self.blur_buf);     // t4    → output
+        let contrast_bg = make_bg(&iv, &t1v, &self.contrast_buf); // input → t1
+        let tonal_bg = make_bg(&t1v, &t2v, &self.tonal_buf); // t1    → t2
+        let sharpen_bg = make_bg(&t2v, &t3v, &self.sharpen_buf); // t2    → t3
+        let blur_h_bg = make_bg(&t3v, &t4v, &self.blur_buf); // t3    → t4
+        let blur_v_bg = make_bg(&t4v, &ov, &self.blur_buf); // t4    → output
 
         let (w, h) = self.image_size.unwrap();
         let wg = ((w + 7) / 8, (h + 7) / 8);
@@ -592,10 +665,10 @@ impl Processor {
         };
 
         dispatch(&self.contrast_pipeline, &contrast_bg);
-        dispatch(&self.tonal_pipeline,    &tonal_bg);
-        dispatch(&self.sharpen_pipeline,  &sharpen_bg);
-        dispatch(&self.blur_h_pipeline,   &blur_h_bg);
-        dispatch(&self.blur_v_pipeline,   &blur_v_bg);
+        dispatch(&self.tonal_pipeline, &tonal_bg);
+        dispatch(&self.sharpen_pipeline, &sharpen_bg);
+        dispatch(&self.blur_h_pipeline, &blur_h_bg);
+        dispatch(&self.blur_v_pipeline, &blur_v_bg);
 
         queue.submit([encoder.finish()]);
 
@@ -607,8 +680,14 @@ impl Processor {
             label: None,
             layout: &self.histogram_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&hist_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: self.histogram_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&hist_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.histogram_buf.as_entire_binding(),
+                },
             ],
         });
         let mut enc = device.create_command_encoder(&Default::default());
@@ -623,7 +702,9 @@ impl Processor {
 
         let slice = self.histogram_staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
         device.poll(wgpu::Maintain::Wait);
         if rx.recv().unwrap().is_ok() {
             let data = slice.get_mapped_range();
@@ -634,7 +715,8 @@ impl Processor {
     }
 
     pub fn export(&self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let (Some(output), Some((width, height))) = (self.output_tex.as_ref(), self.image_size) else {
+        let (Some(output), Some((width, height))) = (self.output_tex.as_ref(), self.image_size)
+        else {
             return;
         };
 
@@ -659,15 +741,23 @@ impl Processor {
                     rows_per_image: None,
                 },
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         queue.submit([encoder.finish()]);
 
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
         device.poll(wgpu::Maintain::Wait);
-        if rx.recv().unwrap().is_err() { return; }
+        if rx.recv().unwrap().is_err() {
+            return;
+        }
 
         // Copy pixel data out of the mapped range so we can unmap before the file write
         let pixels: Vec<u8> = {

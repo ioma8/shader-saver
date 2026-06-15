@@ -1,19 +1,24 @@
 // Unified image loading: standard formats via the `image` crate, camera RAW
 // formats via rawloader/imagepipe (pure-Rust decode + demosaic).
+use jpgfromraw::FindJpegType;
 use std::path::Path;
 
 pub const STD_EXTS: [&str; 8] = ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "gif"];
 pub const RAW_EXTS: [&str; 19] = [
-    "dng", "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf", "pef", "srw",
-    "mrw", "kdc", "dcr", "erf", "mef", "mos", "nrw", "3fr", "x3f",
+    "dng", "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf", "pef", "srw", "mrw", "kdc", "dcr",
+    "erf", "mef", "mos", "nrw", "3fr", "x3f",
 ];
 
 fn ext_of(path: &Path) -> Option<String> {
-    path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase())
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
 }
 
 pub fn is_raw(path: &Path) -> bool {
-    ext_of(path).map(|e| RAW_EXTS.contains(&e.as_str())).unwrap_or(false)
+    ext_of(path)
+        .map(|e| RAW_EXTS.contains(&e.as_str()))
+        .unwrap_or(false)
 }
 
 pub fn is_supported(path: &Path) -> bool {
@@ -24,6 +29,36 @@ pub fn is_supported(path: &Path) -> bool {
 
 pub fn all_exts() -> Vec<&'static str> {
     STD_EXTS.iter().chain(RAW_EXTS.iter()).copied().collect()
+}
+
+pub fn load_preview_rgba(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
+    if is_raw(path) {
+        if let Some(img) = jpgfromraw_preview(path, max_dim) {
+            return Some(img);
+        }
+    }
+    load_rgba(path, max_dim)
+}
+
+pub fn load_edit_rgba(path: &Path) -> Option<(image::RgbaImage, bool)> {
+    if is_raw(path) {
+        if let Some(img) = jpgfromraw_preview(path, 0) {
+            return Some((img, true));
+        }
+    }
+    load_rgba(path, 0).map(|img| (img, false))
+}
+
+fn jpgfromraw_preview(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
+    let bytes =
+        pollster::block_on(jpgfromraw::process_file_bytes(path, FindJpegType::Largest)).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let img = if max_dim > 0 {
+        img.thumbnail(max_dim, max_dim)
+    } else {
+        img
+    };
+    Some(img.to_rgba8())
 }
 
 // Decode to RGBA8. max_dim = 0 loads full resolution; otherwise the result
@@ -40,7 +75,11 @@ pub fn load_rgba(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
         image::RgbaImage::from_raw(dec.width as u32, dec.height as u32, rgba)
     } else {
         let img = image::open(path).ok()?;
-        let img = if max_dim > 0 { img.thumbnail(max_dim, max_dim) } else { img };
+        let img = if max_dim > 0 {
+            img.thumbnail(max_dim, max_dim)
+        } else {
+            img
+        };
         Some(img.to_rgba8())
     }
 }

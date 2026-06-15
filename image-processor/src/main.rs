@@ -1,6 +1,8 @@
+mod cull;
 mod imgload;
 mod processor;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,6 +19,9 @@ const KEY_OPEN_PATH: &str = "open_path";
 const KEY_EXPORT_PATH: &str = "export_path";
 const KEY_SCAN_DIR: &str = "scan_dir";
 const KEY_AUTO: &str = "auto_adjust";
+const KEY_TRASH_REJECTS: &str = "trash_rejects";
+const KEY_MOVE_REJECTS: &str = "move_rejects";
+const KEY_COPY_PICKS: &str = "copy_picks";
 
 // ---- Edit persistence (SQLite, one JSON row per image path) ----
 
@@ -33,11 +38,14 @@ fn open_db() -> Option<rusqlite::Connection> {
         );",
     )
     .ok()?;
+    cull::init_meta_table(&conn);
     Some(conn)
 }
 
 fn save_edits(conn: &rusqlite::Connection, path: &Path, state: &EditState) {
-    let Ok(json) = serde_json::to_string(state) else { return };
+    let Ok(json) = serde_json::to_string(state) else {
+        return;
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -60,15 +68,82 @@ fn load_edits(conn: &rusqlite::Connection, path: &Path) -> Option<EditState> {
     serde_json::from_str(&json).ok()
 }
 
+fn label_color(label: cull::Label) -> Option<egui::Color32> {
+    match label {
+        cull::Label::None => None,
+        cull::Label::Red => Some(egui::Color32::from_rgb(224, 92, 92)),
+        cull::Label::Yellow => Some(egui::Color32::from_rgb(225, 204, 72)),
+        cull::Label::Green => Some(egui::Color32::from_rgb(94, 186, 113)),
+        cull::Label::Blue => Some(egui::Color32::from_rgb(96, 152, 233)),
+    }
+}
+
+fn paint_badges(p: &egui::Painter, rect: egui::Rect, meta: cull::CullMeta) {
+    if meta.flag == cull::Flag::Reject {
+        p.rect_filled(
+            egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 4.0), egui::vec2(14.0, 14.0)),
+            3.0,
+            egui::Color32::from_rgb(170, 60, 60),
+        );
+        p.text(
+            rect.min + egui::vec2(11.0, 11.0),
+            egui::Align2::CENTER_CENTER,
+            "✕",
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+    } else if meta.flag == cull::Flag::Pick {
+        p.rect_filled(
+            egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 4.0), egui::vec2(14.0, 14.0)),
+            3.0,
+            egui::Color32::from_rgb(66, 128, 235),
+        );
+        p.text(
+            rect.min + egui::vec2(11.0, 11.0),
+            egui::Align2::CENTER_CENTER,
+            "✓",
+            egui::FontId::proportional(11.0),
+            egui::Color32::WHITE,
+        );
+    }
+    if meta.rating > 0 {
+        p.text(
+            rect.left_bottom() + egui::vec2(6.0, -6.0),
+            egui::Align2::LEFT_BOTTOM,
+            "★".repeat(meta.rating as usize),
+            egui::FontId::proportional(10.0),
+            egui::Color32::from_rgb(235, 196, 55),
+        );
+    }
+    if let Some(color) = label_color(meta.label) {
+        p.circle_filled(rect.right_top() - egui::vec2(11.0, -11.0), 4.0, color);
+    }
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum View {
     Browse,
     Edit,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum BrowseFilter {
+    All,
+    Picks,
+    Rejects,
+    Unflagged,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum BrowseSort {
+    Name,
+    Date,
+}
+
 struct ThumbEntry {
     path: PathBuf,
     tex: Option<egui::TextureHandle>,
+    mtime: Option<std::time::SystemTime>,
 }
 
 struct GpuState {
@@ -104,11 +179,26 @@ struct App {
     thumbs: Vec<ThumbEntry>,
     thumb_rx: Option<std::sync::mpsc::Receiver<(usize, egui::ColorImage)>>,
     current_path: Option<PathBuf>,
+    selected: Option<PathBuf>,
+    meta: HashMap<PathBuf, cull::CullMeta>,
+    filter: BrowseFilter,
+    min_rating: u8,
+    sort: BrowseSort,
+    strip_scroll: bool,
+    grid_scroll: bool,
+    confirm_trash: bool,
+    full_tx: std::sync::mpsc::Sender<(PathBuf, image::RgbaImage)>,
+    full_rx: std::sync::mpsc::Receiver<(PathBuf, image::RgbaImage)>,
+    full_pending: Option<PathBuf>,
+    wants_full: Option<(PathBuf, std::time::Instant)>,
     db: Option<rusqlite::Connection>,
 }
 
 impl App {
     fn new() -> Self {
+        let db = open_db();
+        let meta = db.as_ref().map(cull::load_all_meta).unwrap_or_default();
+        let (full_tx, full_rx) = std::sync::mpsc::channel();
         Self {
             window: None,
             gpu: None,
@@ -130,7 +220,19 @@ impl App {
             thumbs: Vec::new(),
             thumb_rx: None,
             current_path: None,
-            db: open_db(),
+            selected: None,
+            meta,
+            filter: BrowseFilter::All,
+            min_rating: 0,
+            sort: BrowseSort::Name,
+            strip_scroll: false,
+            grid_scroll: false,
+            confirm_trash: false,
+            full_tx,
+            full_rx,
+            full_pending: None,
+            wants_full: None,
+            db,
         }
     }
 }
@@ -242,7 +344,11 @@ impl App {
         self.browse_dir = Some(dir.to_owned());
         self.thumbs = paths
             .iter()
-            .map(|p| ThumbEntry { path: p.clone(), tex: None })
+            .map(|p| ThumbEntry {
+                path: p.clone(),
+                tex: None,
+                mtime: std::fs::metadata(p).and_then(|m| m.modified()).ok(),
+            })
             .collect();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -250,7 +356,9 @@ impl App {
         let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
             for (i, p) in paths.into_iter().enumerate() {
-                let Some(t) = imgload::load_rgba(&p, 220) else { continue };
+                let Some(t) = imgload::load_preview_rgba(&p, 220) else {
+                    continue;
+                };
                 let (w, h) = t.dimensions();
                 let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &t);
                 if tx.send((i, ci)).is_err() {
@@ -261,12 +369,91 @@ impl App {
         });
     }
 
+    fn rebind_image_textures(&mut self) {
+        let (Some(gpu), Some(proc), Some(er)) = (
+            self.gpu.as_ref(),
+            self.processor.as_ref(),
+            self.egui_renderer.as_mut(),
+        ) else {
+            return;
+        };
+        if let Some(id) = self.image_tex_id.take() {
+            er.free_texture(&id);
+        }
+        if let Some(id) = self.original_tex_id.take() {
+            er.free_texture(&id);
+        }
+        let output_view = proc.output_view().unwrap();
+        let input_view = proc.input_view().unwrap();
+        self.image_tex_id =
+            Some(er.register_native_texture(&gpu.device, &output_view, wgpu::FilterMode::Linear));
+        self.original_tex_id =
+            Some(er.register_native_texture(&gpu.device, &input_view, wgpu::FilterMode::Linear));
+    }
+
+    fn apply_cull_action(&mut self, path: &Path, action: cull::CullAction) {
+        let mut meta = self.meta.get(path).copied().unwrap_or_default();
+        cull::apply_action(&mut meta, action);
+        if meta.is_default() {
+            self.meta.remove(path);
+        } else {
+            self.meta.insert(path.to_owned(), meta);
+        }
+        if let Some(db) = &self.db {
+            cull::save_meta(db, path, meta);
+        }
+    }
+
+    fn flag_count(&self, flag: cull::Flag) -> usize {
+        self.thumbs
+            .iter()
+            .filter(|t| self.meta.get(&t.path).map_or(false, |m| m.flag == flag))
+            .count()
+    }
+
+    fn flagged_paths(&self, flag: cull::Flag) -> Vec<PathBuf> {
+        self.thumbs
+            .iter()
+            .filter(|t| self.meta.get(&t.path).map_or(false, |m| m.flag == flag))
+            .map(|t| t.path.clone())
+            .collect()
+    }
+
+    fn after_files_removed(&mut self, removed: &[PathBuf]) {
+        if removed.is_empty() {
+            return;
+        }
+        if self
+            .current_path
+            .as_ref()
+            .map_or(false, |path| removed.contains(path))
+        {
+            self.current_path = None;
+            self.view = View::Browse;
+            self.wants_full = None;
+            self.full_pending = None;
+        }
+        if self
+            .selected
+            .as_ref()
+            .map_or(false, |path| removed.contains(path))
+        {
+            self.selected = None;
+        }
+        if let Some(dir) = self.browse_dir.clone() {
+            self.scan_folder(&dir);
+        }
+    }
+
     fn register_image(&mut self, path: &std::path::Path) {
         let Some(gpu) = &self.gpu else { return };
-        let Some(processor) = &mut self.processor else { return };
-        let Some(egui_renderer) = &mut self.egui_renderer else { return };
+        let Some(processor) = &mut self.processor else {
+            return;
+        };
+        let Some(_egui_renderer) = &mut self.egui_renderer else {
+            return;
+        };
 
-        // Restore this image's saved edits (or defaults) before the first process
         let state = self
             .db
             .as_ref()
@@ -274,42 +461,42 @@ impl App {
             .unwrap_or_default();
         processor.apply_edit_state(&state);
 
-        if processor.load_image(path, &gpu.device, &gpu.queue) {
-            if let Some(id) = self.image_tex_id.take() { egui_renderer.free_texture(&id); }
-            if let Some(id) = self.original_tex_id.take() { egui_renderer.free_texture(&id); }
+        let Some((img, preview_quality)) = imgload::load_edit_rgba(path) else {
+            return;
+        };
 
-            let output_view = processor.output_view().unwrap();
-            let input_view  = processor.input_view().unwrap();
+        processor.upload_rgba(&img, &gpu.device, &gpu.queue);
+        self.rebind_image_textures();
+        self.full_pending = None;
+        self.wants_full = preview_quality.then(|| (path.to_owned(), std::time::Instant::now()));
 
-            self.image_tex_id = Some(egui_renderer.register_native_texture(
-                &gpu.device, &output_view, wgpu::FilterMode::Linear,
-            ));
-            self.original_tex_id = Some(egui_renderer.register_native_texture(
-                &gpu.device, &input_view, wgpu::FilterMode::Linear,
-            ));
+        if let Some(window) = &self.window {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("image-processor");
+            window.set_title(name);
+        }
 
-            if let Some(window) = &self.window {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("image-processor");
-                window.set_title(name);
-            }
+        self.output_dirty = true;
+        self.zoom_fit = true;
+        self.view = View::Edit;
+        self.current_path = Some(path.to_owned());
+        self.selected = Some(path.to_owned());
+        self.strip_scroll = true;
 
-            self.output_dirty = true;
-            self.zoom_fit = true; // reset to fit when a new image is loaded
-            self.view = View::Edit;
-            self.current_path = Some(path.to_owned());
-
-            // Populate the browser with the image's folder
-            if let Some(parent) = path.parent() {
-                if self.browse_dir.as_deref() != Some(parent) {
-                    self.scan_folder(parent);
-                }
+        if let Some(parent) = path.parent() {
+            if self.browse_dir.as_deref() != Some(parent) {
+                self.scan_folder(parent);
             }
         }
     }
 
     fn render(&mut self) {
-        if self.gpu.is_none() || self.window.is_none()
-            || self.egui_state.is_none() || self.egui_renderer.is_none()
+        if self.gpu.is_none()
+            || self.window.is_none()
+            || self.egui_state.is_none()
+            || self.egui_renderer.is_none()
             || self.processor.is_none()
         {
             return;
@@ -327,6 +514,67 @@ impl App {
                 }
             }
         }
+        if let Some((path, started)) = self.wants_full.clone() {
+            if self.current_path.as_deref() != Some(path.as_path()) {
+                self.wants_full = None;
+            } else if self.full_pending.is_none() && started.elapsed().as_secs_f32() > 0.6 {
+                self.full_pending = Some(path.clone());
+                self.wants_full = None;
+                let tx = self.full_tx.clone();
+                std::thread::spawn(move || {
+                    if let Some(img) = imgload::load_rgba(&path, 0) {
+                        let _ = tx.send((path, img));
+                    }
+                });
+            }
+        }
+        let full_results: Vec<(PathBuf, image::RgbaImage)> =
+            std::iter::from_fn(|| self.full_rx.try_recv().ok()).collect();
+        for (path, img) in full_results {
+            if self.full_pending.as_deref() == Some(path.as_path()) {
+                self.full_pending = None;
+            }
+            if self.current_path.as_deref() == Some(path.as_path()) {
+                if let (Some(gpu), Some(processor)) = (self.gpu.as_ref(), self.processor.as_mut()) {
+                    processor.upload_rgba(&img, &gpu.device, &gpu.queue);
+                    self.rebind_image_textures();
+                    self.output_dirty = true;
+                }
+            }
+        }
+        let mut visible: Vec<usize> = self
+            .thumbs
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                let meta = self.meta.get(&entry.path).copied().unwrap_or_default();
+                let flag_ok = match self.filter {
+                    BrowseFilter::All => true,
+                    BrowseFilter::Picks => meta.flag == cull::Flag::Pick,
+                    BrowseFilter::Rejects => meta.flag == cull::Flag::Reject,
+                    BrowseFilter::Unflagged => meta.flag == cull::Flag::None,
+                };
+                flag_ok && meta.rating >= self.min_rating
+            })
+            .map(|(i, _)| i)
+            .collect();
+        match self.sort {
+            BrowseSort::Name => {
+                visible.sort_by(|&a, &b| self.thumbs[a].path.cmp(&self.thumbs[b].path))
+            }
+            BrowseSort::Date => visible.sort_by(|&a, &b| {
+                let am = self.thumbs[a]
+                    .mtime
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                let bm = self.thumbs[b]
+                    .mtime
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                am.cmp(&bm)
+                    .then_with(|| self.thumbs[a].path.cmp(&self.thumbs[b].path))
+            }),
+        }
+        let n_picks = self.flag_count(cull::Flag::Pick);
+        let n_rejects = self.flag_count(cull::Flag::Reject);
 
         let frame = {
             let gpu = self.gpu.as_mut().unwrap();
@@ -336,30 +584,55 @@ impl App {
                     gpu.surface.configure(&gpu.device, &gpu.config);
                     return;
                 }
-                Err(e) => { eprintln!("surface error: {e}"); return; }
+                Err(e) => {
+                    eprintln!("surface error: {e}");
+                    return;
+                }
             }
         };
         let frame_view = frame.texture.create_view(&Default::default());
 
-        let image_tex_id    = self.image_tex_id;
+        let image_tex_id = self.image_tex_id;
         let original_tex_id = self.original_tex_id;
+        let mut cull_actions: Vec<(PathBuf, cull::CullAction)> = Vec::new();
 
         // Scoped egui frame — all field borrows dropped at end of block
-        let (shapes, textures_delta, pixels_per_point, open_path, export_path, scan_dir, auto_req, mut needs_process) = {
-            let window      = self.window.as_ref().unwrap();
-            let egui_state  = self.egui_state.as_mut().unwrap();
-            let processor   = self.processor.as_mut().unwrap();
-            let zoom_fit          = &mut self.zoom_fit;
-            let zoom_scale        = &mut self.zoom_scale;
-            let zoom_offset       = &mut self.zoom_offset;
+        let (
+            shapes,
+            textures_delta,
+            pixels_per_point,
+            open_path,
+            export_path,
+            scan_dir,
+            auto_req,
+            trash_req,
+            move_rejects_dir,
+            copy_picks_dir,
+            mut needs_process,
+        ) = {
+            let window = self.window.as_ref().unwrap();
+            let egui_state = self.egui_state.as_mut().unwrap();
+            let processor = self.processor.as_mut().unwrap();
+            let zoom_fit = &mut self.zoom_fit;
+            let zoom_scale = &mut self.zoom_scale;
+            let zoom_offset = &mut self.zoom_offset;
             let preview_hold_start = &mut self.preview_hold_start;
-            let levels_drag       = &mut self.levels_drag;
-            let curve_drag        = &mut self.curve_drag;
-            let view              = &mut self.view;
-            let thumbs            = &self.thumbs;
-            let browse_dir        = &self.browse_dir;
-            let current_path      = &self.current_path;
-            let raw_input   = egui_state.take_egui_input(window);
+            let levels_drag = &mut self.levels_drag;
+            let curve_drag = &mut self.curve_drag;
+            let view = &mut self.view;
+            let selected = &mut self.selected;
+            let filter = &mut self.filter;
+            let min_rating = &mut self.min_rating;
+            let sort = &mut self.sort;
+            let strip_scroll = &mut self.strip_scroll;
+            let grid_scroll = &mut self.grid_scroll;
+            let confirm_trash = &mut self.confirm_trash;
+            let cull_actions = &mut cull_actions;
+            let thumbs = &self.thumbs;
+            let browse_dir = &self.browse_dir;
+            let current_path = &self.current_path;
+            let meta_map = &self.meta;
+            let raw_input = egui_state.take_egui_input(window);
             let mut needs_process = false;
 
             let full_output = self.egui_ctx.run(raw_input, |ctx| {
@@ -370,6 +643,109 @@ impl App {
                         ui.selectable_value(view, View::Edit, "  Edit  ");
                     });
                 });
+                if *confirm_trash {
+                    egui::Window::new("Trash rejected photos?")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                        .show(ctx, |ui| {
+                            ui.label(format!("Move {n_rejects} rejected photo(s) to the system trash?"));
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Trash").clicked() {
+                                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_TRASH_REJECTS), true));
+                                    *confirm_trash = false;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    *confirm_trash = false;
+                                }
+                            });
+                        });
+                }
+
+                if !ctx.wants_keyboard_input() {
+                    let (left, right, enter) = ctx.input(|i| {
+                        (
+                            i.key_pressed(egui::Key::ArrowLeft),
+                            i.key_pressed(egui::Key::ArrowRight),
+                            i.key_pressed(egui::Key::Enter),
+                        )
+                    });
+                    let delta = right as i32 - left as i32;
+                    if delta != 0 && !visible.is_empty() {
+                        let anchor = if *view == View::Edit {
+                            current_path.as_deref()
+                        } else {
+                            selected.as_deref().or(current_path.as_deref())
+                        };
+                        let pos = anchor
+                            .and_then(|a| visible.iter().position(|&i| thumbs[i].path == a));
+                        let next = match pos {
+                            Some(c) => (c as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize,
+                            None => 0,
+                        };
+                        let p = thumbs[visible[next]].path.clone();
+                        if *view == View::Edit {
+                            if current_path.as_deref() != Some(p.as_path()) {
+                                ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_OPEN_PATH), p));
+                            }
+                        } else {
+                            *selected = Some(p);
+                            *grid_scroll = true;
+                        }
+                    }
+                    if *view == View::Browse && enter {
+                        if let Some(p) = selected.clone() {
+                            ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_OPEN_PATH), p));
+                        }
+                    }
+                    if let Some(path) = current_path.clone().or(selected.clone()) {
+                        let keys = ctx.input(|i| (
+                            i.key_pressed(egui::Key::Num0),
+                            i.key_pressed(egui::Key::Num1),
+                            i.key_pressed(egui::Key::Num2),
+                            i.key_pressed(egui::Key::Num3),
+                            i.key_pressed(egui::Key::Num4),
+                            i.key_pressed(egui::Key::Num5),
+                            i.key_pressed(egui::Key::Num6),
+                            i.key_pressed(egui::Key::Num7),
+                            i.key_pressed(egui::Key::Num8),
+                            i.key_pressed(egui::Key::Num9),
+                            i.key_pressed(egui::Key::P),
+                            i.key_pressed(egui::Key::X),
+                        ));
+                        if keys.0 {
+                            cull_actions.push((path.clone(), cull::CullAction::Rating(0)));
+                        }
+                        for (pressed, rating) in [
+                            (keys.1, 1u8),
+                            (keys.2, 2),
+                            (keys.3, 3),
+                            (keys.4, 4),
+                            (keys.5, 5),
+                        ] {
+                            if pressed {
+                                cull_actions.push((path.clone(), cull::CullAction::Rating(rating)));
+                            }
+                        }
+                        if keys.10 {
+                            cull_actions.push((path.clone(), cull::CullAction::TogglePick));
+                        }
+                        if keys.11 {
+                            cull_actions.push((path.clone(), cull::CullAction::ToggleReject));
+                        }
+                        for (pressed, label) in [
+                            (keys.6, cull::Label::Red),
+                            (keys.7, cull::Label::Yellow),
+                            (keys.8, cull::Label::Green),
+                            (keys.9, cull::Label::Blue),
+                        ] {
+                            if pressed {
+                                cull_actions.push((path.clone(), cull::CullAction::ToggleLabel(label)));
+                            }
+                        }
+                    }
+                }
 
                 if *view == View::Browse {
                     egui::CentralPanel::default()
@@ -396,14 +772,71 @@ impl App {
                             ui.add_space(6.0);
                             ui.separator();
 
-                            if thumbs.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.add_space(6.0);
+                                for (f, lbl) in [
+                                    (BrowseFilter::All, "All"),
+                                    (BrowseFilter::Picks, "Picks"),
+                                    (BrowseFilter::Rejects, "Rejects"),
+                                    (BrowseFilter::Unflagged, "Unflagged"),
+                                ] {
+                                    if ui.selectable_label(*filter == f, lbl).clicked() {
+                                        *filter = f;
+                                    }
+                                }
+                                ui.separator();
+                                ui.label(egui::RichText::new("★ ≥").small());
+                                ui.add(egui::DragValue::new(min_rating).range(0..=5));
+                                ui.separator();
+                                ui.label(egui::RichText::new("Sort").small());
+                                for (s, lbl) in [(BrowseSort::Name, "Name"), (BrowseSort::Date, "Date")] {
+                                    if ui.selectable_label(*sort == s, lbl).clicked() {
+                                        *sort = s;
+                                    }
+                                }
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} shown · {n_picks} picks · {n_rejects} rejects",
+                                        visible.len()
+                                    ))
+                                    .small()
+                                    .color(egui::Color32::from_gray(140)),
+                                );
+                                ui.separator();
+                                if ui
+                                    .add_enabled(n_rejects > 0, egui::Button::new(format!("Trash Rejects ({n_rejects})")))
+                                    .clicked()
+                                {
+                                    *confirm_trash = true;
+                                }
+                                if ui
+                                    .add_enabled(n_rejects > 0, egui::Button::new("Move Rejects..."))
+                                    .clicked()
+                                {
+                                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_MOVE_REJECTS), dir));
+                                    }
+                                }
+                                if ui
+                                    .add_enabled(n_picks > 0, egui::Button::new(format!("Copy Picks ({n_picks})...")))
+                                    .clicked()
+                                {
+                                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_COPY_PICKS), dir));
+                                    }
+                                }
+                            });
+                            ui.separator();
+
+                            if thumbs.is_empty() || visible.is_empty() {
                                 ui.centered_and_justified(|ui| {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Open a folder (or an image) to browse thumbnails",
-                                        )
-                                        .color(egui::Color32::from_gray(140)),
-                                    );
+                                    let msg = if thumbs.is_empty() {
+                                        "Open a folder (or an image) to browse thumbnails"
+                                    } else {
+                                        "No images match the filter"
+                                    };
+                                    ui.label(egui::RichText::new(msg).color(egui::Color32::from_gray(140)));
                                 });
                                 return;
                             }
@@ -412,9 +845,14 @@ impl App {
                                 ui.add_space(6.0);
                                 ui.horizontal_wrapped(|ui| {
                                     let cell = egui::vec2(168.0, 152.0);
-                                    for entry in thumbs {
+                                    for &ti in &visible {
+                                        let entry = &thumbs[ti];
                                         let (rect, resp) =
                                             ui.allocate_exact_size(cell, egui::Sense::click());
+                                        if *grid_scroll && selected.as_deref() == Some(entry.path.as_path()) {
+                                            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                            *grid_scroll = false;
+                                        }
                                         if !ui.is_rect_visible(rect) {
                                             continue;
                                         }
@@ -453,6 +891,16 @@ impl App {
                                             );
                                         }
 
+                                        let meta = meta_map.get(&entry.path).copied().unwrap_or_default();
+                                        if meta.flag == cull::Flag::Reject {
+                                            p.rect_filled(
+                                                img_area,
+                                                0.0,
+                                                egui::Color32::from_rgba_premultiplied(140, 20, 20, 48),
+                                            );
+                                        }
+                                        paint_badges(&p, img_area, meta);
+
                                         let name = entry
                                             .path
                                             .file_name()
@@ -471,9 +919,11 @@ impl App {
                                             egui::Color32::from_gray(170),
                                         );
 
-                                        let selected =
-                                            current_path.as_deref() == Some(entry.path.as_path());
-                                        if selected {
+                                        let selected_item = selected
+                                            .as_deref()
+                                            .or(current_path.as_deref())
+                                            == Some(entry.path.as_path());
+                                        if selected_item {
                                             p.rect_stroke(
                                                 rect.shrink(2.0),
                                                 4.0,
@@ -488,6 +938,7 @@ impl App {
                                         }
 
                                         if resp.clicked() {
+                                            *selected = Some(entry.path.clone());
                                             ctx.data_mut(|d| {
                                                 d.insert_temp(
                                                     egui::Id::new(KEY_OPEN_PATH),
@@ -837,6 +1288,41 @@ impl App {
                                 ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_AUTO), true));
                             }
                         });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            let path = current_path.clone();
+                            if let Some(path) = path {
+                                ui.label(egui::RichText::new("Rating").small().color(egui::Color32::from_gray(140)));
+                                for rating in 1..=5u8 {
+                                    let filled = meta_map.get(&path).map_or(false, |m| m.rating >= rating);
+                                    let label = if filled { "★" } else { "☆" };
+                                    if ui.selectable_label(filled, label).clicked() {
+                                        cull_actions.push((path.clone(), cull::CullAction::Rating(rating)));
+                                    }
+                                }
+                                if ui.button("0").clicked() {
+                                    cull_actions.push((path.clone(), cull::CullAction::Rating(0)));
+                                }
+                                ui.separator();
+                                let pick = meta_map.get(&path).map_or(false, |m| m.flag == cull::Flag::Pick);
+                                if ui.selectable_label(pick, "P").clicked() {
+                                    cull_actions.push((path.clone(), cull::CullAction::TogglePick));
+                                }
+                                let reject = meta_map.get(&path).map_or(false, |m| m.flag == cull::Flag::Reject);
+                                if ui.selectable_label(reject, "X").clicked() {
+                                    cull_actions.push((path.clone(), cull::CullAction::ToggleReject));
+                                }
+                                ui.separator();
+                                for label in [cull::Label::Red, cull::Label::Yellow, cull::Label::Green, cull::Label::Blue] {
+                                    let c = label_color(label).unwrap();
+                                    let dot = egui::RichText::new("●").color(c);
+                                    let active = meta_map.get(&path).map_or(false, |m| m.label == label);
+                                    if ui.selectable_label(active, dot).clicked() {
+                                        cull_actions.push((path.clone(), cull::CullAction::ToggleLabel(label)));
+                                    }
+                                }
+                            }
+                        });
                         ui.separator();
                         ui.spacing_mut().item_spacing.y = 3.0;
 
@@ -933,8 +1419,90 @@ impl App {
                                         .color(egui::Color32::from_gray(120)),
                                 );
                             }
-                        });
                     });
+                });
+
+                if *view == View::Edit {
+                    egui::TopBottomPanel::bottom("filmstrip")
+                        .exact_height(92.0)
+                        .frame(egui::Frame::none().fill(egui::Color32::from_gray(20)))
+                        .show(ctx, |ui| {
+                            egui::ScrollArea::horizontal().show(ui, |ui| {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    for &ti in &visible {
+                                        let entry = &thumbs[ti];
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(104.0, 80.0),
+                                            egui::Sense::click(),
+                                        );
+                                        let is_cur = current_path.as_deref() == Some(entry.path.as_path());
+                                        if is_cur && *strip_scroll {
+                                            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                            *strip_scroll = false;
+                                        }
+                                        if !ui.is_rect_visible(rect) {
+                                            continue;
+                                        }
+                                        let p = ui.painter_at(rect);
+                                        p.rect_filled(rect.shrink(2.0), 3.0, egui::Color32::from_gray(14));
+                                        let img_area = rect.shrink(4.0);
+                                        if let Some(tex) = &entry.tex {
+                                            let ts = tex.size_vec2();
+                                            let s = (img_area.width() / ts.x)
+                                                .min(img_area.height() / ts.y)
+                                                .min(1.0);
+                                            let ir = egui::Rect::from_center_size(img_area.center(), ts * s);
+                                            p.image(
+                                                tex.id(),
+                                                ir,
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(0.0, 0.0),
+                                                    egui::pos2(1.0, 1.0),
+                                                ),
+                                                egui::Color32::WHITE,
+                                            );
+                                        } else {
+                                            p.text(
+                                                img_area.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                "…",
+                                                egui::FontId::proportional(14.0),
+                                                egui::Color32::from_gray(90),
+                                            );
+                                        }
+                                        paint_badges(
+                                            &p,
+                                            img_area,
+                                            meta_map.get(&entry.path).copied().unwrap_or_default(),
+                                        );
+                                        if is_cur {
+                                            p.rect_stroke(
+                                                rect.shrink(2.0),
+                                                3.0,
+                                                egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 140, 255)),
+                                            );
+                                        } else if resp.hovered() {
+                                            p.rect_stroke(
+                                                rect.shrink(2.0),
+                                                3.0,
+                                                egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+                                            );
+                                        }
+                                        if resp.clicked() {
+                                            *selected = Some(entry.path.clone());
+                                            ctx.data_mut(|d| {
+                                                d.insert_temp(
+                                                    egui::Id::new(KEY_OPEN_PATH),
+                                                    entry.path.clone(),
+                                                )
+                                            });
+                                        }
+                                    }
+                                });
+                            });
+                        });
+                }
 
                 egui::CentralPanel::default()
                     .frame(egui::Frame::none().fill(egui::Color32::from_gray(30)))
@@ -1056,18 +1624,87 @@ impl App {
             });
 
             egui_state.handle_platform_output(window, full_output.platform_output);
-            let open_path: Option<PathBuf> =
-                self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_OPEN_PATH)));
-            let export_path: Option<PathBuf> =
-                self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_EXPORT_PATH)));
-            let scan_dir: Option<PathBuf> =
-                self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_SCAN_DIR)));
-            let auto_req: Option<bool> =
-                self.egui_ctx.data_mut(|d| d.remove_temp(egui::Id::new(KEY_AUTO)));
-
-            (full_output.shapes, full_output.textures_delta, full_output.pixels_per_point,
-             open_path, export_path, scan_dir, auto_req.is_some(), needs_process)
+            let open_path: Option<PathBuf> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_OPEN_PATH)));
+            let export_path: Option<PathBuf> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_EXPORT_PATH)));
+            let scan_dir: Option<PathBuf> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_SCAN_DIR)));
+            let auto_req: Option<bool> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_AUTO)));
+            let trash_req: Option<bool> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_TRASH_REJECTS)));
+            let move_rejects_dir: Option<PathBuf> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_MOVE_REJECTS)));
+            let copy_picks_dir: Option<PathBuf> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_COPY_PICKS)));
+            (
+                full_output.shapes,
+                full_output.textures_delta,
+                full_output.pixels_per_point,
+                open_path,
+                export_path,
+                scan_dir,
+                auto_req.is_some(),
+                trash_req.is_some(),
+                move_rejects_dir,
+                copy_picks_dir,
+                needs_process,
+            )
         }; // all field borrows dropped here
+
+        for (path, action) in cull_actions {
+            self.apply_cull_action(&path, action);
+        }
+        if trash_req {
+            let rejects = self.flagged_paths(cull::Flag::Reject);
+            if trash::delete_all(&rejects).is_ok() {
+                if let Some(db) = &self.db {
+                    for path in &rejects {
+                        cull::delete_rows(db, path);
+                    }
+                }
+                self.after_files_removed(&rejects);
+            }
+        }
+        if let Some(dest) = move_rejects_dir {
+            let rejects = self.flagged_paths(cull::Flag::Reject);
+            let mut moved = Vec::new();
+            for path in &rejects {
+                let Some(name) = path.file_name() else {
+                    continue;
+                };
+                let new_path = dest.join(name);
+                if move_file(path, &new_path).is_ok() {
+                    if let Some(db) = &self.db {
+                        cull::rekey_rows(db, path, &new_path);
+                    }
+                    moved.push(path.clone());
+                }
+            }
+            self.after_files_removed(&moved);
+        }
+        if let Some(dest) = copy_picks_dir {
+            let picks = self.flagged_paths(cull::Flag::Pick);
+            for path in &picks {
+                let Some(name) = path.file_name() else {
+                    continue;
+                };
+                let new_path = dest.join(name);
+                if std::fs::copy(path, &new_path).is_ok() {
+                    if let Some(db) = &self.db {
+                        cull::copy_rows(db, path, &new_path);
+                    }
+                }
+            }
+        }
 
         // File ops
         if let Some(dir) = scan_dir {
@@ -1118,7 +1755,10 @@ impl App {
                     self.gpu.as_ref(),
                 ) {
                     er.update_egui_texture_from_wgpu_texture(
-                        &gpu.device, &view, wgpu::FilterMode::Linear, tex_id,
+                        &gpu.device,
+                        &view,
+                        wgpu::FilterMode::Linear,
+                        tex_id,
                     );
                 }
             }
@@ -1126,8 +1766,8 @@ impl App {
         }
 
         // wgpu render
-        let gpu           = self.gpu.as_mut().unwrap();
-        let window        = self.window.as_ref().unwrap();
+        let gpu = self.gpu.as_mut().unwrap();
+        let window = self.window.as_ref().unwrap();
         let egui_renderer = self.egui_renderer.as_mut().unwrap();
 
         let size = window.inner_size();
@@ -1140,7 +1780,13 @@ impl App {
         for (id, delta) in textures_delta.set {
             egui_renderer.update_texture(&gpu.device, &gpu.queue, id, &delta);
         }
-        egui_renderer.update_buffers(&gpu.device, &gpu.queue, &mut encoder, &tris, &screen_descriptor);
+        egui_renderer.update_buffers(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &tris,
+            &screen_descriptor,
+        );
 
         {
             let mut pass = encoder
@@ -1150,7 +1796,12 @@ impl App {
                         view: &frame_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.11, g: 0.11, b: 0.11, a: 1.0 }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.11,
+                                g: 0.11,
+                                b: 0.11,
+                                a: 1.0,
+                            }),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -1190,7 +1841,12 @@ async fn init_gpu(window: Arc<Window>) -> GpuState {
         .expect("failed to get device");
 
     let caps = surface.get_capabilities(&adapter);
-    let format = caps.formats.iter().find(|f| f.is_srgb()).copied().unwrap_or(caps.formats[0]);
+    let format = caps
+        .formats
+        .iter()
+        .find(|f| f.is_srgb())
+        .copied()
+        .unwrap_or(caps.formats[0]);
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
@@ -1203,14 +1859,50 @@ async fn init_gpu(window: Arc<Window>) -> GpuState {
     };
     surface.configure(&device, &config);
 
-    GpuState { device, queue, surface, config }
+    GpuState {
+        device,
+        queue,
+        surface,
+        config,
+    }
 }
 
 fn resize_surface(gpu: &mut GpuState, size: PhysicalSize<u32>) {
-    if size.width == 0 || size.height == 0 { return; }
+    if size.width == 0 || size.height == 0 {
+        return;
+    }
     gpu.config.width = size.width;
     gpu.config.height = size.height;
     gpu.surface.configure(&gpu.device, &gpu.config);
+}
+
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            std::fs::copy(from, to)?;
+            std::fs::remove_file(from)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::move_file;
+
+    #[test]
+    fn move_file_moves() {
+        let dir = std::env::temp_dir().join(format!("ip_move_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let from = dir.join("a.txt");
+        let to = dir.join("b.txt");
+        std::fs::write(&from, b"hi").unwrap();
+        move_file(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(&to).unwrap(), b"hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn main() {
