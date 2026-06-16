@@ -22,6 +22,7 @@ const KEY_AUTO: &str = "auto_adjust";
 const KEY_TRASH_REJECTS: &str = "trash_rejects";
 const KEY_MOVE_REJECTS: &str = "move_rejects";
 const KEY_COPY_PICKS: &str = "copy_picks";
+const CULL_HELP_KEY: &str = "browse_cull_help_visible";
 
 // ---- Edit persistence (SQLite, one JSON row per image path) ----
 
@@ -35,6 +36,10 @@ fn open_db() -> Option<rusqlite::Connection> {
             path    TEXT PRIMARY KEY,
             params  TEXT NOT NULL,
             updated INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS app_kv (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );",
     )
     .ok()?;
@@ -66,6 +71,29 @@ fn load_edits(conn: &rusqlite::Connection, path: &Path) -> Option<EditState> {
         )
         .ok()?;
     serde_json::from_str(&json).ok()
+}
+
+fn load_bool_pref(conn: &rusqlite::Connection, key: &str, default: bool) -> bool {
+    conn.query_row(
+        "SELECT value FROM app_kv WHERE key = ?1",
+        rusqlite::params![key],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| match v.as_str() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    })
+    .unwrap_or(default)
+}
+
+fn save_bool_pref(conn: &rusqlite::Connection, key: &str, value: bool) {
+    let _ = conn.execute(
+        "INSERT INTO app_kv (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, if value { "1" } else { "0" }],
+    );
 }
 
 fn label_color(label: cull::Label) -> Option<egui::Color32> {
@@ -186,7 +214,9 @@ struct App {
     sort: BrowseSort,
     strip_scroll: bool,
     grid_scroll: bool,
+    grid_cols: usize,
     confirm_trash: bool,
+    show_cull_help: bool,
     full_tx: std::sync::mpsc::Sender<(PathBuf, image::RgbaImage)>,
     full_rx: std::sync::mpsc::Receiver<(PathBuf, image::RgbaImage)>,
     full_pending: Option<PathBuf>,
@@ -198,6 +228,7 @@ impl App {
     fn new() -> Self {
         let db = open_db();
         let meta = db.as_ref().map(cull::load_all_meta).unwrap_or_default();
+        let show_cull_help = db.as_ref().map_or(true, |db| load_bool_pref(db, CULL_HELP_KEY, true));
         let (full_tx, full_rx) = std::sync::mpsc::channel();
         Self {
             window: None,
@@ -227,7 +258,9 @@ impl App {
             sort: BrowseSort::Name,
             strip_scroll: false,
             grid_scroll: false,
+            grid_cols: 1,
             confirm_trash: false,
+            show_cull_help,
             full_tx,
             full_rx,
             full_pending: None,
@@ -297,8 +330,12 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
-                    event_loop.exit();
+                if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
+                    && event.state == winit::event::ElementState::Pressed
+                {
+                    if self.view == View::Edit {
+                        self.view = View::Browse;
+                    }
                 }
             }
 
@@ -626,12 +663,15 @@ impl App {
             let sort = &mut self.sort;
             let strip_scroll = &mut self.strip_scroll;
             let grid_scroll = &mut self.grid_scroll;
+            let grid_cols = &mut self.grid_cols;
             let confirm_trash = &mut self.confirm_trash;
+            let show_cull_help = &mut self.show_cull_help;
             let cull_actions = &mut cull_actions;
             let thumbs = &self.thumbs;
             let browse_dir = &self.browse_dir;
             let current_path = &self.current_path;
             let meta_map = &self.meta;
+            let db = self.db.as_ref();
             let raw_input = egui_state.take_egui_input(window);
             let mut needs_process = false;
 
@@ -664,14 +704,17 @@ impl App {
                 }
 
                 if !ctx.wants_keyboard_input() {
-                    let (left, right, enter) = ctx.input(|i| {
+                    let (left, right, up, down, enter) = ctx.input(|i| {
                         (
                             i.key_pressed(egui::Key::ArrowLeft),
                             i.key_pressed(egui::Key::ArrowRight),
+                            i.key_pressed(egui::Key::ArrowUp),
+                            i.key_pressed(egui::Key::ArrowDown),
                             i.key_pressed(egui::Key::Enter),
                         )
                     });
-                    let delta = right as i32 - left as i32;
+                    let cols = *grid_cols as i32;
+                    let delta = (right as i32 - left as i32) + (down as i32 - up as i32) * cols;
                     if delta != 0 && !visible.is_empty() {
                         let anchor = if *view == View::Edit {
                             current_path.as_deref()
@@ -695,11 +738,11 @@ impl App {
                         }
                     }
                     if *view == View::Browse && enter {
-                        if let Some(p) = selected.clone() {
+                        if let Some(p) = selected.clone().or(current_path.clone()) {
                             ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_OPEN_PATH), p));
                         }
                     }
-                    if let Some(path) = current_path.clone().or(selected.clone()) {
+                    if let Some(path) = selected.clone().or(current_path.clone()) {
                         let keys = ctx.input(|i| (
                             i.key_pressed(egui::Key::Num0),
                             i.key_pressed(egui::Key::Num1),
@@ -748,6 +791,55 @@ impl App {
                 }
 
                 if *view == View::Browse {
+                    egui::Area::new("browse_cull_help".into())
+                        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+                        .interactable(true)
+                        .show(ctx, |ui| {
+                            if *show_cull_help {
+                                egui::Frame::window(ui.style())
+                                    .fill(egui::Color32::from_rgba_premultiplied(24, 24, 24, 238))
+                                    .rounding(egui::Rounding::same(8.0))
+                                    .inner_margin(egui::Margin::same(10.0))
+                                    .show(ui, |ui| {
+                                        ui.set_max_width(260.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("Keyboard shortcuts")
+                                                    .strong()
+                                                    .color(egui::Color32::from_gray(230)),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.button("×").clicked() {
+                                                        *show_cull_help = false;
+                                                        if let Some(db) = db {
+                                                            save_bool_pref(db, CULL_HELP_KEY, false);
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.label("Rate: `1-5`, `0` clear");
+                                        ui.label("Flag: `P` pick, `X` reject");
+                                        ui.label("Label: `6` red, `7` yellow, `8` green, `9` blue");
+                                        ui.label("Move: `←→` / `↑↓`, `Enter` opens");
+                                        ui.add_space(4.0);
+                                        ui.label(
+                                            egui::RichText::new("Bulk actions stay in the top toolbar.")
+                                                .small()
+                                                .color(egui::Color32::from_gray(150)),
+                                        );
+                                    });
+                            } else if ui.small_button("? Keys").clicked() {
+                                *show_cull_help = true;
+                                if let Some(db) = db {
+                                    save_bool_pref(db, CULL_HELP_KEY, true);
+                                }
+                            }
+                        });
+
                     egui::CentralPanel::default()
                         .frame(egui::Frame::none().fill(egui::Color32::from_gray(24)))
                         .show(ctx, |ui| {
@@ -845,6 +937,7 @@ impl App {
                                 ui.add_space(6.0);
                                 ui.horizontal_wrapped(|ui| {
                                     let cell = egui::vec2(168.0, 152.0);
+                                    *grid_cols = (ui.available_width() / cell.x).max(1.0) as usize;
                                     for &ti in &visible {
                                         let entry = &thumbs[ti];
                                         let (rect, resp) =
@@ -1888,7 +1981,7 @@ fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::move_file;
+    use super::{load_bool_pref, move_file, save_bool_pref};
 
     #[test]
     fn move_file_moves() {
@@ -1902,6 +1995,23 @@ mod tests {
         assert!(!from.exists());
         assert_eq!(std::fs::read(&to).unwrap(), b"hi");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bool_pref_roundtrip() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_kv (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        assert!(load_bool_pref(&conn, "x", true));
+        save_bool_pref(&conn, "x", false);
+        assert!(!load_bool_pref(&conn, "x", true));
+        save_bool_pref(&conn, "x", true);
+        assert!(load_bool_pref(&conn, "x", false));
     }
 }
 
