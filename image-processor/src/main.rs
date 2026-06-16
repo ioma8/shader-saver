@@ -516,20 +516,28 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel::<(usize, egui::ColorImage, ThumbExif)>();
         self.thumb_rx = Some(rx); // dropping the old rx makes a stale loader thread stop
         let ctx = self.egui_ctx.clone();
-        std::thread::spawn(move || {
-            for (i, p) in paths.into_iter().enumerate() {
-                let exif = read_exif(&p);
-                let Some(t) = imgload::load_preview_rgba(&p, 220) else {
-                    continue;
-                };
-                let (w, h) = t.dimensions();
-                let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &t);
-                if tx.send((i, ci, exif)).is_err() {
-                    break;
+        let n_workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<(usize, PathBuf)>();
+        let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+        for _ in 0..n_workers {
+            let work_rx = work_rx.clone();
+            let tx = tx.clone();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let Ok((i, p)) = work_rx.lock().unwrap().recv() else { break };
+                    let exif = read_exif(&p);
+                    let Some(t) = imgload::load_preview_rgba(&p, 220) else { continue };
+                    let (w, h) = t.dimensions();
+                    let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &t);
+                    if tx.send((i, ci, exif)).is_err() { break; }
+                    ctx.request_repaint();
                 }
-                ctx.request_repaint();
-            }
-        });
+            });
+        }
+        for (i, p) in paths.into_iter().enumerate() {
+            let _ = work_tx.send((i, p));
+        }
     }
 
     fn rebind_image_textures(&mut self) {
