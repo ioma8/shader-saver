@@ -32,33 +32,21 @@ pub fn all_exts() -> Vec<&'static str> {
 }
 
 pub fn load_preview_rgba(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
-    if is_raw(path) {
-        if let Some(img) = jpgfromraw_preview(path, max_dim) {
-            return Some(img);
-        }
-    }
-    load_rgba(path, max_dim)
+    // For grid thumbnails use the smallest embedded JPEG — already tiny, no full decode needed.
+    let find_type = if max_dim > 0 { FindJpegType::Smallest } else { FindJpegType::Largest };
+    let bytes = pollster::block_on(jpgfromraw::process_file_bytes(path, find_type)).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    let img = if max_dim > 0 { img.thumbnail(max_dim, max_dim) } else { img };
+    Some(img.to_rgba8())
 }
 
 pub fn load_edit_rgba(path: &Path) -> Option<(image::RgbaImage, bool)> {
     if is_raw(path) {
-        if let Some(img) = jpgfromraw_preview(path, 0) {
-            return Some((img, true));
-        }
+        let bytes = pollster::block_on(jpgfromraw::process_file_bytes(path, FindJpegType::Largest)).ok()?;
+        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        return Some((img, true));
     }
     load_rgba(path, 0).map(|img| (img, false))
-}
-
-fn jpgfromraw_preview(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
-    let bytes =
-        pollster::block_on(jpgfromraw::process_file_bytes(path, FindJpegType::Largest)).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?;
-    let img = if max_dim > 0 {
-        img.thumbnail(max_dim, max_dim)
-    } else {
-        img
-    };
-    Some(img.to_rgba8())
 }
 
 // Decode to RGBA8. max_dim = 0 loads full resolution; otherwise the result
