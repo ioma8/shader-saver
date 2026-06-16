@@ -113,26 +113,20 @@ fn paint_badges(p: &egui::Painter, rect: egui::Rect, meta: cull::CullMeta) {
             3.0,
             egui::Color32::from_rgb(170, 60, 60),
         );
-        p.text(
-            rect.min + egui::vec2(11.0, 11.0),
-            egui::Align2::CENTER_CENTER,
-            "✕",
-            egui::FontId::proportional(11.0),
-            egui::Color32::WHITE,
-        );
+        let c = rect.min + egui::vec2(11.0, 11.0);
+        let s = egui::Stroke::new(1.5, egui::Color32::WHITE);
+        p.line_segment([c + egui::vec2(-3.5, -3.5), c + egui::vec2(3.5, 3.5)], s);
+        p.line_segment([c + egui::vec2(3.5, -3.5), c + egui::vec2(-3.5, 3.5)], s);
     } else if meta.flag == cull::Flag::Pick {
         p.rect_filled(
             egui::Rect::from_min_size(rect.min + egui::vec2(4.0, 4.0), egui::vec2(14.0, 14.0)),
             3.0,
             egui::Color32::from_rgb(66, 128, 235),
         );
-        p.text(
-            rect.min + egui::vec2(11.0, 11.0),
-            egui::Align2::CENTER_CENTER,
-            "✓",
-            egui::FontId::proportional(11.0),
-            egui::Color32::WHITE,
-        );
+        let c = rect.min + egui::vec2(11.0, 11.0);
+        let s = egui::Stroke::new(1.5, egui::Color32::WHITE);
+        p.line_segment([c + egui::vec2(-3.5, 0.5), c + egui::vec2(-1.0, 3.5)], s);
+        p.line_segment([c + egui::vec2(-1.0, 3.5), c + egui::vec2(4.0, -3.5)], s);
     }
     if meta.rating > 0 {
         p.text(
@@ -145,6 +139,61 @@ fn paint_badges(p: &egui::Painter, rect: egui::Rect, meta: cull::CullMeta) {
     }
     if let Some(color) = label_color(meta.label) {
         p.circle_filled(rect.right_top() - egui::vec2(11.0, -11.0), 4.0, color);
+    }
+}
+
+fn show_dir_item(
+    ui: &mut egui::Ui,
+    path: &Path,
+    depth: usize,
+    expanded: &mut std::collections::HashSet<PathBuf>,
+    current: Option<&Path>,
+    ctx: &egui::Context,
+) {
+    let is_exp = expanded.contains(path);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("/");
+    let selected = current == Some(path);
+    ui.horizontal(|ui| {
+        ui.add_space(depth as f32 * 10.0);
+        let (tri_rect, tri_resp) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::click());
+        if ui.is_rect_visible(tri_rect) {
+            let c = tri_rect.center();
+            let color = egui::Color32::from_gray(110);
+            let pts = if is_exp {
+                vec![c + egui::vec2(-4.0, -2.0), c + egui::vec2(4.0, -2.0), c + egui::vec2(0.0, 3.0)]
+            } else {
+                vec![c + egui::vec2(-2.0, -4.0), c + egui::vec2(3.0, 0.0), c + egui::vec2(-2.0, 4.0)]
+            };
+            ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+        }
+        if tri_resp.clicked() {
+            if is_exp { expanded.remove(path); } else { expanded.insert(path.to_owned()); }
+        }
+        let color = if selected {
+            egui::Color32::from_rgb(90, 140, 255)
+        } else {
+            egui::Color32::from_gray(195)
+        };
+        if ui.add(
+            egui::Label::new(egui::RichText::new(name).small().color(color))
+                .sense(egui::Sense::click()),
+        ).clicked() {
+            expanded.insert(path.to_owned());
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_SCAN_DIR), path.to_owned()));
+        }
+    });
+    if is_exp {
+        let Ok(rd) = std::fs::read_dir(path) else { return };
+        let mut dirs: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).map_or(false, |s| !s.starts_with('.')))
+            .collect();
+        dirs.sort_unstable();
+        for dir in dirs {
+            show_dir_item(ui, &dir, depth + 1, expanded, current, ctx);
+        }
     }
 }
 
@@ -215,6 +264,7 @@ struct App {
     strip_scroll: bool,
     grid_scroll: bool,
     grid_cols: usize,
+    tree_expanded: std::collections::HashSet<PathBuf>,
     confirm_trash: bool,
     show_cull_help: bool,
     full_tx: std::sync::mpsc::Sender<(PathBuf, image::RgbaImage)>,
@@ -229,6 +279,14 @@ impl App {
         let db = open_db();
         let meta = db.as_ref().map(cull::load_all_meta).unwrap_or_default();
         let show_cull_help = db.as_ref().map_or(true, |db| load_bool_pref(db, CULL_HELP_KEY, true));
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let mut tree_expanded = std::collections::HashSet::new();
+        let mut p = PathBuf::from("/");
+        tree_expanded.insert(p.clone());
+        for comp in home.components().skip(1) {
+            p.push(comp);
+            tree_expanded.insert(p.clone());
+        }
         let (full_tx, full_rx) = std::sync::mpsc::channel();
         Self {
             window: None,
@@ -259,6 +317,7 @@ impl App {
             strip_scroll: false,
             grid_scroll: false,
             grid_cols: 1,
+            tree_expanded,
             confirm_trash: false,
             show_cull_help,
             full_tx,
@@ -664,6 +723,7 @@ impl App {
             let strip_scroll = &mut self.strip_scroll;
             let grid_scroll = &mut self.grid_scroll;
             let grid_cols = &mut self.grid_cols;
+            let tree_expanded = &mut self.tree_expanded;
             let confirm_trash = &mut self.confirm_trash;
             let show_cull_help = &mut self.show_cull_help;
             let cull_actions = &mut cull_actions;
@@ -838,6 +898,35 @@ impl App {
                                     save_bool_pref(db, CULL_HELP_KEY, true);
                                 }
                             }
+                        });
+
+                    egui::SidePanel::left("folder_tree")
+                        .default_width(200.0)
+                        .width_range(120.0..=380.0)
+                        .frame(egui::Frame::none()
+                            .fill(egui::Color32::from_gray(18))
+                            .inner_margin(egui::Margin::symmetric(4.0, 4.0)))
+                        .show(ctx, |ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                let home = std::env::var_os("HOME")
+                                    .map(PathBuf::from)
+                                    .unwrap_or_default();
+                                show_dir_item(ui, &home, 0, tree_expanded, browse_dir.as_deref(), ctx);
+                                ui.add_space(4.0);
+                                if let Ok(rd) = std::fs::read_dir("/Volumes") {
+                                    let mut vols: Vec<PathBuf> = rd
+                                        .filter_map(|e| e.ok())
+                                        .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+                                        .map(|e| e.path())
+                                        .filter(|p| p.file_name().and_then(|n| n.to_str()).map_or(false, |s| !s.starts_with('.')))
+                                        .collect();
+                                    vols.sort_unstable();
+                                    for vol in vols {
+                                        show_dir_item(ui, &vol, 0, tree_expanded, browse_dir.as_deref(), ctx);
+                                    }
+                                }
+                            });
                         });
 
                     egui::CentralPanel::default()
@@ -1031,6 +1120,9 @@ impl App {
                                         }
 
                                         if resp.clicked() {
+                                            *selected = Some(entry.path.clone());
+                                        }
+                                        if resp.double_clicked() {
                                             *selected = Some(entry.path.clone());
                                             ctx.data_mut(|d| {
                                                 d.insert_temp(
