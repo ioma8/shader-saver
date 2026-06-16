@@ -1055,7 +1055,13 @@ impl App {
                                 }
                                 ui.separator();
                                 ui.label(egui::RichText::new("★ ≥").small());
-                                ui.add(egui::DragValue::new(min_rating).range(0..=5));
+                                egui::ComboBox::from_id_salt("min_rating")
+                                    .selected_text(if *min_rating == 0 { "Any".to_string() } else { "★".repeat(*min_rating as usize) })
+                                    .show_ui(ui, |ui| {
+                                        for (v, lbl) in [(0u8, "Any"), (1, "★"), (2, "★★"), (3, "★★★"), (4, "★★★★"), (5, "★★★★★")] {
+                                            ui.selectable_value(min_rating, v, lbl);
+                                        }
+                                    });
                                 ui.separator();
                                 ui.label(egui::RichText::new("Sort").small());
                                 for (s, lbl) in [(BrowseSort::Name, "Name"), (BrowseSort::Date, "Date"), (BrowseSort::CaptureTime, "Time")] {
