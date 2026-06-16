@@ -215,13 +215,78 @@ enum BrowseFilter {
 enum BrowseSort {
     Name,
     Date,
+    CaptureTime,
+}
+
+#[derive(Default)]
+struct ThumbExif {
+    capture_time: Option<i64>, // YYYYMMDDHHMMSS for sorting
+    shutter: Option<String>,   // "1/200" or "2s"
+    aperture: Option<f32>,     // raw f-number, display as "f/2.8"
+    iso: Option<u32>,
 }
 
 struct ThumbEntry {
     path: PathBuf,
     tex: Option<egui::TextureHandle>,
     mtime: Option<std::time::SystemTime>,
+    exif: ThumbExif,
 }
+
+fn read_exif(path: &Path) -> ThumbExif {
+    let mut out = ThumbExif::default();
+    let Ok(file) = std::fs::File::open(path) else { return out };
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)) else { return out };
+
+    if let Some(f) = exif.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY) {
+        if let exif::Value::Ascii(v) = &f.value {
+            if let Some(s) = v.first().and_then(|b| std::str::from_utf8(b).ok()) {
+                if let Some((date, time)) = s.split_once(' ') {
+                    let mut dp = date.split(':').filter_map(|p| p.parse::<i64>().ok());
+                    let mut tp = time.split(':').filter_map(|p| p.parse::<i64>().ok());
+                    if let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) =
+                        (dp.next(), dp.next(), dp.next(), tp.next(), tp.next(), tp.next())
+                    {
+                        out.capture_time = Some(
+                            y * 10_000_000_000 + mo * 100_000_000 + d * 1_000_000
+                                + h * 10_000 + mi * 100 + s,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(f) = exif.get_field(exif::Tag::ExposureTime, exif::In::PRIMARY) {
+        if let exif::Value::Rational(v) = &f.value {
+            if let Some(r) = v.first().filter(|r| r.denom > 0) {
+                out.shutter = Some(if r.num >= r.denom {
+                    let s = r.num as f32 / r.denom as f32;
+                    if s.fract() < 0.05 { format!("{}s", s.round() as u32) } else { format!("{:.1}s", s) }
+                } else {
+                    format!("1/{}", (r.denom as f32 / r.num as f32).round() as u32)
+                });
+            }
+        }
+    }
+
+    if let Some(f) = exif.get_field(exif::Tag::FNumber, exif::In::PRIMARY) {
+        if let exif::Value::Rational(v) = &f.value {
+            if let Some(r) = v.first().filter(|r| r.denom > 0) {
+                out.aperture = Some(r.num as f32 / r.denom as f32);
+            }
+        }
+    }
+
+    if let Some(f) = exif.get_field(exif::Tag::PhotographicSensitivity, exif::In::PRIMARY) {
+        if let exif::Value::Short(v) = &f.value {
+            out.iso = v.first().map(|&i| i as u32);
+        }
+    }
+
+    out
+}
+
 
 struct GpuState {
     device: wgpu::Device,
@@ -254,7 +319,7 @@ struct App {
     view: View,
     browse_dir: Option<PathBuf>,
     thumbs: Vec<ThumbEntry>,
-    thumb_rx: Option<std::sync::mpsc::Receiver<(usize, egui::ColorImage)>>,
+    thumb_rx: Option<std::sync::mpsc::Receiver<(usize, egui::ColorImage, ThumbExif)>>,
     current_path: Option<PathBuf>,
     selected: Option<PathBuf>,
     meta: HashMap<PathBuf, cull::CullMeta>,
@@ -444,20 +509,22 @@ impl App {
                 path: p.clone(),
                 tex: None,
                 mtime: std::fs::metadata(p).and_then(|m| m.modified()).ok(),
+                exif: ThumbExif::default(),
             })
             .collect();
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, egui::ColorImage, ThumbExif)>();
         self.thumb_rx = Some(rx); // dropping the old rx makes a stale loader thread stop
         let ctx = self.egui_ctx.clone();
         std::thread::spawn(move || {
             for (i, p) in paths.into_iter().enumerate() {
+                let exif = read_exif(&p);
                 let Some(t) = imgload::load_preview_rgba(&p, 220) else {
                     continue;
                 };
                 let (w, h) = t.dimensions();
                 let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &t);
-                if tx.send((i, ci)).is_err() {
+                if tx.send((i, ci, exif)).is_err() {
                     break;
                 }
                 ctx.request_repaint();
@@ -600,13 +667,14 @@ impl App {
 
         // Upload any thumbnails the loader thread has finished
         if let Some(rx) = &self.thumb_rx {
-            while let Ok((i, img)) = rx.try_recv() {
+            while let Ok((i, img, exif)) = rx.try_recv() {
                 if let Some(entry) = self.thumbs.get_mut(i) {
                     entry.tex = Some(self.egui_ctx.load_texture(
                         format!("thumb{i}"),
                         img,
                         egui::TextureOptions::LINEAR,
                     ));
+                    entry.exif = exif;
                 }
             }
         }
@@ -666,6 +734,11 @@ impl App {
                     .mtime
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                 am.cmp(&bm)
+                    .then_with(|| self.thumbs[a].path.cmp(&self.thumbs[b].path))
+            }),
+            BrowseSort::CaptureTime => visible.sort_by(|&a, &b| {
+                self.thumbs[a].exif.capture_time.unwrap_or(i64::MAX)
+                    .cmp(&self.thumbs[b].exif.capture_time.unwrap_or(i64::MAX))
                     .then_with(|| self.thumbs[a].path.cmp(&self.thumbs[b].path))
             }),
         }
@@ -764,13 +837,14 @@ impl App {
                 }
 
                 if !ctx.wants_keyboard_input() {
-                    let (left, right, up, down, enter) = ctx.input(|i| {
+                    let (left, right, up, down, enter, space) = ctx.input(|i| {
                         (
                             i.key_pressed(egui::Key::ArrowLeft),
                             i.key_pressed(egui::Key::ArrowRight),
                             i.key_pressed(egui::Key::ArrowUp),
                             i.key_pressed(egui::Key::ArrowDown),
                             i.key_pressed(egui::Key::Enter),
+                            i.key_pressed(egui::Key::Space),
                         )
                     });
                     let cols = *grid_cols as i32;
@@ -801,6 +875,20 @@ impl App {
                         if let Some(p) = selected.clone().or(current_path.clone()) {
                             ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_OPEN_PATH), p));
                         }
+                    }
+                    if *view == View::Browse && space && !visible.is_empty() {
+                        // Pick current + advance to next
+                        if let Some(path) = selected.clone().or(current_path.clone()) {
+                            cull_actions.push((path.clone(), cull::CullAction::TogglePick));
+                        }
+                        let anchor = selected.as_deref().or(current_path.as_deref());
+                        let pos = anchor.and_then(|a| visible.iter().position(|&i| thumbs[i].path == a));
+                        let next = match pos {
+                            Some(c) => (c + 1).min(visible.len() - 1),
+                            None => 0,
+                        };
+                        *selected = Some(thumbs[visible[next]].path.clone());
+                        *grid_scroll = true;
                     }
                     if let Some(path) = selected.clone().or(current_path.clone()) {
                         let keys = ctx.input(|i| (
@@ -882,7 +970,7 @@ impl App {
                                         });
                                         ui.add_space(4.0);
                                         ui.label("Rate: `1-5`, `0` clear");
-                                        ui.label("Flag: `P` pick, `X` reject");
+                                        ui.label("Flag: `P` pick, `X` reject, `Space` pick+next");
                                         ui.label("Label: `6` red, `7` yellow, `8` green, `9` blue");
                                         ui.label("Move: `←→` / `↑↓`, `Enter` opens");
                                         ui.add_space(4.0);
@@ -970,7 +1058,7 @@ impl App {
                                 ui.add(egui::DragValue::new(min_rating).range(0..=5));
                                 ui.separator();
                                 ui.label(egui::RichText::new("Sort").small());
-                                for (s, lbl) in [(BrowseSort::Name, "Name"), (BrowseSort::Date, "Date")] {
+                                for (s, lbl) in [(BrowseSort::Name, "Name"), (BrowseSort::Date, "Date"), (BrowseSort::CaptureTime, "Time")] {
                                     if ui.selectable_label(*sort == s, lbl).clicked() {
                                         *sort = s;
                                     }
@@ -1043,7 +1131,7 @@ impl App {
 
                                         let img_area = egui::Rect::from_min_max(
                                             rect.min + egui::vec2(6.0, 6.0),
-                                            egui::pos2(rect.max.x - 6.0, rect.max.y - 24.0),
+                                            egui::pos2(rect.max.x - 6.0, rect.max.y - 36.0),
                                         );
                                         if let Some(tex) = &entry.tex {
                                             let ts = tex.size_vec2();
@@ -1093,13 +1181,38 @@ impl App {
                                             label.truncate(20);
                                             label.push('…');
                                         }
+                                        // Row 1: filename
                                         p.text(
-                                            egui::pos2(rect.center().x, rect.max.y - 13.0),
+                                            egui::pos2(rect.center().x, rect.max.y - 24.0),
                                             egui::Align2::CENTER_CENTER,
                                             label,
                                             egui::FontId::proportional(10.0),
                                             egui::Color32::from_gray(170),
                                         );
+                                        // Row 2: EXIF (left) + time (right)
+                                        let exif_line: String = [
+                                            entry.exif.shutter.clone(),
+                                            entry.exif.aperture.map(|a| if a.fract() < 0.05 { format!("f/{}", a.round() as u32) } else { format!("f/{:.1}", a) }),
+                                            entry.exif.iso.map(|i| format!("ISO{i}")),
+                                        ].into_iter().flatten().collect::<Vec<_>>().join("  ");
+                                        if !exif_line.is_empty() {
+                                            p.text(
+                                                egui::pos2(rect.min.x + 6.0, rect.max.y - 11.0),
+                                                egui::Align2::LEFT_CENTER,
+                                                exif_line,
+                                                egui::FontId::proportional(9.0),
+                                                egui::Color32::from_gray(120),
+                                            );
+                                        }
+                                        if let Some(ct) = entry.exif.capture_time {
+                                            p.text(
+                                                egui::pos2(rect.max.x - 6.0, rect.max.y - 11.0),
+                                                egui::Align2::RIGHT_CENTER,
+                                                format!("{:02}:{:02}", (ct / 10_000) % 100, (ct / 100) % 100),
+                                                egui::FontId::proportional(9.0),
+                                                egui::Color32::from_gray(120),
+                                            );
+                                        }
 
                                         let selected_item = selected
                                             .as_deref()
