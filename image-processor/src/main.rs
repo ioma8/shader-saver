@@ -1208,7 +1208,7 @@ impl App {
                                             p.text(
                                                 egui::pos2(rect.max.x - 6.0, rect.max.y - 11.0),
                                                 egui::Align2::RIGHT_CENTER,
-                                                format!("{:02}:{:02}", (ct / 10_000) % 100, (ct / 100) % 100),
+                                                format!("{:02}-{:02} {:02}:{:02}", (ct / 100_000_000) % 100, (ct / 1_000_000) % 100, (ct / 10_000) % 100, (ct / 100) % 100),
                                                 egui::FontId::proportional(9.0),
                                                 egui::Color32::from_gray(120),
                                             );
