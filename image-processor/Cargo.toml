@@ -20,3 +20,6 @@ imagepipe = "0.5"
 jpgfromraw = { git = "https://github.com/ioma8/jpgfromrawlib", package = "jpgfromraw" }
 trash = "5"
 kamadak-exif = "0.5"
+
+[patch.crates-io]
+block = { path = "vendor/block" }
