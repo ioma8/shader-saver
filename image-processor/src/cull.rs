@@ -110,15 +110,14 @@ pub fn save_meta(conn: &rusqlite::Connection, path: &Path, meta: CullMeta) {
     }
     let updated = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs().cast_signed());
     let _ = conn.execute(
         "INSERT INTO meta (path, rating, flag, label, updated)
          VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(path) DO UPDATE SET rating = ?2, flag = ?3, label = ?4, updated = ?5",
         rusqlite::params![
             path,
-            meta.rating as i64,
+            i64::from(meta.rating),
             meta.flag as i64,
             meta.label as i64,
             updated
@@ -147,7 +146,7 @@ pub fn load_all_meta(conn: &rusqlite::Connection) -> HashMap<PathBuf, CullMeta> 
         out.insert(
             PathBuf::from(path),
             CullMeta {
-                rating: rating.clamp(0, 5) as u8,
+                rating: u8::try_from(rating.clamp(0, 5)).unwrap_or(0),
                 flag: flag_from_i(flag),
                 label: label_from_i(label),
             },

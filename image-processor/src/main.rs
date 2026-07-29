@@ -53,8 +53,7 @@ fn save_edits(conn: &rusqlite::Connection, path: &Path, state: &EditState) {
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs().cast_signed());
     let _ = conn.execute(
         "INSERT INTO edits (path, params, updated) VALUES (?1, ?2, ?3)
          ON CONFLICT(path) DO UPDATE SET params = ?2, updated = ?3",
@@ -145,7 +144,7 @@ fn paint_badges(p: &egui::Painter, rect: egui::Rect, meta: cull::CullMeta) {
 fn show_dir_item(
     ui: &mut egui::Ui,
     path: &Path,
-    depth: usize,
+    depth: u8,
     expanded: &mut std::collections::HashSet<PathBuf>,
     current: Option<&Path>,
     ctx: &egui::Context,
@@ -154,7 +153,7 @@ fn show_dir_item(
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("/");
     let selected = current == Some(path);
     ui.horizontal(|ui| {
-        ui.add_space(depth as f32 * 10.0);
+        ui.add_space(f32::from(depth) * 10.0);
         let (tri_rect, tri_resp) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::click());
         if ui.is_rect_visible(tri_rect) {
             let c = tri_rect.center();
@@ -185,14 +184,14 @@ fn show_dir_item(
     if is_exp {
         let Ok(rd) = std::fs::read_dir(path) else { return };
         let mut dirs: Vec<PathBuf> = rd
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map_or(false, |ft| ft.is_dir()))
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|ft| ft.is_dir()))
             .map(|e| e.path())
-            .filter(|p| p.file_name().and_then(|n| n.to_str()).map_or(false, |s| !s.starts_with('.')))
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|s| !s.starts_with('.')))
             .collect();
         dirs.sort_unstable();
         for dir in dirs {
-            show_dir_item(ui, &dir, depth + 1, expanded, current, ctx);
+            show_dir_item(ui, &dir, depth.saturating_add(1), expanded, current, ctx);
         }
     }
 }
@@ -220,9 +219,9 @@ enum BrowseSort {
 
 #[derive(Default)]
 struct ThumbExif {
-    capture_time: Option<i64>, // YYYYMMDDHHMMSS for sorting
-    shutter: Option<String>,   // "1/200" or "2s"
-    aperture: Option<f32>,     // raw f-number, display as "f/2.8"
+    capture_time: Option<i64>,      // YYYYMMDDHHMMSS for sorting
+    shutter: Option<String>,        // pre-formatted: "1/200" or "2s"
+    aperture: Option<(u32, u32)>,   // rational (numerator, denominator), displayed as "f/2.8"
     iso: Option<u32>,
 }
 
@@ -259,12 +258,15 @@ fn read_exif(path: &Path) -> ThumbExif {
 
     if let Some(f) = exif.get_field(exif::Tag::ExposureTime, exif::In::PRIMARY) {
         if let exif::Value::Rational(v) = &f.value {
-            if let Some(r) = v.first().filter(|r| r.denom > 0) {
+            if let Some(r) = v.first().filter(|r| r.denom > 0 && r.num > 0) {
                 out.shutter = Some(if r.num >= r.denom {
-                    let s = r.num as f32 / r.denom as f32;
-                    if s.fract() < 0.05 { format!("{}s", s.round() as u32) } else { format!("{:.1}s", s) }
+                    // >= 1s: integer whole seconds + optional one decimal place
+                    let whole = r.num / r.denom;
+                    let tenths = (u64::from(r.num) * 10 / u64::from(r.denom)) % 10;
+                    if tenths < 1 { format!("{whole}s") } else { format!("{whole}.{tenths}s") }
                 } else {
-                    format!("1/{}", (r.denom as f32 / r.num as f32).round() as u32)
+                    // sub-second: display as 1/N using integer division
+                    format!("1/{}", r.denom / r.num)
                 });
             }
         }
@@ -273,14 +275,14 @@ fn read_exif(path: &Path) -> ThumbExif {
     if let Some(f) = exif.get_field(exif::Tag::FNumber, exif::In::PRIMARY) {
         if let exif::Value::Rational(v) = &f.value {
             if let Some(r) = v.first().filter(|r| r.denom > 0) {
-                out.aperture = Some(r.num as f32 / r.denom as f32);
+                out.aperture = Some((r.num, r.denom));
             }
         }
     }
 
     if let Some(f) = exif.get_field(exif::Tag::PhotographicSensitivity, exif::In::PRIMARY) {
         if let exif::Value::Short(v) = &f.value {
-            out.iso = v.first().map(|&i| i as u32);
+            out.iso = v.first().map(|&i| u32::from(i));
         }
     }
 
@@ -295,6 +297,15 @@ struct GpuState {
     config: wgpu::SurfaceConfiguration,
 }
 
+struct AppFlags {
+    output_dirty: bool,
+    zoom_fit: bool,
+    strip_scroll: bool,
+    grid_scroll: bool,
+    confirm_trash: bool,
+    show_cull_help: bool,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
@@ -304,9 +315,8 @@ struct App {
     processor: Option<Processor>,
     image_tex_id: Option<egui::TextureId>,
     original_tex_id: Option<egui::TextureId>,
-    output_dirty: bool,
+    flags: AppFlags,
     // Zoom state
-    zoom_fit: bool,
     zoom_scale: f32,
     zoom_offset: egui::Vec2, // image top-left relative to panel top-left
     // Hold-to-show-original: only activates after 300 ms so double-clicks don't trigger it
@@ -326,12 +336,8 @@ struct App {
     filter: BrowseFilter,
     min_rating: u8,
     sort: BrowseSort,
-    strip_scroll: bool,
-    grid_scroll: bool,
     grid_cols: usize,
     tree_expanded: std::collections::HashSet<PathBuf>,
-    confirm_trash: bool,
-    show_cull_help: bool,
     full_tx: std::sync::mpsc::Sender<(PathBuf, image::RgbaImage)>,
     full_rx: std::sync::mpsc::Receiver<(PathBuf, image::RgbaImage)>,
     full_pending: Option<PathBuf>,
@@ -343,7 +349,7 @@ impl App {
     fn new() -> Self {
         let db = open_db();
         let meta = db.as_ref().map(cull::load_all_meta).unwrap_or_default();
-        let show_cull_help = db.as_ref().map_or(true, |db| load_bool_pref(db, CULL_HELP_KEY, true));
+        let show_cull_help = db.as_ref().is_none_or(|db| load_bool_pref(db, CULL_HELP_KEY, true));
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
         let mut tree_expanded = std::collections::HashSet::new();
         let mut p = PathBuf::from("/");
@@ -362,8 +368,14 @@ impl App {
             processor: None,
             image_tex_id: None,
             original_tex_id: None,
-            output_dirty: false,
-            zoom_fit: true,
+            flags: AppFlags {
+                output_dirty: false,
+                zoom_fit: true,
+                strip_scroll: false,
+                grid_scroll: false,
+                confirm_trash: false,
+                show_cull_help,
+            },
             zoom_scale: 1.0,
             zoom_offset: egui::Vec2::ZERO,
             preview_hold_start: None,
@@ -379,12 +391,8 @@ impl App {
             filter: BrowseFilter::All,
             min_rating: 0,
             sort: BrowseSort::Name,
-            strip_scroll: false,
-            grid_scroll: false,
             grid_cols: 1,
             tree_expanded,
-            confirm_trash: false,
-            show_cull_help,
             full_tx,
             full_rx,
             full_pending: None,
@@ -409,7 +417,7 @@ impl ApplicationHandler for App {
             self.egui_ctx.clone(),
             egui::ViewportId::ROOT,
             &window,
-            Some(window.scale_factor() as f32),
+            None, // egui-winit detects DPI from the window itself
             None,
             Some(gpu.device.limits().max_texture_dimension_2d as usize),
         );
@@ -456,11 +464,9 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
                     && event.state == winit::event::ElementState::Pressed
-                {
-                    if self.view == View::Edit {
+                    && self.view == View::Edit {
                         self.view = View::Browse;
                     }
-                }
             }
 
             WindowEvent::Resized(size) => {
@@ -516,7 +522,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel::<(usize, egui::ColorImage, ThumbExif)>();
         self.thumb_rx = Some(rx); // dropping the old rx makes a stale loader thread stop
         let ctx = self.egui_ctx.clone();
-        let n_workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+        let n_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get).min(8);
         let (work_tx, work_rx) = std::sync::mpsc::channel::<(usize, PathBuf)>();
         let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
         for _ in 0..n_workers {
@@ -525,12 +531,12 @@ impl App {
             let ctx = ctx.clone();
             std::thread::spawn(move || {
                 loop {
-                    let Ok((i, p)) = work_rx.lock().unwrap().recv() else { break };
-                    let exif = read_exif(&p);
-                    let Some(t) = imgload::load_preview_rgba(&p, 220) else { continue };
-                    let (w, h) = t.dimensions();
-                    let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &t);
-                    if tx.send((i, ci, exif)).is_err() { break; }
+                    let Ok((idx, path)) = work_rx.lock().unwrap().recv() else { break };
+                    let exif = read_exif(&path);
+                    let Some(img) = imgload::load_preview_rgba(&path, 220) else { continue };
+                    let (img_w, img_h) = img.dimensions();
+                    let ci = egui::ColorImage::from_rgba_unmultiplied([img_w as usize, img_h as usize], &img);
+                    if tx.send((idx, ci, exif)).is_err() { break; }
                     ctx.request_repaint();
                 }
             });
@@ -578,14 +584,14 @@ impl App {
     fn flag_count(&self, flag: cull::Flag) -> usize {
         self.thumbs
             .iter()
-            .filter(|t| self.meta.get(&t.path).map_or(false, |m| m.flag == flag))
+            .filter(|t| self.meta.get(&t.path).is_some_and(|m| m.flag == flag))
             .count()
     }
 
     fn flagged_paths(&self, flag: cull::Flag) -> Vec<PathBuf> {
         self.thumbs
             .iter()
-            .filter(|t| self.meta.get(&t.path).map_or(false, |m| m.flag == flag))
+            .filter(|t| self.meta.get(&t.path).is_some_and(|m| m.flag == flag))
             .map(|t| t.path.clone())
             .collect()
     }
@@ -597,7 +603,7 @@ impl App {
         if self
             .current_path
             .as_ref()
-            .map_or(false, |path| removed.contains(path))
+            .is_some_and(|path| removed.contains(path))
         {
             self.current_path = None;
             self.view = View::Browse;
@@ -607,7 +613,7 @@ impl App {
         if self
             .selected
             .as_ref()
-            .map_or(false, |path| removed.contains(path))
+            .is_some_and(|path| removed.contains(path))
         {
             self.selected = None;
         }
@@ -649,12 +655,12 @@ impl App {
             window.set_title(name);
         }
 
-        self.output_dirty = true;
-        self.zoom_fit = true;
+        self.flags.output_dirty = true;
+        self.flags.zoom_fit = true;
         self.view = View::Edit;
         self.current_path = Some(path.to_owned());
         self.selected = Some(path.to_owned());
-        self.strip_scroll = true;
+        self.flags.strip_scroll = true;
 
         if let Some(parent) = path.parent() {
             if self.browse_dir.as_deref() != Some(parent) {
@@ -710,7 +716,7 @@ impl App {
                 if let (Some(gpu), Some(processor)) = (self.gpu.as_ref(), self.processor.as_mut()) {
                     processor.upload_rgba(&img, &gpu.device, &gpu.queue);
                     self.rebind_image_textures();
-                    self.output_dirty = true;
+                    self.flags.output_dirty = true;
                 }
             }
         }
@@ -732,7 +738,7 @@ impl App {
             .collect();
         match self.sort {
             BrowseSort::Name => {
-                visible.sort_by(|&a, &b| self.thumbs[a].path.cmp(&self.thumbs[b].path))
+                visible.sort_by(|&a, &b| self.thumbs[a].path.cmp(&self.thumbs[b].path));
             }
             BrowseSort::Date => visible.sort_by(|&a, &b| {
                 let am = self.thumbs[a]
@@ -767,7 +773,7 @@ impl App {
                 }
             }
         };
-        let frame_view = frame.texture.create_view(&Default::default());
+        let frame_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let image_tex_id = self.image_tex_id;
         let original_tex_id = self.original_tex_id;
@@ -790,7 +796,7 @@ impl App {
             let window = self.window.as_ref().unwrap();
             let egui_state = self.egui_state.as_mut().unwrap();
             let processor = self.processor.as_mut().unwrap();
-            let zoom_fit = &mut self.zoom_fit;
+            let zoom_fit = &mut self.flags.zoom_fit;
             let zoom_scale = &mut self.zoom_scale;
             let zoom_offset = &mut self.zoom_offset;
             let preview_hold_start = &mut self.preview_hold_start;
@@ -801,12 +807,12 @@ impl App {
             let filter = &mut self.filter;
             let min_rating = &mut self.min_rating;
             let sort = &mut self.sort;
-            let strip_scroll = &mut self.strip_scroll;
-            let grid_scroll = &mut self.grid_scroll;
+            let strip_scroll = &mut self.flags.strip_scroll;
+            let grid_scroll = &mut self.flags.grid_scroll;
             let grid_cols = &mut self.grid_cols;
             let tree_expanded = &mut self.tree_expanded;
-            let confirm_trash = &mut self.confirm_trash;
-            let show_cull_help = &mut self.show_cull_help;
+            let confirm_trash = &mut self.flags.confirm_trash;
+            let show_cull_help = &mut self.flags.show_cull_help;
             let cull_actions = &mut cull_actions;
             let thumbs = &self.thumbs;
             let browse_dir = &self.browse_dir;
@@ -856,7 +862,7 @@ impl App {
                         )
                     });
                     let cols = *grid_cols as i32;
-                    let delta = (right as i32 - left as i32) + (down as i32 - up as i32) * cols;
+                    let delta = (i32::from(right) - i32::from(left)) + (i32::from(down) - i32::from(up)) * cols;
                     if delta != 0 && !visible.is_empty() {
                         let anchor = if *view == View::Edit {
                             current_path.as_deref()
@@ -1012,10 +1018,10 @@ impl App {
                                 ui.add_space(4.0);
                                 if let Ok(rd) = std::fs::read_dir("/Volumes") {
                                     let mut vols: Vec<PathBuf> = rd
-                                        .filter_map(|e| e.ok())
-                                        .filter(|e| e.file_type().map_or(false, |t| t.is_dir()))
+                                        .filter_map(std::result::Result::ok)
+                                        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
                                         .map(|e| e.path())
-                                        .filter(|p| p.file_name().and_then(|n| n.to_str()).map_or(false, |s| !s.starts_with('.')))
+                                        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|s| !s.starts_with('.')))
                                         .collect();
                                     vols.sort_unstable();
                                     for vol in vols {
@@ -1034,7 +1040,7 @@ impl App {
                                 if ui.button("Open Folder…").clicked() {
                                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                                         ctx.data_mut(|d| {
-                                            d.insert_temp(egui::Id::new(KEY_SCAN_DIR), dir)
+                                            d.insert_temp(egui::Id::new(KEY_SCAN_DIR), dir);
                                         });
                                     }
                                 }
@@ -1206,7 +1212,11 @@ impl App {
                                         // Row 2: EXIF (left) + time (right)
                                         let exif_line: String = [
                                             entry.exif.shutter.clone(),
-                                            entry.exif.aperture.map(|a| if a.fract() < 0.05 { format!("f/{}", a.round() as u32) } else { format!("f/{:.1}", a) }),
+                                            entry.exif.aperture.map(|(n, d)| {
+                                                let whole = n / d;
+                                                let tenths = (u64::from(n) * 10 / u64::from(d)) % 10;
+                                                if tenths < 1 { format!("f/{whole}") } else { format!("f/{whole}.{tenths}") }
+                                            }),
                                             entry.exif.iso.map(|i| format!("ISO{i}")),
                                         ].into_iter().flatten().collect::<Vec<_>>().join("  ");
                                         if !exif_line.is_empty() {
@@ -1255,7 +1265,7 @@ impl App {
                                                 d.insert_temp(
                                                     egui::Id::new(KEY_OPEN_PATH),
                                                     entry.path.clone(),
-                                                )
+                                                );
                                             });
                                         }
                                     }
@@ -1270,6 +1280,8 @@ impl App {
                     .exact_width(260.0)
                     .resizable(false)
                     .show(ctx, |ui| {
+                        const MIN_DX: f32 = 0.01;
+                        const GAMMA_LOG_RANGE: f32 = 1.609_438; // ln(5): gamma handle maps 0.2..5
                         // Luminance histogram + curves editor
                         let hist_size = egui::vec2(ui.available_width(), 150.0);
                         let (hist_rect, hist_resp) =
@@ -1351,7 +1363,6 @@ impl App {
                                 .filter(|(_, d)| *d < 10.0)
                                 .map(|(i, _)| i)
                         };
-                        const MIN_DX: f32 = 0.01;
 
                         // Grab an existing point or create one (click or drag start)
                         if hist_resp.drag_started() || hist_resp.clicked() {
@@ -1413,12 +1424,12 @@ impl App {
                         }
 
                         // Quarter grid lines
-                        let grid = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(34));
+                        let grid_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(34));
                         for f in [0.25f32, 0.5, 0.75] {
                             let x = hist_rect.left() + f * hist_rect.width();
                             let y = hist_rect.top() + f * hist_rect.height();
-                            painter.line_segment([egui::pos2(x, hist_rect.top()), egui::pos2(x, hist_rect.bottom())], grid);
-                            painter.line_segment([egui::pos2(hist_rect.left(), y), egui::pos2(hist_rect.right(), y)], grid);
+                            painter.line_segment([egui::pos2(x, hist_rect.top()), egui::pos2(x, hist_rect.bottom())], grid_stroke);
+                            painter.line_segment([egui::pos2(hist_rect.left(), y), egui::pos2(hist_rect.right(), y)], grid_stroke);
                         }
 
                         // The curve itself, sampled from the same LUT the shader uses
@@ -1452,7 +1463,6 @@ impl App {
                         }
 
                         // Levels: gradient strip with draggable handles (black / gamma / white)
-                        const GAMMA_LOG_RANGE: f32 = 1.609_438; // ln(5): handle maps gamma 0.2..5, center = 1.0
                         let strip_h  = 10.0;
                         let marker_h = 12.0;
                         let (strip_area, strip_resp) = ui.allocate_exact_size(
@@ -1460,7 +1470,7 @@ impl App {
                             egui::Sense::click_and_drag(),
                         );
                         let sp = ui.painter_at(strip_area);
-                        let grad = egui::Rect::from_min_size(strip_area.min, egui::vec2(strip_area.width(), strip_h));
+                        let gradient_rect = egui::Rect::from_min_size(strip_area.min, egui::vec2(strip_area.width(), strip_h));
 
                         let w = strip_area.width();
                         let x_of = |v: f32| strip_area.left() + (v / 255.0) * w;
@@ -1513,10 +1523,10 @@ impl App {
                         let mut gm = egui::Mesh::default();
                         let gv = gm.vertices.len() as u32;
                         gm.vertices.extend([
-                            egui::epaint::Vertex { pos: grad.left_top(),     uv, color: egui::Color32::BLACK },
-                            egui::epaint::Vertex { pos: grad.right_top(),    uv, color: egui::Color32::WHITE },
-                            egui::epaint::Vertex { pos: grad.right_bottom(), uv, color: egui::Color32::WHITE },
-                            egui::epaint::Vertex { pos: grad.left_bottom(),  uv, color: egui::Color32::BLACK },
+                            egui::epaint::Vertex { pos: gradient_rect.left_top(),     uv, color: egui::Color32::BLACK },
+                            egui::epaint::Vertex { pos: gradient_rect.right_top(),    uv, color: egui::Color32::WHITE },
+                            egui::epaint::Vertex { pos: gradient_rect.right_bottom(), uv, color: egui::Color32::WHITE },
+                            egui::epaint::Vertex { pos: gradient_rect.left_bottom(),  uv, color: egui::Color32::BLACK },
                         ]);
                         gm.indices.extend_from_slice(&[gv, gv+1, gv+2, gv, gv+2, gv+3]);
                         sp.add(egui::Shape::Mesh(gm));
@@ -1535,7 +1545,7 @@ impl App {
                         });
 
                         // Triangle handles (pointing up, sitting below the gradient strip)
-                        let ty = grad.bottom();
+                        let ty = gradient_rect.bottom();
                         let by = strip_area.bottom();
                         let mk = |cx: f32, fill: egui::Color32, hot: bool| {
                             let cx = cx.clamp(strip_area.left() + 6.0, strip_area.right() - 6.0);
@@ -1606,7 +1616,7 @@ impl App {
                             if let Some(path) = path {
                                 ui.label(egui::RichText::new("Rating").small().color(egui::Color32::from_gray(140)));
                                 for rating in 1..=5u8 {
-                                    let filled = meta_map.get(&path).map_or(false, |m| m.rating >= rating);
+                                    let filled = meta_map.get(&path).is_some_and(|m| m.rating >= rating);
                                     let label = if filled { "★" } else { "☆" };
                                     if ui.selectable_label(filled, label).clicked() {
                                         cull_actions.push((path.clone(), cull::CullAction::Rating(rating)));
@@ -1616,11 +1626,11 @@ impl App {
                                     cull_actions.push((path.clone(), cull::CullAction::Rating(0)));
                                 }
                                 ui.separator();
-                                let pick = meta_map.get(&path).map_or(false, |m| m.flag == cull::Flag::Pick);
+                                let pick = meta_map.get(&path).is_some_and(|m| m.flag == cull::Flag::Pick);
                                 if ui.selectable_label(pick, "P").clicked() {
                                     cull_actions.push((path.clone(), cull::CullAction::TogglePick));
                                 }
-                                let reject = meta_map.get(&path).map_or(false, |m| m.flag == cull::Flag::Reject);
+                                let reject = meta_map.get(&path).is_some_and(|m| m.flag == cull::Flag::Reject);
                                 if ui.selectable_label(reject, "X").clicked() {
                                     cull_actions.push((path.clone(), cull::CullAction::ToggleReject));
                                 }
@@ -1628,7 +1638,7 @@ impl App {
                                 for label in [cull::Label::Red, cull::Label::Yellow, cull::Label::Green, cull::Label::Blue] {
                                     let c = label_color(label).unwrap();
                                     let dot = egui::RichText::new("●").color(c);
-                                    let active = meta_map.get(&path).map_or(false, |m| m.label == label);
+                                    let active = meta_map.get(&path).is_some_and(|m| m.label == label);
                                     if ui.selectable_label(active, dot).clicked() {
                                         cull_actions.push((path.clone(), cull::CullAction::ToggleLabel(label)));
                                     }
@@ -1807,7 +1817,7 @@ impl App {
                                                 d.insert_temp(
                                                     egui::Id::new(KEY_OPEN_PATH),
                                                     entry.path.clone(),
-                                                )
+                                                );
                                             });
                                         }
                                     }
@@ -1845,8 +1855,7 @@ impl App {
                         // Only show original after 300 ms — fast double-clicks finish in ~200–400 ms
                         // and won't reach the threshold, so they don't flash the original.
                         let held_long_enough = preview_hold_start
-                            .map(|t| now - t > 0.3)
-                            .unwrap_or(false);
+                            .is_some_and(|t| now - t > 0.3);
                         let show_original = ctx.input(|i| i.key_down(egui::Key::Space))
                             || held_long_enough;
                         let tex_id = if show_original { original_tex_id } else { image_tex_id };
@@ -2055,11 +2064,11 @@ impl App {
             {
                 save_edits(db, path, &proc.edit_state());
             }
-            self.output_dirty = true;
+            self.flags.output_dirty = true;
         }
 
         // Refresh output texture only when GPU output changed
-        if self.output_dirty {
+        if self.flags.output_dirty {
             if let (Some(proc), Some(tex_id)) = (&self.processor, self.image_tex_id) {
                 if let (Some(view), Some(er), Some(gpu)) = (
                     proc.output_view(),
@@ -2074,7 +2083,7 @@ impl App {
                     );
                 }
             }
-            self.output_dirty = false;
+            self.flags.output_dirty = false;
         }
 
         // wgpu render
@@ -2087,7 +2096,7 @@ impl App {
             size_in_pixels: [size.width, size.height],
             pixels_per_point: window.scale_factor() as f32,
         };
-        let mut encoder = gpu.device.create_command_encoder(&Default::default());
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let tris = self.egui_ctx.tessellate(shapes, pixels_per_point);
         for (id, delta) in textures_delta.set {
             egui_renderer.update_texture(&gpu.device, &gpu.queue, id, &delta);
@@ -2189,13 +2198,16 @@ fn resize_surface(gpu: &mut GpuState, size: PhysicalSize<u32>) {
 }
 
 fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    match std::fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            std::fs::copy(from, to)?;
-            std::fs::remove_file(from)
-        }
+    if let Ok(()) = std::fs::rename(from, to) { Ok(()) } else {
+        std::fs::copy(from, to)?;
+        std::fs::remove_file(from)
     }
+}
+
+fn main() {
+    let event_loop = EventLoop::new().unwrap();
+    let mut app = App::new();
+    event_loop.run_app(&mut app).unwrap();
 }
 
 #[cfg(test)]
@@ -2232,10 +2244,4 @@ mod tests {
         save_bool_pref(&conn, "x", true);
         assert!(load_bool_pref(&conn, "x", false));
     }
-}
-
-fn main() {
-    let event_loop = EventLoop::new().unwrap();
-    let mut app = App::new();
-    event_loop.run_app(&mut app).unwrap();
 }

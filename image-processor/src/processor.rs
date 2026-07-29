@@ -100,6 +100,82 @@ pub struct Processor {
     pub curve_points: Vec<[f32; 2]>,
 }
 
+fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+fn create_histogram_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
 impl Processor {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -107,51 +183,7 @@ impl Processor {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders.wgsl").into()),
         });
 
-        let compute_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        let compute_bgl = create_compute_bgl(device);
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
@@ -165,7 +197,7 @@ impl Processor {
                 layout: Some(&pipeline_layout),
                 module: &shader,
                 entry_point: ep,
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             })
         };
@@ -179,31 +211,7 @@ impl Processor {
             })
         };
 
-        let histogram_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        let histogram_bgl = create_histogram_bgl(device);
         let histogram_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(include_str!("histogram.wgsl").into()),
@@ -218,7 +226,7 @@ impl Processor {
             layout: Some(&histogram_pl),
             module: &histogram_shader,
             entry_point: "histogram_pass",
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
         let histogram_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -290,47 +298,47 @@ impl Processor {
     // LUT. Flat extension outside the endpoint x-range, values clamped to [0,1].
     pub fn curve_lut(&self) -> [f32; 256] {
         let pts = &self.curve_points;
-        let n = pts.len();
+        let n_pts = pts.len();
         let mut lut = [0f32; 256];
-        if n < 2 {
-            for (i, v) in lut.iter_mut().enumerate() {
-                *v = i as f32 / 255.0;
+        if n_pts < 2 {
+            for (lut_i, v) in (0u16..).zip(lut.iter_mut()) {
+                *v = f32::from(lut_i) / 255.0;
             }
             return lut;
         }
 
-        // Second derivatives with natural boundary (m[0] = m[n-1] = 0),
+        // Second derivatives with natural boundary (d2[0] = d2[n-1] = 0),
         // solved with the Thomas algorithm.
-        let mut m = vec![0f32; n];
-        if n > 2 {
-            let mut b = vec![1f32; n];
-            let mut c = vec![0f32; n];
-            let mut d = vec![0f32; n];
-            for i in 1..n - 1 {
-                let h0 = (pts[i][0] - pts[i - 1][0]).max(1e-4);
-                let h1 = (pts[i + 1][0] - pts[i][0]).max(1e-4);
-                let a_i = h0;
-                b[i] = 2.0 * (h0 + h1);
-                c[i] = h1;
-                d[i] = 6.0 * ((pts[i + 1][1] - pts[i][1]) / h1 - (pts[i][1] - pts[i - 1][1]) / h0);
-                let w = a_i / b[i - 1];
-                b[i] -= w * c[i - 1];
-                d[i] -= w * d[i - 1];
+        let mut d2 = vec![0f32; n_pts];
+        if n_pts > 2 {
+            let mut diag = vec![1f32; n_pts];
+            let mut upper = vec![0f32; n_pts];
+            let mut rhs = vec![0f32; n_pts];
+            for idx in 1..n_pts - 1 {
+                let h0 = (pts[idx][0] - pts[idx - 1][0]).max(1e-4);
+                let h1 = (pts[idx + 1][0] - pts[idx][0]).max(1e-4);
+                let a_idx = h0;
+                diag[idx] = 2.0 * (h0 + h1);
+                upper[idx] = h1;
+                rhs[idx] = 6.0 * ((pts[idx + 1][1] - pts[idx][1]) / h1 - (pts[idx][1] - pts[idx - 1][1]) / h0);
+                let fac = a_idx / diag[idx - 1];
+                diag[idx] -= fac * upper[idx - 1];
+                rhs[idx] -= fac * rhs[idx - 1];
             }
-            for i in (1..n - 1).rev() {
-                m[i] = (d[i] - c[i] * m[i + 1]) / b[i];
+            for idx in (1..n_pts - 1).rev() {
+                d2[idx] = (rhs[idx] - upper[idx] * d2[idx + 1]) / diag[idx];
             }
         }
 
         let mut seg = 0;
-        for (i, v) in lut.iter_mut().enumerate() {
-            let x = i as f32 / 255.0;
+        for (lut_i, v) in (0u16..).zip(lut.iter_mut()) {
+            let x = f32::from(lut_i) / 255.0;
             let y = if x <= pts[0][0] {
                 pts[0][1]
-            } else if x >= pts[n - 1][0] {
-                pts[n - 1][1]
+            } else if x >= pts[n_pts - 1][0] {
+                pts[n_pts - 1][1]
             } else {
-                while seg < n - 2 && pts[seg + 1][0] < x {
+                while seg < n_pts - 2 && pts[seg + 1][0] < x {
                     seg += 1;
                 }
                 let (x0, y0) = (pts[seg][0], pts[seg][1]);
@@ -338,10 +346,10 @@ impl Processor {
                 let h = (x1 - x0).max(1e-4);
                 let t0 = x1 - x;
                 let t1 = x - x0;
-                m[seg] * t0 * t0 * t0 / (6.0 * h)
-                    + m[seg + 1] * t1 * t1 * t1 / (6.0 * h)
-                    + (y0 / h - m[seg] * h / 6.0) * t0
-                    + (y1 / h - m[seg + 1] * h / 6.0) * t1
+                d2[seg] * t0 * t0 * t0 / (6.0 * h)
+                    + d2[seg + 1] * t1 * t1 * t1 / (6.0 * h)
+                    + (y0 / h - d2[seg] * h / 6.0) * t0
+                    + (y1 / h - d2[seg + 1] * h / 6.0) * t1
             };
             *v = y.clamp(0.0, 1.0);
         }
@@ -399,18 +407,19 @@ impl Processor {
     // Derive auto adjustments from the luminance histogram. Call with the
     // histogram of the UNEDITED image (reset + process first).
     pub fn auto_adjust(&mut self) {
-        let total: u64 = self.histogram.iter().map(|&c| c as u64).sum();
-        if total == 0 {
+        let total_f: f64 = self.histogram.iter().map(|&c| f64::from(c)).sum();
+        if total_f == 0.0 {
             return;
         }
-        // Luminance value (0-255) below which fraction p of all pixels fall
+        // Luminance value (0-255) below which fraction p of all pixels fall.
+        // u32→f64 is lossless; no integer casts needed.
         let pct = |p: f64| -> f32 {
-            let target = (total as f64 * p) as u64;
-            let mut cum = 0u64;
-            for (i, &c) in self.histogram.iter().enumerate() {
-                cum += c as u64;
+            let target = total_f * p;
+            let mut cum = 0.0f64;
+            for (bucket, &c) in (0u8..).zip(self.histogram.iter()) {
+                cum += f64::from(c);
                 if cum >= target {
-                    return i as f32;
+                    return f32::from(bucket);
                 }
             }
             255.0
@@ -481,7 +490,7 @@ impl Processor {
         });
         queue.write_texture(
             input_tex.as_image_copy(),
-            &img,
+            img,
             wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * width),
@@ -548,6 +557,79 @@ impl Processor {
 
     // Pipeline: contrast → sharpen → blur_h → blur_v
     // Sharpen operates on the contrast-adjusted image (pre-blur) so the unsharp
+    fn write_uniforms(&self, queue: &wgpu::Queue) {
+        queue.write_buffer(
+            &self.contrast_buf,
+            0,
+            bytemuck::cast_slice(&[
+                self.contrast, self.levels_black, self.levels_white, self.levels_gamma,
+                self.exposure, self.wb_temp, self.wb_tint, 0f32,
+            ]),
+        );
+        queue.write_buffer(
+            &self.tonal_buf,
+            0,
+            bytemuck::cast_slice(&[
+                self.blacks, self.shadows, self.highlights, self.whites,
+                self.brightness, self.vignette, self.vignette_mid, 0f32,
+            ]),
+        );
+        queue.write_buffer(
+            &self.blur_buf,
+            0,
+            bytemuck::cast_slice(&[self.blur_radius, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32]),
+        );
+        queue.write_buffer(
+            &self.sharpen_buf,
+            0,
+            bytemuck::cast_slice(&[
+                self.unsharp_strength, self.unsharp_blur_radius,
+                0f32, 0f32, 0f32, 0f32, 0f32, 0f32,
+            ]),
+        );
+        let lut = self.curve_lut();
+        queue.write_buffer(&self.curve_buf, 0, bytemuck::cast_slice(&lut[..]));
+    }
+
+    fn read_histogram(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        hist_view: &wgpu::TextureView,
+        w: u32,
+        h: u32,
+    ) {
+        queue.write_buffer(&self.histogram_buf, 0, &[0u8; 1024]);
+        let hist_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.histogram_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(hist_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: self.histogram_buf.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&self.histogram_pipeline);
+            pass.set_bind_group(0, &hist_bg, &[]);
+            pass.dispatch_workgroups(w.div_ceil(16), h.div_ceil(16), 1);
+        }
+        enc.copy_buffer_to_buffer(&self.histogram_buf, 0, &self.histogram_staging, 0, 1024);
+        queue.submit([enc.finish()]);
+
+        let slice = self.histogram_staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        device.poll(wgpu::Maintain::Wait);
+        if rx.recv().unwrap().is_ok() {
+            let data = slice.get_mapped_range();
+            self.histogram.copy_from_slice(bytemuck::cast_slice(&data));
+            drop(data);
+        }
+        self.histogram_staging.unmap();
+    }
+
     // mask anchors off clean signal, independent of the box-blur slider.
     pub fn process(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let (Some(input), Some(t1), Some(t2), Some(t3), Some(t4), Some(output)) = (
@@ -561,62 +643,14 @@ impl Processor {
             return;
         };
 
-        queue.write_buffer(
-            &self.contrast_buf,
-            0,
-            bytemuck::cast_slice(&[
-                self.contrast,
-                self.levels_black,
-                self.levels_white,
-                self.levels_gamma,
-                self.exposure,
-                self.wb_temp,
-                self.wb_tint,
-                0f32,
-            ]),
-        );
-        queue.write_buffer(
-            &self.tonal_buf,
-            0,
-            bytemuck::cast_slice(&[
-                self.blacks,
-                self.shadows,
-                self.highlights,
-                self.whites,
-                self.brightness,
-                self.vignette,
-                self.vignette_mid,
-                0f32,
-            ]),
-        );
-        queue.write_buffer(
-            &self.blur_buf,
-            0,
-            bytemuck::cast_slice(&[self.blur_radius, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32, 0f32]),
-        );
-        queue.write_buffer(
-            &self.sharpen_buf,
-            0,
-            bytemuck::cast_slice(&[
-                self.unsharp_strength,
-                self.unsharp_blur_radius,
-                0f32,
-                0f32,
-                0f32,
-                0f32,
-                0f32,
-                0f32,
-            ]),
-        );
-        let lut = self.curve_lut();
-        queue.write_buffer(&self.curve_buf, 0, bytemuck::cast_slice(&lut[..]));
+        self.write_uniforms(queue);
 
-        let iv = input.create_view(&Default::default());
-        let t1v = t1.create_view(&Default::default());
-        let t2v = t2.create_view(&Default::default());
-        let t3v = t3.create_view(&Default::default());
-        let t4v = t4.create_view(&Default::default());
-        let ov = output.create_view(&Default::default());
+        let iv = input.create_view(&wgpu::TextureViewDescriptor::default());
+        let t1v = t1.create_view(&wgpu::TextureViewDescriptor::default());
+        let t2v = t2.create_view(&wgpu::TextureViewDescriptor::default());
+        let t3v = t3.create_view(&wgpu::TextureViewDescriptor::default());
+        let t4v = t4.create_view(&wgpu::TextureViewDescriptor::default());
+        let ov = output.create_view(&wgpu::TextureViewDescriptor::default());
 
         let bgl = &self.compute_bgl;
         let curve_buf = &self.curve_buf;
@@ -626,92 +660,39 @@ impl Processor {
                     label: None,
                     layout: bgl,
                     entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(in_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(out_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: curve_buf.as_entire_binding(),
-                        },
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(in_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(out_view) },
+                        wgpu::BindGroupEntry { binding: 2, resource: buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: curve_buf.as_entire_binding() },
                     ],
                 })
             };
 
-        let contrast_bg = make_bg(&iv, &t1v, &self.contrast_buf); // input → t1
-        let tonal_bg = make_bg(&t1v, &t2v, &self.tonal_buf); // t1    → t2
-        let sharpen_bg = make_bg(&t2v, &t3v, &self.sharpen_buf); // t2    → t3
-        let blur_h_bg = make_bg(&t3v, &t4v, &self.blur_buf); // t3    → t4
-        let blur_v_bg = make_bg(&t4v, &ov, &self.blur_buf); // t4    → output
+        let contrast_bg  = make_bg(&iv,  &t1v, &self.contrast_buf);
+        let tonal_bg     = make_bg(&t1v, &t2v, &self.tonal_buf);
+        let sharpen_bg   = make_bg(&t2v, &t3v, &self.sharpen_buf);
+        let blur_h_bg    = make_bg(&t3v, &t4v, &self.blur_buf);
+        let blur_vert_bg = make_bg(&t4v, &ov,  &self.blur_buf);
 
         let (w, h) = self.image_size.unwrap();
-        let wg = ((w + 7) / 8, (h + 7) / 8);
+        let wg = (w.div_ceil(8), h.div_ceil(8));
 
-        let mut encoder = device.create_command_encoder(&Default::default());
-
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let mut dispatch = |pipeline: &wgpu::ComputePipeline, bg: &wgpu::BindGroup| {
-            let mut pass = encoder.begin_compute_pass(&Default::default());
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(wg.0, wg.1, 1);
         };
-
         dispatch(&self.contrast_pipeline, &contrast_bg);
-        dispatch(&self.tonal_pipeline, &tonal_bg);
-        dispatch(&self.sharpen_pipeline, &sharpen_bg);
-        dispatch(&self.blur_h_pipeline, &blur_h_bg);
-        dispatch(&self.blur_v_pipeline, &blur_v_bg);
-
+        dispatch(&self.tonal_pipeline,    &tonal_bg);
+        dispatch(&self.sharpen_pipeline,  &sharpen_bg);
+        dispatch(&self.blur_h_pipeline,   &blur_h_bg);
+        dispatch(&self.blur_v_pipeline,   &blur_vert_bg);
         queue.submit([encoder.finish()]);
 
-        // Histogram: reset bins, dispatch over the output, copy 1 KB to staging, sync readback.
-        // Separate submission so the blur_v write is visible before histogram reads output.
-        queue.write_buffer(&self.histogram_buf, 0, &[0u8; 1024]);
-        let hist_view = output.create_view(&Default::default());
-        let hist_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.histogram_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&hist_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.histogram_buf.as_entire_binding(),
-                },
-            ],
-        });
-        let mut enc = device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            pass.set_pipeline(&self.histogram_pipeline);
-            pass.set_bind_group(0, &hist_bg, &[]);
-            pass.dispatch_workgroups((w + 15) / 16, (h + 15) / 16, 1);
-        }
-        enc.copy_buffer_to_buffer(&self.histogram_buf, 0, &self.histogram_staging, 0, 1024);
-        queue.submit([enc.finish()]);
-
-        let slice = self.histogram_staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        device.poll(wgpu::Maintain::Wait);
-        if rx.recv().unwrap().is_ok() {
-            let data = slice.get_mapped_range();
-            self.histogram.copy_from_slice(bytemuck::cast_slice(&data));
-            drop(data);
-        }
-        self.histogram_staging.unmap();
+        // Separate submission: blur_v write must be visible before histogram reads.
+        self.read_histogram(device, queue, &ov, w, h);
     }
 
     pub fn export(&self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -721,16 +702,16 @@ impl Processor {
         };
 
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let bytes_per_row = (width * 4 + align - 1) / align * align;
+        let bytes_per_row = (width * 4).div_ceil(align) * align;
 
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: (bytes_per_row * height) as u64,
+            size: u64::from(bytes_per_row * height),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
-        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_texture_to_buffer(
             output.as_image_copy(),
             wgpu::ImageCopyBuffer {
