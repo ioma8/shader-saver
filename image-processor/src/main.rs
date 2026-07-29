@@ -1,9 +1,11 @@
 mod classify;
 mod cull;
+mod face;
 mod imgload;
 mod presets;
 mod processor;
 mod rate;
+mod similar;
 mod tags;
 
 use std::collections::HashMap;
@@ -28,6 +30,7 @@ const KEY_MOVE_REJECTS: &str = "move_rejects";
 const KEY_COPY_PICKS: &str = "copy_picks";
 const KEY_CLASSIFY_FOLDER: &str = "classify_folder";
 const KEY_RATE_FOLDER: &str = "rate_folder";
+const KEY_SIMILAR_CULL: &str = "similar_cull";
 const CULL_HELP_KEY: &str = "browse_cull_help_visible";
 
 // ---- Edit persistence (SQLite, one JSON row per image path) ----
@@ -369,6 +372,13 @@ struct App {
     rate_rx: std::sync::mpsc::Receiver<(PathBuf, Option<u8>)>,
     // (done, total) while a folder rating batch is running
     rate_progress: Option<(usize, usize)>,
+    face_detector: Option<Arc<face::Detector>>,
+    similar_tx: std::sync::mpsc::Sender<(PathBuf, Option<similar::Analysis>)>,
+    similar_rx: std::sync::mpsc::Receiver<(PathBuf, Option<similar::Analysis>)>,
+    // (done, total) while semantic burst analysis is running
+    similar_progress: Option<(usize, usize)>,
+    similar_candidates: HashMap<PathBuf, similar::Analysis>,
+    similar_summary: Option<(usize, usize)>,
 }
 
 impl App {
@@ -390,6 +400,7 @@ impl App {
         let tags = db.as_ref().map(tags::load_all_tags).unwrap_or_default();
         let (classify_tx, classify_rx) = std::sync::mpsc::channel();
         let (rate_tx, rate_rx) = std::sync::mpsc::channel();
+        let (similar_tx, similar_rx) = std::sync::mpsc::channel();
         Self {
             window: None,
             gpu: None,
@@ -442,6 +453,12 @@ impl App {
             rate_tx,
             rate_rx,
             rate_progress: None,
+            face_detector: face::Detector::load().map(Arc::new),
+            similar_tx,
+            similar_rx,
+            similar_progress: None,
+            similar_candidates: HashMap::new(),
+            similar_summary: None,
         }
     }
 }
@@ -543,6 +560,10 @@ impl App {
     // List the folder's images and decode thumbnails on a background thread;
     // results stream in through thumb_rx and are uploaded as egui textures.
     fn scan_folder(&mut self, dir: &std::path::Path) {
+        self.similar_candidates.clear();
+        self.similar_progress = None;
+        self.similar_summary = None;
+        while self.similar_rx.try_recv().is_ok() {}
         let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
             .map(|rd| {
                 rd.filter_map(|e| e.ok().map(|e| e.path()))
@@ -623,6 +644,54 @@ impl App {
         if let Some(db) = &self.db {
             cull::save_meta(db, path, meta);
         }
+    }
+
+    fn finish_similar_cull(&mut self) {
+        let candidates: Vec<similar::Candidate> = self
+            .similar_candidates
+            .drain()
+            .map(|(path, analysis)| similar::Candidate { path, analysis })
+            .collect();
+        let groups = similar::groups(&candidates);
+        let mut rejected = 0;
+        for group in &groups {
+            let manual_pick = group
+                .iter()
+                .filter(|&&i| self.meta.get(&candidates[i].path).is_some_and(|m| m.flag == cull::Flag::Pick))
+                .copied()
+                .collect::<Vec<_>>();
+            let keep = manual_pick.first().copied().unwrap_or_else(|| {
+                group
+                    .iter()
+                    .copied()
+                    .max_by(|&a, &b| {
+                        let aa = &candidates[a].analysis;
+                        let bb = &candidates[b].analysis;
+                        aa.rating
+                            .cmp(&bb.rating)
+                            .then_with(|| (aa.face_count > 0).cmp(&(bb.face_count > 0)))
+                            .then_with(|| aa.largest_face.total_cmp(&bb.largest_face))
+                            .then_with(|| candidates[b].path.cmp(&candidates[a].path))
+                    })
+                    .unwrap()
+            });
+            for &i in group {
+                if i == keep || self.meta.get(&candidates[i].path).is_some_and(|m| m.flag == cull::Flag::Pick) {
+                    continue;
+                }
+                let path = &candidates[i].path;
+                let mut meta = self.meta.get(path).copied().unwrap_or_default();
+                if meta.flag != cull::Flag::Reject {
+                    meta.flag = cull::Flag::Reject;
+                    self.meta.insert(path.clone(), meta);
+                    if let Some(db) = &self.db {
+                        cull::save_meta(db, path, meta);
+                    }
+                    rejected += 1;
+                }
+            }
+        }
+        self.similar_summary = Some((groups.len(), rejected));
     }
 
     fn flag_count(&self, flag: cull::Flag) -> usize {
@@ -775,6 +844,22 @@ impl App {
                 }
             }
         }
+        let mut similar_finished = false;
+        while let Ok((path, result)) = self.similar_rx.try_recv() {
+            if let Some(analysis) = result {
+                self.similar_candidates.insert(path, analysis);
+            }
+            if let Some((done, total)) = &mut self.similar_progress {
+                *done += 1;
+                if *done >= *total {
+                    similar_finished = true;
+                }
+            }
+        }
+        if similar_finished {
+            self.similar_progress = None;
+            self.finish_similar_cull();
+        }
         if let Some((path, started)) = self.wants_full.clone() {
             if self.current_path.as_deref() != Some(path.as_path()) {
                 self.wants_full = None;
@@ -876,6 +961,7 @@ impl App {
             copy_picks_dir,
             classify_folder_req,
             rate_folder_req,
+            similar_cull_req,
             mut needs_process,
         ) = {
             let window = self.window.as_ref().unwrap();
@@ -911,6 +997,11 @@ impl App {
             let classify_progress = self.classify_progress;
             let rater_available = self.rater.is_some();
             let rate_progress = self.rate_progress;
+            let similar_available = self.classifier.is_some()
+                && self.rater.is_some()
+                && self.face_detector.is_some();
+            let similar_progress = self.similar_progress;
+            let similar_summary = self.similar_summary;
             let tags_map = &mut self.tags;
             let tag_edit = &mut self.tag_edit;
             let raw_input = egui_state.take_egui_input(window);
@@ -932,7 +1023,7 @@ impl App {
                         .show(ctx, |ui| {
                             ui.label(format!("Move {n_rejects} rejected photo(s) to the system trash?"));
                             ui.add_space(8.0);
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 if ui.button("Trash").clicked() {
                                     ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_TRASH_REJECTS), true));
                                     *confirm_trash = false;
@@ -1149,7 +1240,7 @@ impl App {
                             ui.add_space(6.0);
                             ui.separator();
 
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.add_space(6.0);
                                 for (f, lbl) in [
                                     (BrowseFilter::All, "All"),
@@ -1210,38 +1301,73 @@ impl App {
                                     }
                                 }
                                 ui.separator();
+                                ui.menu_button("🤖 AI Actions", |ui| {
+                                    ui.set_min_width(190.0);
+                                    if let Some((done, total)) = classify_progress {
+                                        ui.label(format!("Tagging {done}/{total}…"));
+                                    } else if ui
+                                        .add_enabled(
+                                            classifier_available && !thumbs.is_empty(),
+                                            egui::Button::new("🏷 Tag Folder"),
+                                        )
+                                        .on_hover_text("Classify every photo in this folder and add tags")
+                                        .clicked()
+                                    {
+                                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_CLASSIFY_FOLDER), true));
+                                        ui.close_menu();
+                                    }
+                                    if let Some((done, total)) = rate_progress {
+                                        ui.label(format!("Rating {done}/{total}…"));
+                                    } else if ui
+                                        .add_enabled(
+                                            rater_available && !thumbs.is_empty(),
+                                            egui::Button::new("⭐ Rate Folder"),
+                                        )
+                                        .on_hover_text("Auto-rate every photo in this folder by quality (1-5 stars)")
+                                        .clicked()
+                                    {
+                                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_RATE_FOLDER), true));
+                                        ui.close_menu();
+                                    }
+                                    if let Some((done, total)) = similar_progress {
+                                        ui.label(format!("Grouping {done}/{total}…"));
+                                    } else if ui
+                                        .add_enabled(
+                                            similar_available && !thumbs.is_empty(),
+                                            egui::Button::new("✨ Cull Similar"),
+                                        )
+                                        .on_hover_text("Group near-duplicate photos, then keep the best-rated frame; face size breaks ties")
+                                        .clicked()
+                                    {
+                                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_SIMILAR_CULL), true));
+                                        ui.close_menu();
+                                    }
+                                });
                                 if let Some((done, total)) = classify_progress {
                                     ui.label(
                                         egui::RichText::new(format!("Tagging {done}/{total}…"))
                                             .small()
                                             .color(egui::Color32::from_gray(160)),
                                     );
-                                } else if ui
-                                    .add_enabled(
-                                        classifier_available && !thumbs.is_empty(),
-                                        egui::Button::new("🏷 Tag Folder"),
-                                    )
-                                    .on_hover_text("Classify every photo in this folder and add tags")
-                                    .clicked()
-                                {
-                                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_CLASSIFY_FOLDER), true));
-                                }
-                                ui.separator();
-                                if let Some((done, total)) = rate_progress {
+                                } else if let Some((done, total)) = rate_progress {
                                     ui.label(
                                         egui::RichText::new(format!("Rating {done}/{total}…"))
                                             .small()
                                             .color(egui::Color32::from_gray(160)),
                                     );
-                                } else if ui
-                                    .add_enabled(
-                                        rater_available && !thumbs.is_empty(),
-                                        egui::Button::new("⭐ Rate Folder"),
-                                    )
-                                    .on_hover_text("Auto-rate every photo in this folder by quality (1-5 stars)")
-                                    .clicked()
-                                {
-                                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_RATE_FOLDER), true));
+                                } else if let Some((done, total)) = similar_progress {
+                                    ui.label(
+                                        egui::RichText::new(format!("Grouping {done}/{total}…"))
+                                            .small()
+                                            .color(egui::Color32::from_gray(160)),
+                                    );
+                                }
+                                if let Some((groups, rejected)) = similar_summary {
+                                    ui.label(
+                                        egui::RichText::new(format!("{groups} groups · {rejected} rejected"))
+                                            .small()
+                                            .color(egui::Color32::from_gray(140)),
+                                    );
                                 }
                             });
                             ui.separator();
@@ -2174,6 +2300,9 @@ impl App {
             let rate_folder_req: Option<bool> = self
                 .egui_ctx
                 .data_mut(|d| d.remove_temp(egui::Id::new(KEY_RATE_FOLDER)));
+            let similar_cull_req: Option<bool> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_SIMILAR_CULL)));
             (
                 full_output.shapes,
                 full_output.textures_delta,
@@ -2187,6 +2316,7 @@ impl App {
                 copy_picks_dir,
                 classify_folder_req.is_some(),
                 rate_folder_req.is_some(),
+                similar_cull_req.is_some(),
                 needs_process,
             )
         }; // all field borrows dropped here
@@ -2272,6 +2402,39 @@ impl App {
                     imgload::load_edit_rgba(path).and_then(|(img, _)| rater.rate(&img))
                 };
                 spawn_folder_workers(paths, work, self.rate_tx.clone());
+            }
+        }
+        if similar_cull_req {
+            let paths: Vec<PathBuf> = self.thumbs.iter().map(|t| t.path.clone()).collect();
+            if let (Some(classifier), Some(rater), Some(detector), false) = (
+                &self.classifier,
+                &self.rater,
+                &self.face_detector,
+                paths.is_empty(),
+            ) {
+                self.similar_candidates.clear();
+                self.similar_summary = None;
+                self.similar_progress = Some((0, paths.len()));
+                let classifier = Arc::clone(classifier);
+                let rater = Arc::clone(rater);
+                let detector = Arc::clone(detector);
+                let existing_meta = self.meta.clone();
+                let work = move |path: &Path| {
+                    let img = imgload::load_rgba(path, 512)?;
+                    let embedding = classifier.embedding(&img)?;
+                    let model_rating = rater.rate(&img)?;
+                    let rating = existing_meta
+                        .get(path)
+                        .map_or(model_rating, |meta| meta.rating.max(model_rating));
+                    let faces = detector.detect(&img);
+                    Some(similar::Analysis {
+                        embedding,
+                        rating,
+                        face_count: faces.count,
+                        largest_face: faces.largest_area,
+                    })
+                };
+                spawn_folder_workers(paths, work, self.similar_tx.clone());
             }
         }
 

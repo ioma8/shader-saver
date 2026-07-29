@@ -41,6 +41,13 @@ impl Classifier {
 
     // At most two controlled tags, most confident first.
     pub fn classify(&self, img: &image::RgbaImage) -> Vec<String> {
+        self.embedding(img)
+            .map_or_else(Vec::new, |embedding| top_tags(&embedding, &self.tag_embeddings))
+    }
+
+    // Normalized MobileCLIP image embedding, reused for semantic burst
+    // grouping so the model only runs once per image in a culling pass.
+    pub fn embedding(&self, img: &image::RgbaImage) -> Option<Vec<f32>> {
         let scale = INPUT_SIZE as f32 / img.width().min(img.height()) as f32;
         let resized = image::imageops::resize(
             img,
@@ -64,17 +71,11 @@ impl Classifier {
         }
 
         let shape = [1, 3, INPUT_SIZE as usize, INPUT_SIZE as usize];
-        let Some(input) = tract::Tensor::from_slice(&shape, &chw).ok() else {
-            return Vec::new();
-        };
-        let Some(outputs) = self.runnable.run([input]).ok() else {
-            return Vec::new();
-        };
-        let Some(embedding) = outputs[0].as_slice::<f32>().ok() else {
-            return Vec::new();
-        };
-
-        top_tags(embedding, &self.tag_embeddings)
+        let input = tract::Tensor::from_slice(&shape, &chw).ok()?;
+        let outputs = self.runnable.run([input]).ok()?;
+        let embedding = outputs[0].as_slice::<f32>().ok()?;
+        let norm = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+        (norm > 0.0).then(|| embedding.iter().map(|v| v / norm).collect())
     }
 }
 
