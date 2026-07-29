@@ -3,7 +3,7 @@
 
 struct Params { v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32, v6: f32, v7: f32 }
 @group(0) @binding(2) var<uniform> params: Params;
-@group(0) @binding(3) var<storage, read> curve_lut: array<f32, 256>;
+@group(0) @binding(3) var<storage, read> curve_lut: array<f32>;
 
 // Tone curve lookup with linear interpolation between LUT entries
 fn curve_apply(v: f32) -> f32 {
@@ -11,6 +11,23 @@ fn curve_apply(v: f32) -> f32 {
     let i = u32(floor(x));
     let j = min(i + 1u, 255u);
     return mix(curve_lut[i], curve_lut[j], x - f32(i));
+}
+
+fn photo_lut_sample(r: u32, g: u32, b: u32) -> vec3<f32> {
+    let i = 256u + (r + g * 33u + b * 1089u) * 3u;
+    return vec3<f32>(curve_lut[i], curve_lut[i + 1u], curve_lut[i + 2u]);
+}
+
+fn photo_lut_apply(rgb: vec3<f32>) -> vec3<f32> {
+    let p = clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * 32.0;
+    let lo = vec3<u32>(floor(p));
+    let hi = min(lo + vec3<u32>(1u), vec3<u32>(32u));
+    let d = fract(p);
+    let c00 = mix(photo_lut_sample(lo.r, lo.g, lo.b), photo_lut_sample(hi.r, lo.g, lo.b), d.r);
+    let c10 = mix(photo_lut_sample(lo.r, hi.g, lo.b), photo_lut_sample(hi.r, hi.g, lo.b), d.r);
+    let c01 = mix(photo_lut_sample(lo.r, lo.g, hi.b), photo_lut_sample(hi.r, lo.g, hi.b), d.r);
+    let c11 = mix(photo_lut_sample(lo.r, hi.g, hi.b), photo_lut_sample(hi.r, hi.g, hi.b), d.r);
+    return mix(mix(c00, c10, d.g), mix(c01, c11, d.g), d.b);
 }
 
 // Shared helper — clamp-to-edge load used by all passes
@@ -35,7 +52,11 @@ fn contrast_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Exposure: 2^ev gain in linear light. Values here are gamma-encoded, and
     // with a power-law gamma that is exactly a 2^(ev/2.2) scale on them.
-    var rgb = c.rgb * exp2(params.v4 * 0.4545);
+    var rgb = c.rgb;
+    if params.v7 > 0.5 {
+        rgb = photo_lut_apply(rgb);
+    }
+    rgb = rgb * exp2(params.v4 * 0.4545);
 
     // White balance: temperature (blue↔yellow) and tint (green↔magenta).
     // Linear-light channel gains, normalized to unit luminance so overall

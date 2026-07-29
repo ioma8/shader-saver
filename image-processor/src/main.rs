@@ -1,5 +1,6 @@
 mod classify;
 mod cull;
+mod enhance;
 mod face;
 mod imgload;
 mod presets;
@@ -30,6 +31,7 @@ const KEY_MOVE_REJECTS: &str = "move_rejects";
 const KEY_COPY_PICKS: &str = "copy_picks";
 const KEY_CLASSIFY_FOLDER: &str = "classify_folder";
 const KEY_RATE_FOLDER: &str = "rate_folder";
+const KEY_ADJUST_FOLDER: &str = "adjust_folder";
 const KEY_SIMILAR_CULL: &str = "similar_cull";
 const CULL_HELP_KEY: &str = "browse_cull_help_visible";
 
@@ -361,6 +363,7 @@ struct App {
     presets: Vec<String>,
     preset_name: String,
     classifier: Option<Arc<classify::Classifier>>,
+    enhancer: Option<Arc<enhance::Enhancer>>,
     tags: HashMap<PathBuf, Vec<String>>,
     tag_edit: String,
     classify_tx: std::sync::mpsc::Sender<(PathBuf, Option<Vec<String>>)>,
@@ -372,6 +375,9 @@ struct App {
     rate_rx: std::sync::mpsc::Receiver<(PathBuf, Option<u8>)>,
     // (done, total) while a folder rating batch is running
     rate_progress: Option<(usize, usize)>,
+    adjust_tx: std::sync::mpsc::Sender<(PathBuf, Option<EditState>)>,
+    adjust_rx: std::sync::mpsc::Receiver<(PathBuf, Option<EditState>)>,
+    adjust_progress: Option<(usize, usize)>,
     face_detector: Option<Arc<face::Detector>>,
     similar_tx: std::sync::mpsc::Sender<(PathBuf, Option<similar::Analysis>)>,
     similar_rx: std::sync::mpsc::Receiver<(PathBuf, Option<similar::Analysis>)>,
@@ -400,6 +406,7 @@ impl App {
         let tags = db.as_ref().map(tags::load_all_tags).unwrap_or_default();
         let (classify_tx, classify_rx) = std::sync::mpsc::channel();
         let (rate_tx, rate_rx) = std::sync::mpsc::channel();
+        let (adjust_tx, adjust_rx) = std::sync::mpsc::channel();
         let (similar_tx, similar_rx) = std::sync::mpsc::channel();
         Self {
             window: None,
@@ -444,6 +451,7 @@ impl App {
             presets,
             preset_name: String::new(),
             classifier: classify::Classifier::load().map(Arc::new),
+            enhancer: enhance::Enhancer::load().map(Arc::new),
             tags,
             tag_edit: String::new(),
             classify_tx,
@@ -453,6 +461,9 @@ impl App {
             rate_tx,
             rate_rx,
             rate_progress: None,
+            adjust_tx,
+            adjust_rx,
+            adjust_progress: None,
             face_detector: face::Detector::load().map(Arc::new),
             similar_tx,
             similar_rx,
@@ -844,6 +855,26 @@ impl App {
                 }
             }
         }
+        while let Ok((path, result)) = self.adjust_rx.try_recv() {
+            if let Some(state) = result {
+                if let Some(db) = &self.db {
+                    save_edits(db, &path, &state);
+                }
+                if self.current_path.as_deref() == Some(path.as_path()) {
+                    if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
+                        proc.apply_edit_state(&state);
+                        proc.process(&gpu.device, &gpu.queue);
+                        self.flags.output_dirty = true;
+                    }
+                }
+            }
+            if let Some((done, total)) = &mut self.adjust_progress {
+                *done += 1;
+                if *done >= *total {
+                    self.adjust_progress = None;
+                }
+            }
+        }
         let mut similar_finished = false;
         while let Ok((path, result)) = self.similar_rx.try_recv() {
             if let Some(analysis) = result {
@@ -961,6 +992,7 @@ impl App {
             copy_picks_dir,
             classify_folder_req,
             rate_folder_req,
+            adjust_folder_req,
             similar_cull_req,
             mut needs_process,
         ) = {
@@ -997,6 +1029,8 @@ impl App {
             let classify_progress = self.classify_progress;
             let rater_available = self.rater.is_some();
             let rate_progress = self.rate_progress;
+            let enhancer_available = self.enhancer.is_some();
+            let adjust_progress = self.adjust_progress;
             let similar_available = self.classifier.is_some()
                 && self.rater.is_some()
                 && self.face_detector.is_some();
@@ -1329,6 +1363,19 @@ impl App {
                                         ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_RATE_FOLDER), true));
                                         ui.close_menu();
                                     }
+                                    if let Some((done, total)) = adjust_progress {
+                                        ui.label(format!("Adjusting {done}/{total}…"));
+                                    } else if ui
+                                        .add_enabled(
+                                            enhancer_available && !thumbs.is_empty(),
+                                            egui::Button::new("✨ Auto Adjust Folder"),
+                                        )
+                                        .on_hover_text("Apply AI color and tone adjustment to every photo")
+                                        .clicked()
+                                    {
+                                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_ADJUST_FOLDER), true));
+                                        ui.close_menu();
+                                    }
                                     if let Some((done, total)) = similar_progress {
                                         ui.label(format!("Grouping {done}/{total}…"));
                                     } else if ui
@@ -1352,6 +1399,12 @@ impl App {
                                 } else if let Some((done, total)) = rate_progress {
                                     ui.label(
                                         egui::RichText::new(format!("Rating {done}/{total}…"))
+                                            .small()
+                                            .color(egui::Color32::from_gray(160)),
+                                    );
+                                } else if let Some((done, total)) = adjust_progress {
+                                    ui.label(
+                                        egui::RichText::new(format!("Adjusting {done}/{total}…"))
                                             .small()
                                             .color(egui::Color32::from_gray(160)),
                                     );
@@ -2300,6 +2353,9 @@ impl App {
             let rate_folder_req: Option<bool> = self
                 .egui_ctx
                 .data_mut(|d| d.remove_temp(egui::Id::new(KEY_RATE_FOLDER)));
+            let adjust_folder_req: Option<bool> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_ADJUST_FOLDER)));
             let similar_cull_req: Option<bool> = self
                 .egui_ctx
                 .data_mut(|d| d.remove_temp(egui::Id::new(KEY_SIMILAR_CULL)));
@@ -2316,6 +2372,7 @@ impl App {
                 copy_picks_dir,
                 classify_folder_req.is_some(),
                 rate_folder_req.is_some(),
+                adjust_folder_req.is_some(),
                 similar_cull_req.is_some(),
                 needs_process,
             )
@@ -2404,6 +2461,17 @@ impl App {
                 spawn_folder_workers(paths, work, self.rate_tx.clone());
             }
         }
+        if adjust_folder_req {
+            let paths: Vec<PathBuf> = self.thumbs.iter().map(|t| t.path.clone()).collect();
+            if let (Some(enhancer), false) = (&self.enhancer, paths.is_empty()) {
+                self.adjust_progress = Some((0, paths.len()));
+                let enhancer = Arc::clone(enhancer);
+                let work = move |path: &Path| {
+                    imgload::load_rgba(path, 512).and_then(|img| enhancer.suggest_edits(&img))
+                };
+                spawn_folder_workers(paths, work, self.adjust_tx.clone());
+            }
+        }
         if similar_cull_req {
             let paths: Vec<PathBuf> = self.thumbs.iter().map(|t| t.path.clone()).collect();
             if let (Some(classifier), Some(rater), Some(detector), false) = (
@@ -2439,14 +2507,23 @@ impl App {
         }
 
         // Auto adjust: reset to neutral, refresh the histogram from the
-        // original image, derive the auto values, then let the normal
-        // needs_process path re-process and persist them.
+        // original image, derive AI or histogram-based values, then let the
+        // normal needs_process path re-process and persist them.
         if auto_req {
+            let ai_state = self
+                .current_path
+                .as_deref()
+                .and_then(|path| imgload::load_rgba(path, 512))
+                .and_then(|img| self.enhancer.as_ref()?.suggest_edits(&img));
             if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
                 if proc.has_image() {
                     proc.apply_edit_state(&EditState::default());
-                    proc.process(&gpu.device, &gpu.queue);
-                    proc.auto_adjust();
+                    if let Some(state) = ai_state {
+                        proc.apply_edit_state(&state);
+                    } else {
+                        proc.process(&gpu.device, &gpu.queue);
+                        proc.auto_adjust();
+                    }
                     needs_process = true;
                 }
             }

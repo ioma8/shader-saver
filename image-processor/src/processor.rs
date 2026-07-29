@@ -1,5 +1,58 @@
 use std::path::Path;
 
+#[repr(align(4))]
+struct AlignedPhotoLuts([u8; 1_293_732]);
+
+static PHOTO_LUTS: AlignedPhotoLuts =
+    AlignedPhotoLuts(*include_bytes!("../models/photo_luts.f32"));
+
+fn photo_luts() -> &'static [f32] {
+    bytemuck::cast_slice(&PHOTO_LUTS.0)
+}
+
+fn combined_photo_lut(weights: [f32; 3]) -> Vec<f32> {
+    const GRID: usize = 33 * 33 * 33;
+    const BASIS: usize = 3 * GRID;
+    const TONE_STRENGTH: f32 = 0.82;
+    const COLOR_STRENGTH: f32 = 0.78;
+    const LUM: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+    let bases = photo_luts();
+    let sample = |i: usize, channel: usize| {
+        let offset = channel * GRID + i;
+        weights[0] * bases[offset]
+            + weights[1] * bases[BASIS + offset]
+            + weights[2] * bases[2 * BASIS + offset]
+    };
+    let mid = 16 + 16 * 33 + 16 * 33 * 33;
+    let mid_lum = (0..3).map(|c| sample(mid, c) * LUM[c]).sum::<f32>();
+    let exposure_gain = (mid_lum / 0.5).clamp(0.5, 2.0);
+
+    let mut result = Vec::with_capacity(3 * GRID);
+    for i in 0..GRID {
+        let input = [
+            (i % 33) as f32 / 32.0,
+            ((i / 33) % 33) as f32 / 32.0,
+            (i / (33 * 33)) as f32 / 32.0,
+        ];
+        let output = [sample(i, 0), sample(i, 1), sample(i, 2)];
+        let input_lum = input.iter().zip(LUM).map(|(v, w)| v * w).sum::<f32>();
+        let output_lum = output.iter().zip(LUM).map(|(v, w)| v * w).sum::<f32>();
+        let target_lum = input_lum * exposure_gain;
+        let softened_lum = target_lum + (output_lum - target_lum) * TONE_STRENGTH;
+        for channel in 0..3 {
+            let source_chroma = input[channel] - input_lum;
+            let model_chroma = output[channel] - output_lum;
+            result.push(
+                softened_lum
+                    + source_chroma
+                    + (model_chroma - source_chroma) * COLOR_STRENGTH,
+            );
+        }
+    }
+    result
+}
+
 // Everything that defines an image's edit, serialized to SQLite as JSON.
 // serde(default) keeps old DB rows loadable when new fields are added.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -23,6 +76,8 @@ pub struct EditState {
     pub vignette: f32,
     pub vignette_mid: f32,
     pub curve_points: Vec<[f32; 2]>,
+    pub ai_lut_enabled: bool,
+    pub ai_lut_weights: [f32; 3],
 }
 
 impl Default for EditState {
@@ -46,6 +101,8 @@ impl Default for EditState {
             vignette: 0.0,
             vignette_mid: 50.0,
             curve_points: vec![[0.0, 0.0], [1.0, 1.0]],
+            ai_lut_enabled: false,
+            ai_lut_weights: [0.0; 3],
         }
     }
 }
@@ -98,6 +155,8 @@ pub struct Processor {
     // Tone curve control points, normalized [0,1]², sorted by x.
     // Always at least the two endpoints; identity = [[0,0],[1,1]].
     pub curve_points: Vec<[f32; 2]>,
+    pub ai_lut_enabled: bool,
+    pub ai_lut_weights: [f32; 3],
 }
 
 fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -277,7 +336,7 @@ impl Processor {
             sharpen_buf: make_buf(32),
             curve_buf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
-                size: 1024, // 256 LUT entries × 4 bytes
+                size: ((256 + 33 * 33 * 33 * 3) * 4) as u64,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
@@ -305,6 +364,8 @@ impl Processor {
             vignette: 0.0,
             vignette_mid: 50.0,
             curve_points: vec![[0.0, 0.0], [1.0, 1.0]],
+            ai_lut_enabled: false,
+            ai_lut_weights: [0.0; 3],
         }
     }
 
@@ -390,6 +451,8 @@ impl Processor {
             vignette: self.vignette,
             vignette_mid: self.vignette_mid,
             curve_points: self.curve_points.clone(),
+            ai_lut_enabled: self.ai_lut_enabled,
+            ai_lut_weights: self.ai_lut_weights,
         }
     }
 
@@ -416,6 +479,8 @@ impl Processor {
         } else {
             vec![[0.0, 0.0], [1.0, 1.0]]
         };
+        self.ai_lut_enabled = s.ai_lut_enabled;
+        self.ai_lut_weights = s.ai_lut_weights;
     }
 
     // Derive auto adjustments from the luminance histogram. Call with the
@@ -565,7 +630,8 @@ impl Processor {
             0,
             bytemuck::cast_slice(&[
                 self.contrast, self.levels_black, self.levels_white, self.levels_gamma,
-                self.exposure, self.wb_temp, self.wb_tint, 0f32,
+                self.exposure, self.wb_temp, self.wb_tint,
+                if self.ai_lut_enabled { 1.0 } else { 0.0 },
             ]),
         );
         queue.write_buffer(
@@ -589,8 +655,10 @@ impl Processor {
                 0f32, 0f32, 0f32, 0f32, 0f32, 0f32,
             ]),
         );
-        let lut = self.curve_lut();
-        queue.write_buffer(&self.curve_buf, 0, bytemuck::cast_slice(&lut[..]));
+        let mut data = Vec::with_capacity(256 + 33 * 33 * 33 * 3);
+        data.extend(self.curve_lut());
+        data.extend(combined_photo_lut(self.ai_lut_weights));
+        queue.write_buffer(&self.curve_buf, 0, bytemuck::cast_slice(&data));
     }
 
     fn read_histogram(
@@ -766,7 +834,19 @@ impl Processor {
 
 #[cfg(test)]
 mod tests {
-    use super::percentile;
+    use super::{combined_photo_lut, percentile, photo_luts};
+
+    #[test]
+    fn embedded_photo_luts_are_readable() {
+        assert_eq!(photo_luts().len(), 3 * 3 * 33 * 33 * 33);
+    }
+
+    #[test]
+    fn softened_photo_lut_is_complete_and_finite() {
+        let lut = combined_photo_lut([1.0, 0.0, 0.0]);
+        assert_eq!(lut.len(), 3 * 33 * 33 * 33);
+        assert!(lut.iter().all(|v| v.is_finite()));
+    }
 
     // Regression test: a histogram with mass concentrated in the top bucket
     // (e.g. a photo with blown highlights) used to panic with "attempt to add
