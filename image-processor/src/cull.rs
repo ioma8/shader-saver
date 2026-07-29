@@ -1,22 +1,24 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+#[repr(i64)]
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum Flag {
     #[default]
-    None,
-    Pick,
-    Reject,
+    None = 0,
+    Pick = 1,
+    Reject = 2,
 }
 
+#[repr(i64)]
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum Label {
     #[default]
-    None,
-    Red,
-    Yellow,
-    Green,
-    Blue,
+    None = 0,
+    Red = 1,
+    Yellow = 2,
+    Green = 3,
+    Blue = 4,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -69,29 +71,11 @@ pub fn apply_action(meta: &mut CullMeta, action: CullAction) {
     }
 }
 
-fn flag_to_i(flag: Flag) -> i64 {
-    match flag {
-        Flag::None => 0,
-        Flag::Pick => 1,
-        Flag::Reject => 2,
-    }
-}
-
 fn flag_from_i(v: i64) -> Flag {
     match v {
         1 => Flag::Pick,
         2 => Flag::Reject,
         _ => Flag::None,
-    }
-}
-
-fn label_to_i(label: Label) -> i64 {
-    match label {
-        Label::None => 0,
-        Label::Red => 1,
-        Label::Yellow => 2,
-        Label::Green => 3,
-        Label::Blue => 4,
     }
 }
 
@@ -135,8 +119,8 @@ pub fn save_meta(conn: &rusqlite::Connection, path: &Path, meta: CullMeta) {
         rusqlite::params![
             path,
             meta.rating as i64,
-            flag_to_i(meta.flag),
-            label_to_i(meta.label),
+            meta.flag as i64,
+            meta.label as i64,
             updated
         ],
     );
