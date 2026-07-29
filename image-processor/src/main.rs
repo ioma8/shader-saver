@@ -114,7 +114,7 @@ fn paint_badges(p: &egui::Painter, rect: egui::Rect, meta: cull::CullMeta) {
             egui::Color32::from_rgb(170, 60, 60),
         );
         let c = rect.min + egui::vec2(11.0, 11.0);
-        let s = egui::Stroke::new(1.5, egui::Color32::WHITE);
+        let s = egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
         p.line_segment([c + egui::vec2(-3.5, -3.5), c + egui::vec2(3.5, 3.5)], s);
         p.line_segment([c + egui::vec2(3.5, -3.5), c + egui::vec2(-3.5, 3.5)], s);
     } else if meta.flag == cull::Flag::Pick {
@@ -124,7 +124,7 @@ fn paint_badges(p: &egui::Painter, rect: egui::Rect, meta: cull::CullMeta) {
             egui::Color32::from_rgb(66, 128, 235),
         );
         let c = rect.min + egui::vec2(11.0, 11.0);
-        let s = egui::Stroke::new(1.5, egui::Color32::WHITE);
+        let s = egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
         p.line_segment([c + egui::vec2(-3.5, 0.5), c + egui::vec2(-1.0, 3.5)], s);
         p.line_segment([c + egui::vec2(-1.0, 3.5), c + egui::vec2(4.0, -3.5)], s);
     }
@@ -1236,13 +1236,13 @@ impl App {
                                             p.rect_stroke(
                                                 rect.shrink(2.0),
                                                 4.0,
-                                                egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 140, 255)),
+                                                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(90, 140, 255)),
                                             );
                                         } else if resp.hovered() {
                                             p.rect_stroke(
                                                 rect.shrink(2.0),
                                                 4.0,
-                                                egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+                                                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110)),
                                             );
                                         }
 
@@ -1413,7 +1413,7 @@ impl App {
                         }
 
                         // Quarter grid lines
-                        let grid = egui::Stroke::new(1.0, egui::Color32::from_gray(34));
+                        let grid = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(34));
                         for f in [0.25f32, 0.5, 0.75] {
                             let x = hist_rect.left() + f * hist_rect.width();
                             let y = hist_rect.top() + f * hist_rect.height();
@@ -1431,7 +1431,7 @@ impl App {
                             .collect();
                         painter.add(egui::Shape::line(
                             curve_pts,
-                            egui::Stroke::new(1.5, egui::Color32::from_gray(230)),
+                            egui::Stroke::new(1.5_f32, egui::Color32::from_gray(230)),
                         ));
 
                         // Control points
@@ -1445,7 +1445,7 @@ impl App {
                             } else {
                                 (3.5, egui::Color32::from_gray(200))
                             };
-                            painter.circle(to_screen(p), r, fill, egui::Stroke::new(1.0, egui::Color32::from_gray(60)));
+                            painter.circle(to_screen(p), r, fill, egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)));
                         }
                         if hover_idx.is_some() || curve_drag.is_some() {
                             ctx.set_cursor_icon(egui::CursorIcon::Grab);
@@ -1540,9 +1540,9 @@ impl App {
                         let mk = |cx: f32, fill: egui::Color32, hot: bool| {
                             let cx = cx.clamp(strip_area.left() + 6.0, strip_area.right() - 6.0);
                             let stroke = if hot {
-                                egui::Stroke::new(1.5, egui::Color32::from_gray(220))
+                                egui::Stroke::new(1.5_f32, egui::Color32::from_gray(220))
                             } else {
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(110))
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110))
                             };
                             egui::Shape::convex_polygon(
                                 vec![egui::pos2(cx, ty), egui::pos2(cx - 6.0, by), egui::pos2(cx + 6.0, by)],
@@ -1792,13 +1792,13 @@ impl App {
                                             p.rect_stroke(
                                                 rect.shrink(2.0),
                                                 3.0,
-                                                egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 140, 255)),
+                                                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(90, 140, 255)),
                                             );
                                         } else if resp.hovered() {
                                             p.rect_stroke(
                                                 rect.shrink(2.0),
                                                 3.0,
-                                                egui::Stroke::new(1.0, egui::Color32::from_gray(110)),
+                                                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110)),
                                             );
                                         }
                                         if resp.clicked() {
