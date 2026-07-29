@@ -176,6 +176,20 @@ fn create_histogram_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
+// Luminance value (0-255) below which fraction p of all pixels fall.
+// `total` is the histogram's sum, passed in since callers already have it.
+fn percentile(histogram: &[u32; 256], total: f64, p: f64) -> f32 {
+    let target = total * p;
+    let mut cum = 0.0f64;
+    for (bucket, &c) in (0u8..=255).zip(histogram.iter()) {
+        cum += f64::from(c);
+        if cum >= target {
+            return f32::from(bucket);
+        }
+    }
+    255.0
+}
+
 impl Processor {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -411,19 +425,7 @@ impl Processor {
         if total_f == 0.0 {
             return;
         }
-        // Luminance value (0-255) below which fraction p of all pixels fall.
-        // u32→f64 is lossless; no integer casts needed.
-        let pct = |p: f64| -> f32 {
-            let target = total_f * p;
-            let mut cum = 0.0f64;
-            for (bucket, &c) in (0u8..).zip(self.histogram.iter()) {
-                cum += f64::from(c);
-                if cum >= target {
-                    return f32::from(bucket);
-                }
-            }
-            255.0
-        };
+        let pct = |p: f64| percentile(&self.histogram, total_f, p);
 
         // Levels: trim the empty tails, clipping 0.1% of pixels per side
         let mut black = pct(0.001);
@@ -759,5 +761,35 @@ impl Processor {
                 img.save(path).ok();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percentile;
+
+    // Regression test: a histogram with mass concentrated in the top bucket
+    // (e.g. a photo with blown highlights) used to panic with "attempt to add
+    // with overflow" because the walk used `(0u8..)`, whose iterator advances
+    // past u8::MAX before yielding bucket 255.
+    #[test]
+    fn percentile_reaches_last_bucket_without_overflow() {
+        let mut histogram = [0u32; 256];
+        histogram[0] = 1;
+        histogram[255] = 999;
+        let total: f64 = histogram.iter().map(|&c| f64::from(c)).sum();
+
+        assert_eq!(percentile(&histogram, total, 0.001), 0.0);
+        assert_eq!(percentile(&histogram, total, 0.999), 255.0);
+    }
+
+    #[test]
+    fn percentile_finds_midpoint() {
+        let mut histogram = [0u32; 256];
+        histogram[10] = 50;
+        histogram[20] = 50;
+        let total: f64 = histogram.iter().map(|&c| f64::from(c)).sum();
+
+        assert_eq!(percentile(&histogram, total, 0.5), 10.0);
     }
 }
