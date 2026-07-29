@@ -1,5 +1,6 @@
 mod cull;
 mod imgload;
+mod presets;
 mod processor;
 
 use std::collections::HashMap;
@@ -26,9 +27,13 @@ const CULL_HELP_KEY: &str = "browse_cull_help_visible";
 
 // ---- Edit persistence (SQLite, one JSON row per image path) ----
 
-fn open_db() -> Option<rusqlite::Connection> {
+fn app_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    let dir = PathBuf::from(home).join(".image-processor");
+    Some(PathBuf::from(home).join(".image-processor"))
+}
+
+fn open_db() -> Option<rusqlite::Connection> {
+    let dir = app_dir()?;
     std::fs::create_dir_all(&dir).ok()?;
     let conn = rusqlite::Connection::open(dir.join("edits.db")).ok()?;
     conn.execute_batch(
@@ -343,6 +348,9 @@ struct App {
     full_pending: Option<PathBuf>,
     wants_full: Option<(PathBuf, std::time::Instant)>,
     db: Option<rusqlite::Connection>,
+    presets_dir: Option<PathBuf>,
+    presets: Vec<String>,
+    preset_name: String,
 }
 
 impl App {
@@ -359,6 +367,8 @@ impl App {
             tree_expanded.insert(p.clone());
         }
         let (full_tx, full_rx) = std::sync::mpsc::channel();
+        let presets_dir = app_dir().map(|d| d.join("presets"));
+        let presets = presets_dir.as_deref().map(presets::list).unwrap_or_default();
         Self {
             window: None,
             gpu: None,
@@ -398,6 +408,9 @@ impl App {
             full_pending: None,
             wants_full: None,
             db,
+            presets_dir,
+            presets,
+            preset_name: String::new(),
         }
     }
 }
@@ -819,6 +832,9 @@ impl App {
             let current_path = &self.current_path;
             let meta_map = &self.meta;
             let db = self.db.as_ref();
+            let presets_dir = self.presets_dir.as_deref();
+            let presets = &mut self.presets;
+            let preset_name = &mut self.preset_name;
             let raw_input = egui_state.take_egui_input(window);
             let mut needs_process = false;
 
@@ -1709,6 +1725,53 @@ impl App {
                         ui.separator();
                         slider_row!("VIGNETTE",   processor.vignette,     -100.0..=100.0, 0.0,  true);
                         slider_row!("VIG MID",    processor.vignette_mid, 0.0..=100.0,    50.0, true);
+                        ui.separator();
+
+                        ui.label(egui::RichText::new("PRESET").small().color(egui::Color32::from_gray(140)));
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt("preset_picker")
+                                .selected_text(if preset_name.is_empty() { "Choose…" } else { preset_name.as_str() })
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for name in presets.iter() {
+                                        if ui.selectable_label(preset_name == name, name).clicked() {
+                                            preset_name.clone_from(name);
+                                            if let Some(state) = presets_dir.and_then(|d| presets::load(d, name)) {
+                                                processor.apply_edit_state(&state);
+                                                needs_process = true;
+                                            }
+                                        }
+                                    }
+                                });
+                            let can_delete = presets.iter().any(|n| n == preset_name);
+                            if ui.add_enabled(can_delete, egui::Button::new("🗑")).clicked() {
+                                if let Some(dir) = presets_dir {
+                                    let _ = presets::delete(dir, preset_name);
+                                    *presets = presets::list(dir);
+                                    preset_name.clear();
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(preset_name)
+                                    .hint_text("name…")
+                                    .desired_width(150.0),
+                            );
+                            if ui
+                                .add_enabled(
+                                    processor.has_image() && !preset_name.trim().is_empty(),
+                                    egui::Button::new("Save"),
+                                )
+                                .clicked()
+                            {
+                                if let Some(dir) = presets_dir {
+                                    if presets::save(dir, preset_name.trim(), &processor.edit_state()).is_ok() {
+                                        *presets = presets::list(dir);
+                                    }
+                                }
+                            }
+                        });
 
                         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                             ui.add_space(8.0);
