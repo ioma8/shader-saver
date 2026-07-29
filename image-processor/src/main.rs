@@ -1,7 +1,10 @@
+mod classify;
 mod cull;
 mod imgload;
 mod presets;
 mod processor;
+mod rate;
+mod tags;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,6 +26,8 @@ const KEY_AUTO: &str = "auto_adjust";
 const KEY_TRASH_REJECTS: &str = "trash_rejects";
 const KEY_MOVE_REJECTS: &str = "move_rejects";
 const KEY_COPY_PICKS: &str = "copy_picks";
+const KEY_CLASSIFY_FOLDER: &str = "classify_folder";
+const KEY_RATE_FOLDER: &str = "rate_folder";
 const CULL_HELP_KEY: &str = "browse_cull_help_visible";
 
 // ---- Edit persistence (SQLite, one JSON row per image path) ----
@@ -49,6 +54,7 @@ fn open_db() -> Option<rusqlite::Connection> {
     )
     .ok()?;
     cull::init_meta_table(&conn);
+    tags::init_table(&conn);
     Some(conn)
 }
 
@@ -351,6 +357,18 @@ struct App {
     presets_dir: Option<PathBuf>,
     presets: Vec<String>,
     preset_name: String,
+    classifier: Option<Arc<classify::Classifier>>,
+    tags: HashMap<PathBuf, Vec<String>>,
+    tag_edit: String,
+    classify_tx: std::sync::mpsc::Sender<(PathBuf, Option<Vec<String>>)>,
+    classify_rx: std::sync::mpsc::Receiver<(PathBuf, Option<Vec<String>>)>,
+    // (done, total) while a folder tagging batch is running
+    classify_progress: Option<(usize, usize)>,
+    rater: Option<Arc<rate::Rater>>,
+    rate_tx: std::sync::mpsc::Sender<(PathBuf, Option<u8>)>,
+    rate_rx: std::sync::mpsc::Receiver<(PathBuf, Option<u8>)>,
+    // (done, total) while a folder rating batch is running
+    rate_progress: Option<(usize, usize)>,
 }
 
 impl App {
@@ -369,6 +387,9 @@ impl App {
         let (full_tx, full_rx) = std::sync::mpsc::channel();
         let presets_dir = app_dir().map(|d| d.join("presets"));
         let presets = presets_dir.as_deref().map(presets::list).unwrap_or_default();
+        let tags = db.as_ref().map(tags::load_all_tags).unwrap_or_default();
+        let (classify_tx, classify_rx) = std::sync::mpsc::channel();
+        let (rate_tx, rate_rx) = std::sync::mpsc::channel();
         Self {
             window: None,
             gpu: None,
@@ -411,6 +432,16 @@ impl App {
             presets_dir,
             presets,
             preset_name: String::new(),
+            classifier: classify::Classifier::load().map(Arc::new),
+            tags,
+            tag_edit: String::new(),
+            classify_tx,
+            classify_rx,
+            classify_progress: None,
+            rater: rate::Rater::load().map(Arc::new),
+            rate_tx,
+            rate_rx,
+            rate_progress: None,
         }
     }
 }
@@ -668,6 +699,8 @@ impl App {
             window.set_title(name);
         }
 
+        self.tag_edit = self.tags.get(path).map(|t| t.join(", ")).unwrap_or_default();
+
         self.flags.output_dirty = true;
         self.flags.zoom_fit = true;
         self.view = View::Edit;
@@ -702,6 +735,43 @@ impl App {
                         egui::TextureOptions::LINEAR,
                     ));
                     entry.exif = exif;
+                }
+            }
+        }
+        // Pick up finished classification results. `None` means that image
+        // failed to load — still counts toward progress, but nothing to save.
+        while let Ok((path, result)) = self.classify_rx.try_recv() {
+            if let Some(new_tags) = result {
+                if let Some(db) = &self.db {
+                    tags::save_tags(db, &path, &new_tags);
+                }
+                if self.current_path.as_deref() == Some(path.as_path()) {
+                    self.tag_edit = new_tags.join(", ");
+                }
+                self.tags.insert(path, new_tags);
+            }
+            if let Some((done, total)) = &mut self.classify_progress {
+                *done += 1;
+                if *done >= *total {
+                    self.classify_progress = None;
+                }
+            }
+        }
+
+        // Pick up finished rating results, same shape as classification above.
+        while let Ok((path, result)) = self.rate_rx.try_recv() {
+            if let Some(stars) = result {
+                let mut meta = self.meta.get(&path).copied().unwrap_or_default();
+                meta.rating = stars;
+                self.meta.insert(path.clone(), meta);
+                if let Some(db) = &self.db {
+                    cull::save_meta(db, &path, meta);
+                }
+            }
+            if let Some((done, total)) = &mut self.rate_progress {
+                *done += 1;
+                if *done >= *total {
+                    self.rate_progress = None;
                 }
             }
         }
@@ -804,6 +874,8 @@ impl App {
             trash_req,
             move_rejects_dir,
             copy_picks_dir,
+            classify_folder_req,
+            rate_folder_req,
             mut needs_process,
         ) = {
             let window = self.window.as_ref().unwrap();
@@ -835,6 +907,12 @@ impl App {
             let presets_dir = self.presets_dir.as_deref();
             let presets = &mut self.presets;
             let preset_name = &mut self.preset_name;
+            let classifier_available = self.classifier.is_some();
+            let classify_progress = self.classify_progress;
+            let rater_available = self.rater.is_some();
+            let rate_progress = self.rate_progress;
+            let tags_map = &mut self.tags;
+            let tag_edit = &mut self.tag_edit;
             let raw_input = egui_state.take_egui_input(window);
             let mut needs_process = false;
 
@@ -1130,6 +1208,40 @@ impl App {
                                     if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                                         ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_COPY_PICKS), dir));
                                     }
+                                }
+                                ui.separator();
+                                if let Some((done, total)) = classify_progress {
+                                    ui.label(
+                                        egui::RichText::new(format!("Tagging {done}/{total}…"))
+                                            .small()
+                                            .color(egui::Color32::from_gray(160)),
+                                    );
+                                } else if ui
+                                    .add_enabled(
+                                        classifier_available && !thumbs.is_empty(),
+                                        egui::Button::new("🏷 Tag Folder"),
+                                    )
+                                    .on_hover_text("Classify every photo in this folder and add tags")
+                                    .clicked()
+                                {
+                                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_CLASSIFY_FOLDER), true));
+                                }
+                                ui.separator();
+                                if let Some((done, total)) = rate_progress {
+                                    ui.label(
+                                        egui::RichText::new(format!("Rating {done}/{total}…"))
+                                            .small()
+                                            .color(egui::Color32::from_gray(160)),
+                                    );
+                                } else if ui
+                                    .add_enabled(
+                                        rater_available && !thumbs.is_empty(),
+                                        egui::Button::new("⭐ Rate Folder"),
+                                    )
+                                    .on_hover_text("Auto-rate every photo in this folder by quality (1-5 stars)")
+                                    .clicked()
+                                {
+                                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_RATE_FOLDER), true));
                                 }
                             });
                             ui.separator();
@@ -1662,6 +1774,33 @@ impl App {
                             }
                         });
                         ui.separator();
+                        if let Some(path) = current_path.clone() {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("TAGS").small().color(egui::Color32::from_gray(140)));
+                                let resp = ui.add(
+                                    egui::TextEdit::singleline(tag_edit)
+                                        .hint_text("comma, separated, tags")
+                                        .desired_width(ui.available_width()),
+                                );
+                                if resp.changed() {
+                                    let parsed: Vec<String> = tag_edit
+                                        .split(',')
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .collect();
+                                    if let Some(db) = db {
+                                        tags::save_tags(db, &path, &parsed);
+                                    }
+                                    if parsed.is_empty() {
+                                        tags_map.remove(&path);
+                                    } else {
+                                        tags_map.insert(path.clone(), parsed);
+                                    }
+                                }
+                            });
+                            ui.separator();
+                        }
                         ui.spacing_mut().item_spacing.y = 3.0;
 
                         // Compact one-line rows: fixed-width label left, slider right
@@ -2029,6 +2168,12 @@ impl App {
             let copy_picks_dir: Option<PathBuf> = self
                 .egui_ctx
                 .data_mut(|d| d.remove_temp(egui::Id::new(KEY_COPY_PICKS)));
+            let classify_folder_req: Option<bool> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_CLASSIFY_FOLDER)));
+            let rate_folder_req: Option<bool> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_RATE_FOLDER)));
             (
                 full_output.shapes,
                 full_output.textures_delta,
@@ -2040,6 +2185,8 @@ impl App {
                 trash_req.is_some(),
                 move_rejects_dir,
                 copy_picks_dir,
+                classify_folder_req.is_some(),
+                rate_folder_req.is_some(),
                 needs_process,
             )
         }; // all field borrows dropped here
@@ -2053,6 +2200,7 @@ impl App {
                 if let Some(db) = &self.db {
                     for path in &rejects {
                         cull::delete_rows(db, path);
+                        tags::delete_rows(db, path);
                     }
                 }
                 self.after_files_removed(&rejects);
@@ -2069,6 +2217,7 @@ impl App {
                 if move_file(path, &new_path).is_ok() {
                     if let Some(db) = &self.db {
                         cull::rekey_rows(db, path, &new_path);
+                        tags::rekey_rows(db, path, &new_path);
                     }
                     moved.push(path.clone());
                 }
@@ -2085,6 +2234,7 @@ impl App {
                 if std::fs::copy(path, &new_path).is_ok() {
                     if let Some(db) = &self.db {
                         cull::copy_rows(db, path, &new_path);
+                        tags::copy_rows(db, path, &new_path);
                     }
                 }
             }
@@ -2100,6 +2250,28 @@ impl App {
         if let Some(path) = export_path {
             if let (Some(proc), Some(gpu)) = (&self.processor, &self.gpu) {
                 proc.export(&path, &gpu.device, &gpu.queue);
+            }
+        }
+        if classify_folder_req {
+            let paths: Vec<PathBuf> = self.thumbs.iter().map(|t| t.path.clone()).collect();
+            if let (Some(classifier), false) = (&self.classifier, paths.is_empty()) {
+                self.classify_progress = Some((0, paths.len()));
+                let classifier = Arc::clone(classifier);
+                let work = move |path: &Path| {
+                    imgload::load_edit_rgba(path).map(|(img, _)| classifier.classify(&img))
+                };
+                spawn_folder_workers(paths, work, self.classify_tx.clone());
+            }
+        }
+        if rate_folder_req {
+            let paths: Vec<PathBuf> = self.thumbs.iter().map(|t| t.path.clone()).collect();
+            if let (Some(rater), false) = (&self.rater, paths.is_empty()) {
+                self.rate_progress = Some((0, paths.len()));
+                let rater = Arc::clone(rater);
+                let work = move |path: &Path| {
+                    imgload::load_edit_rgba(path).and_then(|(img, _)| rater.rate(&img))
+                };
+                spawn_folder_workers(paths, work, self.rate_tx.clone());
             }
         }
 
@@ -2264,6 +2436,37 @@ fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
     if let Ok(()) = std::fs::rename(from, to) { Ok(()) } else {
         std::fs::copy(from, to)?;
         std::fs::remove_file(from)
+    }
+}
+
+// Runs `work` over `paths` on a small thread pool, sending one (path, result)
+// per file back over `tx` as it finishes. Used for folder-wide batch actions
+// (tagging, rating) that shouldn't block the UI thread.
+fn spawn_folder_workers<T: Send + 'static>(
+    paths: Vec<PathBuf>,
+    work: impl Fn(&Path) -> T + Send + Sync + 'static,
+    tx: std::sync::mpsc::Sender<(PathBuf, T)>,
+) {
+    let n_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get).min(8);
+    let (work_tx, work_rx) = std::sync::mpsc::channel::<PathBuf>();
+    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+    let work = std::sync::Arc::new(work);
+    for _ in 0..n_workers {
+        let work_rx = std::sync::Arc::clone(&work_rx);
+        let work = std::sync::Arc::clone(&work);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            loop {
+                let Ok(path) = work_rx.lock().unwrap().recv() else { break };
+                let result = work(&path);
+                if tx.send((path, result)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    for path in paths {
+        let _ = work_tx.send(path);
     }
 }
 
