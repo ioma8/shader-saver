@@ -1393,12 +1393,16 @@ const LOOK_GAIN: f32 = 0.6;
 // pipeline, worse than under-correcting the rest of the image.
 const SKIN_SECTOR_DAMP: f32 = 0.3;
 
-pub fn skin_hue_degrees(profile: &LookProfile) -> Option<f32> {
-    if profile.regions[0].share <= 0.0 {
+pub fn skin_hue_degrees_from_region(region: &RegionTone) -> Option<f32> {
+    if region.share <= 0.0 {
         return None;
     }
-    let [a, b] = profile.regions[0].hue_axis;
+    let [a, b] = region.hue_axis;
     Some(b.atan2(a).to_degrees().rem_euclid(360.0))
+}
+
+pub fn skin_hue_degrees(profile: &LookProfile) -> Option<f32> {
+    skin_hue_degrees_from_region(&profile.regions[0])
 }
 
 fn skin_sector(profile: &LookProfile) -> Option<usize> {
@@ -1406,17 +1410,28 @@ fn skin_sector(profile: &LookProfile) -> Option<usize> {
 }
 
 // Damp a baked 33-cube LUT's deviation from identity within a smooth hue
-// neighborhood around `hue_degrees`, blending affected cells back toward
-// true identity by up to `1 - damp`. Skin drift was the single most visible
-// failure mode this pipeline has had (see `SKIN_SECTOR_DAMP`), but that
-// protection lives inside the Oklab statistical stage's own transfer math --
-// it doesn't apply to a LUT that arrived some other way (CanonCGT's direct
-// prediction, blended in `canoncgt::blend_by_confidence` with no knowledge
-// of skin at all). Re-asserting it here, on whatever LUT a caller is about
-// to store, closes that gap regardless of which stage's correction ends up
-// stronger for a given cell.
-pub fn damp_lut_skin_hue(lut: &mut [f32], n: usize, reference: &LookProfile) {
-    let Some(hue_degrees) = skin_hue_degrees(reference) else { return };
+// neighborhood around the target photo's own skin hue, blending affected
+// cells back toward true identity by up to `1 - damp`. Skin drift was the
+// single most visible failure mode this pipeline has had (see
+// `SKIN_SECTOR_DAMP`), but that protection lives inside the Oklab
+// statistical stage's own transfer math -- it doesn't apply to a LUT that
+// arrived some other way (CanonCGT's direct prediction, blended in
+// `canoncgt::blend_by_confidence` with no knowledge of skin at all).
+// Re-asserting it here, on whatever LUT a caller is about to store, closes
+// that gap regardless of which stage's correction ends up stronger for a
+// given cell.
+//
+// `target_skin_hue` -- the *target* photo's own measured skin hue, i.e. the
+// face this LUT is actually about to be applied to -- takes priority over
+// `reference`'s. This used to key off `reference` alone, which meant a
+// reference photo with no detected face (partial profile, small face, no
+// face at all) silently disabled skin protection entirely, even when the
+// target being edited was full of faces. The target's own skin hue is both
+// the more correct signal (it's the thing being protected) and the one most
+// likely to be available exactly when protection matters most; `reference`
+// is only a fallback for when the target itself has no detected skin either.
+pub fn damp_lut_skin_hue(lut: &mut [f32], n: usize, target_skin_hue: Option<f32>, reference: &LookProfile) {
+    let Some(hue_degrees) = target_skin_hue.or_else(|| skin_hue_degrees(reference)) else { return };
     let radius = 60.0f32;
     for i in 0..n * n * n {
         let rgb = voxel_rgb(i, n);
@@ -1455,10 +1470,13 @@ fn derive_transfer(current: &LookProfile, reference: &LookProfile) -> LookTransf
         }
     }
 
-    // Damp whichever sector holds the *reference's* skin tone: pulling this
-    // image's matching hue range that far would be the most visible thing a
-    // viewer notices going wrong.
-    let damped_sector = skin_sector(reference);
+    // Damp whichever sector holds skin: pulling this image's matching hue
+    // range too far would be the most visible thing a viewer notices going
+    // wrong. Prefer `current`'s own skin sector -- it's the photo actually
+    // being edited, and (unlike `reference`) is available exactly when
+    // protection matters most; `reference` is only a fallback for when
+    // `current` itself has no detected skin either.
+    let damped_sector = skin_sector(current).or_else(|| skin_sector(reference));
 
     let mut hue_chroma_scale = [1f32; HUE_SECTORS];
     let mut hue_rotate = [0f32; HUE_SECTORS];
@@ -1616,9 +1634,9 @@ pub fn baked_lut(state: &EditState) -> Option<Vec<f32>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        combined_photo_lut, damp_lut_skin_hue, identity_photo_lut, linear_to_oklab, percentile,
-        photo_luts, skin_hue_degrees, srgb_to_linear, LookProfile, RegionTone, HUE_SECTORS,
-        LOOK_ANCHORS, REGION_COUNT,
+        combined_photo_lut, damp_lut_skin_hue, derive_transfer, identity_photo_lut, linear_to_oklab,
+        percentile, photo_luts, skin_hue_degrees, srgb_to_linear, LookProfile, RegionTone,
+        HUE_SECTORS, LOOK_ANCHORS, LOOK_GAIN, REGION_COUNT, SKIN_SECTOR_DAMP,
     };
 
     #[test]
@@ -1730,7 +1748,7 @@ mod tests {
         let before: Vec<f32> = identity_photo_lut().iter().map(|v| (v + 0.3).min(1.0)).collect();
         let mut lut = before.clone();
 
-        damp_lut_skin_hue(&mut lut, n, &profile);
+        damp_lut_skin_hue(&mut lut, n, None, &profile);
 
         let mut near = Vec::new();
         let mut far = Vec::new();
@@ -1764,5 +1782,128 @@ mod tests {
         println!("near-skin retained={near_avg:.3}  far-from-skin retained={far_avg:.3}");
         assert!(near_avg < 0.6, "skin-hue cells should have most of their deviation damped away, retained {near_avg}");
         assert!(far_avg > 0.9, "cells far from skin hue should be essentially untouched, retained {far_avg}");
+    }
+
+    // Regression test for a reported gap: `damp_lut_skin_hue` used to key
+    // *only* off the reference photo's own detected skin -- a reference with
+    // no detected face (partial profile, small face, no face at all) fully
+    // disabled skin protection, even for a target full of faces. Now the
+    // target's own skin hue takes priority. Here `reference` has no
+    // detectable skin region (share = 0.0) at all; protection should still
+    // fire, anchored on `target_skin_hue`.
+    #[test]
+    fn damp_lut_skin_hue_falls_back_to_target_when_reference_has_no_skin() {
+        let reference = LookProfile {
+            tone: [0.0; LOOK_ANCHORS.len()],
+            cast: [[0.0; 2]; 3],
+            cast_evidence: [0.0; 3],
+            chroma: 0.0,
+            hue_chroma: [0.0; HUE_SECTORS],
+            hue_axis: [[0.0; 2]; HUE_SECTORS],
+            hue_evidence: [0.0; HUE_SECTORS],
+            regions: [RegionTone::default(); REGION_COUNT], // no detected skin anywhere
+        };
+        assert_eq!(skin_hue_degrees(&reference), None, "test setup: reference must have no detected skin");
+
+        let n = 33usize;
+        let before: Vec<f32> = identity_photo_lut().iter().map(|v| (v + 0.3).min(1.0)).collect();
+        let mut lut = before.clone();
+
+        // Target's own skin sits at hue 0 degrees.
+        damp_lut_skin_hue(&mut lut, n, Some(0.0), &reference);
+
+        let mut near_retained = None;
+        for i in 0..n * n * n {
+            let rgb = [
+                (i % n) as f32 / (n - 1) as f32,
+                ((i / n) % n) as f32 / (n - 1) as f32,
+                (i / (n * n)) as f32 / (n - 1) as f32,
+            ];
+            let lab = linear_to_oklab([srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])]);
+            let chroma = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
+            if chroma <= 0.02 {
+                continue;
+            }
+            let hue = lab[2].atan2(lab[1]).to_degrees().rem_euclid(360.0);
+            if !(2.0..=358.0).contains(&hue) {
+                let idx = i * 3;
+                let before_dev = (before[idx] - rgb[0]).abs();
+                if before_dev > 1e-4 {
+                    near_retained = Some((lut[idx] - rgb[0]).abs() / before_dev);
+                    break;
+                }
+            }
+        }
+        let retained = near_retained.expect("test setup should sample a near-hue-0 cell");
+        assert!(retained < 0.6, "skin protection should fire from target_skin_hue even with a skin-less reference, retained {retained}");
+    }
+
+    // Regression test for the other half of the same gap: `derive_transfer`
+    // used to pick the damped hue sector from `reference`'s skin alone
+    // (`skin_sector(reference)`). With a reference that has no detected skin
+    // region, every sector -- including the one holding `current`'s own,
+    // real face -- got full, undamped correction. Now `current`'s own skin
+    // sector takes priority.
+    #[test]
+    fn derive_transfer_damps_current_skin_sector_even_when_reference_has_none() {
+        let unit = |deg: f32| [deg.to_radians().cos(), deg.to_radians().sin()];
+
+        let mut current = LookProfile {
+            tone: [0.0; LOOK_ANCHORS.len()],
+            cast: [[0.0; 2]; 3],
+            cast_evidence: [0.0; 3],
+            chroma: 0.0,
+            hue_chroma: [0.1; HUE_SECTORS],
+            hue_axis: [[0.0; 2]; HUE_SECTORS],
+            hue_evidence: [0.0; HUE_SECTORS],
+            regions: [RegionTone::default(); REGION_COUNT],
+        };
+        // Current's own face: skin hue 10 degrees, sector 0 (0..45).
+        current.regions[0] = RegionTone { lightness: 0.6, chroma: 0.05, hue_axis: unit(10.0), share: 0.2 };
+        current.hue_axis[0] = unit(10.0);
+        current.hue_evidence[0] = 0.5;
+        // An unrelated sector (180..225) with the same angular gap to reference,
+        // as a control that should be corrected normally (not damped).
+        current.hue_axis[4] = unit(190.0);
+        current.hue_evidence[4] = 0.5;
+
+        let reference = LookProfile {
+            tone: [0.0; LOOK_ANCHORS.len()],
+            cast: [[0.0; 2]; 3],
+            cast_evidence: [0.0; 3],
+            chroma: 0.0,
+            hue_chroma: [0.1; HUE_SECTORS],
+            hue_axis: {
+                let mut a = [[0.0; 2]; HUE_SECTORS];
+                a[0] = unit(40.0);
+                a[4] = unit(220.0);
+                a
+            },
+            hue_evidence: {
+                let mut e = [0.0; HUE_SECTORS];
+                e[0] = 0.5;
+                e[4] = 0.5;
+                e
+            },
+            regions: [RegionTone::default(); REGION_COUNT], // no detected skin
+        };
+        assert_eq!(skin_hue_degrees(&reference), None, "test setup: reference must have no detected skin");
+
+        let transfer = derive_transfer(&current, &reference);
+
+        // Both sectors have the same 30-degree gap; only sector 0 overlaps
+        // current's own skin and should come out damped.
+        let undamped = 30.0 * LOOK_GAIN * 0.5;
+        let damped = undamped * SKIN_SECTOR_DAMP;
+        println!("skin sector rotate={:.3} (expect ~{damped:.3})  control sector rotate={:.3} (expect ~{undamped:.3})",
+            transfer.hue_rotate[0], transfer.hue_rotate[4]);
+        assert!(
+            (transfer.hue_rotate[0] - damped).abs() < 0.2,
+            "current's own skin sector should be damped to ~{damped}, got {}", transfer.hue_rotate[0]
+        );
+        assert!(
+            (transfer.hue_rotate[4] - undamped).abs() < 0.2,
+            "an unrelated sector with the same gap should be corrected in full (~{undamped}), got {}", transfer.hue_rotate[4]
+        );
     }
 }

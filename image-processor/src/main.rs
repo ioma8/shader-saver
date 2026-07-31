@@ -218,7 +218,12 @@ fn look_chain_for(
         // every photo through the same code path.
         let pre_lut = processor::baked_lut(&pre_state)
             .unwrap_or_else(processor::identity_photo_lut);
-        if let Some(lut) = canon.predict_lut_prenormalized(img, &look.reference, &pre_lut, &look.profile) {
+        // The target's own skin hue, if any -- takes priority over the
+        // reference's for skin protection (see `damp_lut_skin_hue`'s doc
+        // comment): it's the face this LUT is actually about to be applied to.
+        let target_regions = processor::measure_regions(img.as_raw(), img.width(), img.height(), faces);
+        let target_skin_hue = processor::skin_hue_degrees_from_region(&target_regions[0]);
+        if let Some(lut) = canon.predict_lut_prenormalized(img, &look.reference, &pre_lut, &look.profile, target_skin_hue) {
             state.canon_lut = Some(lut);
             state.ai_lut_enabled = false;
             state.look.clear();

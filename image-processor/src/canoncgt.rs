@@ -118,8 +118,10 @@ impl CanonCGT {
     // identity than the stronger opinion, and it cannot cancel a strong
     // opinion down to nothing just because the weaker one disagrees.
     // `reference_profile` is `reference`'s own measured `LookProfile` --
-    // already computed by the caller when the look was captured -- used to
-    // re-assert skin-hue protection (see `damp_lut_skin_hue`) on the blended
+    // already computed by the caller when the look was captured --
+    // `target_skin_hue` is the *target* photo's own measured skin hue (see
+    // `damp_lut_skin_hue`'s doc comment for why that takes priority over
+    // `reference_profile`'s). Both feed skin-hue protection on the blended
     // result before gamut-mapping it into something directly storable. Both
     // steps live here, not in the caller, so every caller of this function
     // gets a safe, ready-to-apply LUT for free rather than needing to
@@ -133,31 +135,47 @@ impl CanonCGT {
         reference: &image::RgbaImage,
         pre_lut: &[f32],
         reference_profile: &LookProfile,
+        target_skin_hue: Option<f32>,
     ) -> Option<Vec<f32>> {
         let direct = self.predict_lut(target, reference)?;
         let mut blended = blend_by_confidence(pre_lut, &direct, OUTPUT_GRID);
-        damp_lut_skin_hue(&mut blended, OUTPUT_GRID, reference_profile);
+        damp_lut_skin_hue(&mut blended, OUTPUT_GRID, target_skin_hue, reference_profile);
         gamut_map_lut(&mut blended);
         Some(blended)
     }
 }
 
+// Blend two independently-derived LUTs, weighted per-cell by how strongly
+// each one wants to move that color -- see `predict_lut_prenormalized`'s doc
+// comment for why. The weight is a single scalar per cell (the Euclidean
+// magnitude of each stage's RGB deviation from identity), applied uniformly
+// across R/G/B, not computed separately per channel. An earlier, per-channel
+// version could blend two colors neither stage proposed: e.g. a stage
+// confident only about red (dev [0.3, 0, 0]) blended against one confident
+// only about blue (dev [0, 0, 0.3]) produced [0.3, 0, 0.3] under the old
+// per-channel weights -- a diagonal shift with *larger* magnitude than
+// either stage's own opinion, in a direction neither of them suggested. A
+// single per-cell weight keeps the result on the segment between the two
+// stages' actual proposed colors, so it can't run further from either one
+// than the stronger opinion already does.
 fn blend_by_confidence(pre_lut: &[f32], direct: &[f32], n: usize) -> Vec<f32> {
     let cell_count = n * n * n;
     let mut out = vec![0f32; cell_count * 3];
     for i in 0..cell_count {
         let id = voxel_rgb(i, n);
+        let idx = i * 3;
+        let pre_dev = [pre_lut[idx] - id[0], pre_lut[idx + 1] - id[1], pre_lut[idx + 2] - id[2]];
+        let direct_dev = [direct[idx] - id[0], direct[idx + 1] - id[1], direct[idx + 2] - id[2]];
+        let pre_w = pre_dev.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let direct_w = direct_dev.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let total_w = pre_w + direct_w;
         for ch in 0..3 {
-            let pre_dev = pre_lut[i * 3 + ch] - id[ch];
-            let direct_dev = direct[i * 3 + ch] - id[ch];
-            let (pre_w, direct_w) = (pre_dev.abs(), direct_dev.abs());
-            let total_w = pre_w + direct_w;
             let blended_dev = if total_w > 1e-6 {
-                (pre_dev * pre_w + direct_dev * direct_w) / total_w
+                (pre_dev[ch] * pre_w + direct_dev[ch] * direct_w) / total_w
             } else {
                 0.0
             };
-            out[i * 3 + ch] = id[ch] + blended_dev;
+            out[idx + ch] = id[ch] + blended_dev;
         }
     }
     out
@@ -240,6 +258,46 @@ mod tests {
         // what clamps to displayable color. So this only checks for a plausible
         // range, not a hard [0,1] bound.
         assert!(lut.iter().all(|v| (-1.0..=2.0).contains(v)));
+    }
+
+    // Regression test for a reported architectural gap: the original
+    // `blend_by_confidence` weighted each of R/G/B independently, so two
+    // stages that were each confident about a *different* channel could
+    // blend into a color neither one proposed, with a *larger* deviation
+    // from identity than either stage's own opinion -- the exact
+    // amplification failure `predict_lut_prenormalized`'s doc comment
+    // describes elsewhere. Here `pre_lut` only wants to move red, `direct`
+    // only wants to move blue; the fix should land on the midpoint between
+    // the two proposed colors, not their per-channel union.
+    #[test]
+    fn blend_by_confidence_does_not_amplify_orthogonal_channel_opinions() {
+        let n = 2;
+        let id = |i: usize| voxel_rgb(i, n);
+        let mut pre_lut = (0..8).flat_map(id).collect::<Vec<f32>>();
+        let mut direct = pre_lut.clone();
+        pre_lut[0] += 0.3; // cell 0 (rgb=[0,0,0]): pre_lut wants red +0.3
+        direct[2] += 0.3; // cell 0: direct wants blue +0.3
+
+        let blended = blend_by_confidence(&pre_lut, &direct, n);
+
+        // Cell 0 is rgb=[0,0,0], so the LUT value there is exactly the deviation.
+        let (r, g, b) = (blended[0], blended[1], blended[2]);
+        println!("blended cell0 deviation = [{r:.3}, {g:.3}, {b:.3}]");
+
+        let magnitude = (r * r + g * g + b * b).sqrt();
+        assert!(
+            magnitude < 0.3 + 1e-4,
+            "blended deviation (magnitude {magnitude}) should not exceed either stage's own \
+             opinion (0.3) -- the old per-channel scheme landed at [0.3, 0, 0.3], magnitude {:.3}",
+            (0.3f32 * 0.3 + 0.3 * 0.3f32).sqrt()
+        );
+        assert!((r - b).abs() < 1e-4, "with equal-magnitude opinions on orthogonal channels, both should be blended equally, got r={r} b={b}");
+        assert!(g.abs() < 1e-6, "channel neither stage touched should stay at identity");
+
+        // Untouched cells should come through unchanged.
+        for i in 1..8 {
+            assert_eq!(&blended[i * 3..i * 3 + 3], &id(i)[..], "cell {i} should be unaffected");
+        }
     }
 
     #[test]
