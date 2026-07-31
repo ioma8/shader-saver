@@ -30,7 +30,7 @@
 
 use tract::prelude::*;
 
-use crate::processor::{sample_cube, smooth_lut};
+use crate::processor::{compose_luts, damp_lut_skin_hue, gamut_map_lut, sample_cube, smooth_lut, voxel_rgb, LookProfile};
 
 const MODEL: &[u8] = include_bytes!("../models/canoncgt_lut.onnx");
 const INPUT_SIZE: u32 = 224;
@@ -117,14 +117,28 @@ impl CanonCGT {
     // are each already sane on their own -- it cannot run further from
     // identity than the stronger opinion, and it cannot cancel a strong
     // opinion down to nothing just because the weaker one disagrees.
+    // `reference_profile` is `reference`'s own measured `LookProfile` --
+    // already computed by the caller when the look was captured -- used to
+    // re-assert skin-hue protection (see `damp_lut_skin_hue`) on the blended
+    // result before gamut-mapping it into something directly storable. Both
+    // steps live here, not in the caller, so every caller of this function
+    // gets a safe, ready-to-apply LUT for free rather than needing to
+    // remember the right post-processing calls in the right order. `predict_lut`
+    // itself deliberately stays raw (see its own test) since composing an
+    // already-clamped opinion here would throw away how far out of gamut the
+    // network wanted to push before blending tempers it back.
     pub fn predict_lut_prenormalized(
         &self,
         target: &image::RgbaImage,
         reference: &image::RgbaImage,
         pre_lut: &[f32],
+        reference_profile: &LookProfile,
     ) -> Option<Vec<f32>> {
         let direct = self.predict_lut(target, reference)?;
-        Some(blend_by_confidence(pre_lut, &direct, OUTPUT_GRID))
+        let mut blended = blend_by_confidence(pre_lut, &direct, OUTPUT_GRID);
+        damp_lut_skin_hue(&mut blended, OUTPUT_GRID, reference_profile);
+        gamut_map_lut(&mut blended);
+        Some(blended)
     }
 }
 
@@ -132,11 +146,7 @@ fn blend_by_confidence(pre_lut: &[f32], direct: &[f32], n: usize) -> Vec<f32> {
     let cell_count = n * n * n;
     let mut out = vec![0f32; cell_count * 3];
     for i in 0..cell_count {
-        let id = [
-            (i % n) as f32 / (n - 1) as f32,
-            ((i / n) % n) as f32 / (n - 1) as f32,
-            (i / (n * n)) as f32 / (n - 1) as f32,
-        ];
+        let id = voxel_rgb(i, n);
         for ch in 0..3 {
             let pre_dev = pre_lut[i * 3 + ch] - id[ch];
             let direct_dev = direct[i * 3 + ch] - id[ch];
@@ -167,27 +177,11 @@ fn blend_by_confidence(pre_lut: &[f32], direct: &[f32], n: usize) -> Vec<f32> {
 // (e.g. a small, independently-validated correction, not the network's own
 // compounding output).
 
-// Evaluate `outer` at the colors `inner` produces, so a single pass through the
-// result does what applying `inner` then `outer` in sequence would do.
-fn compose_luts(inner: &[f32], outer: &[f32], n: usize) -> Vec<f32> {
-    inner
-        .chunks_exact(3)
-        .flat_map(|rgb| sample_cube(outer, n, [rgb[0], rgb[1], rgb[2]]))
-        .collect()
-}
-
 // Resample a `from`-cube LUT onto a `to`-sized grid by sampling it at the new
 // grid's own coordinates -- the standard meaning of resizing a 3D LUT, and the
 // same trilinear helper the shader itself uses to apply one.
 fn upsample_lut(lut: &[f32], from: usize, to: usize) -> Vec<f32> {
-    (0..to.pow(3))
-        .flat_map(|i| {
-            let r = (i % to) as f32 / (to - 1) as f32;
-            let g = ((i / to) % to) as f32 / (to - 1) as f32;
-            let b = (i / (to * to)) as f32 / (to - 1) as f32;
-            sample_cube(lut, from, [r, g, b])
-        })
-        .collect()
+    (0..to.pow(3)).flat_map(|i| sample_cube(lut, from, voxel_rgb(i, to))).collect()
 }
 
 fn to_input_tensor(img: &image::RgbaImage) -> Option<tract::Tensor> {

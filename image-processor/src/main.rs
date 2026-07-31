@@ -218,20 +218,17 @@ fn look_chain_for(
         // every photo through the same code path.
         let pre_lut = processor::baked_lut(&pre_state)
             .unwrap_or_else(processor::identity_photo_lut);
-        if let Some(mut lut) = canon.predict_lut_prenormalized(img, &look.reference, &pre_lut) {
-            // Re-assert skin protection on CanonCGT's own blended result --
-            // see `damp_lut_skin_hue`'s doc comment for why this can't just
-            // live inside the Oklab stage anymore.
-            processor::damp_lut_skin_hue(&mut lut, 33, &look.profile);
-            // Gamut-map at storage time so the LUT in state is always
-            // in-gamut. This makes `baked_lut`'s clone path (the common
-            // case with strength=1.0) skip the expensive round trip.
-            processor::gamut_map_lut(&mut lut);
+        if let Some(lut) = canon.predict_lut_prenormalized(img, &look.reference, &pre_lut, &look.profile) {
             state.canon_lut = Some(lut);
             state.ai_lut_enabled = false;
             state.look.clear();
             return;
         }
+        // CanonCGT loaded but inference failed for this pair -- `pre_state.look`
+        // is already exactly what the Oklab-only fallback below would recompute
+        // from the same `img`/`state`/`look.profile`/`faces`, so reuse it instead.
+        state.look = pre_state.look;
+        return;
     }
     state.look = processor::derive_look_chain(img, state, &look.profile, faces, LOOK_PASSES);
 }

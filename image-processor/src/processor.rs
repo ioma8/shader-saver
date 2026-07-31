@@ -918,15 +918,20 @@ impl Processor {
 
 
 
+// The normalized RGB coordinate voxel `i` of an `n`-cube grid sits at, laid
+// out R-fastest -- the one indexing scheme every LUT in this app shares,
+// whether it's being built, resampled, or walked for a post-process pass.
+pub(crate) fn voxel_rgb(i: usize, n: usize) -> [f32; 3] {
+    [
+        (i % n) as f32 / (n - 1) as f32,
+        ((i / n) % n) as f32 / (n - 1) as f32,
+        (i / (n * n)) as f32 / (n - 1) as f32,
+    ]
+}
+
 pub fn identity_photo_lut() -> Vec<f32> {
-    const GRID: usize = 33 * 33 * 33;
-    let mut result = Vec::with_capacity(3 * GRID);
-    for i in 0..GRID {
-        result.push((i % 33) as f32 / 32.0);
-        result.push(((i / 33) % 33) as f32 / 32.0);
-        result.push((i / (33 * 33)) as f32 / 32.0);
-    }
-    result
+    const N: usize = 33;
+    (0..N * N * N).flat_map(|i| voxel_rgb(i, N)).collect()
 }
 
 pub fn sample_cube(lut: &[f32], n: usize, rgb: [f32; 3]) -> [f32; 3] {
@@ -950,12 +955,10 @@ pub fn sample_cube(lut: &[f32], n: usize, rgb: [f32; 3]) -> [f32; 3] {
     out
 }
 
-fn sample_photo_lut(lut: &[f32], rgb: [f32; 3]) -> [f32; 3] { sample_cube(lut, 33, rgb) }
-
 fn lut_pixels(img: &image::RgbaImage, lut: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(img.as_raw().len());
     for px in img.as_raw().chunks_exact(4) {
-        let rgb = sample_photo_lut(lut, [f32::from(px[0])/255.0, f32::from(px[1])/255.0, f32::from(px[2])/255.0]);
+        let rgb = sample_cube(lut, 33, [f32::from(px[0])/255.0, f32::from(px[1])/255.0, f32::from(px[2])/255.0]);
         for v in rgb { out.push((v.clamp(0.0, 1.0) * 255.0).round() as u8); }
         out.push(px[3]);
     }
@@ -1044,7 +1047,7 @@ const REGION_PRIORS: [RegionPrior; REGION_COUNT] = [
     RegionPrior { hue: (200.0, 285.0), chroma: (0.02, 0.40), lightness: (0.45, 1.00) },
 ];
 
-#[derive(Clone, Copy, PartialEq, Default)]
+#[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RegionTone {
     pub lightness: f32,
     pub chroma: f32,
@@ -1186,7 +1189,7 @@ pub fn measure_regions(
 pub const LOOK_ANCHORS: [f64; 5] = [0.05, 0.25, 0.5, 0.75, 0.95];
 const HUE_SECTORS: usize = 8;
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LookProfile {
     pub tone: [f32; LOOK_ANCHORS.len()],
     // Average Oklab (a,b) per tone band (shadows/mids/highlights).
@@ -1197,66 +1200,6 @@ pub struct LookProfile {
     pub hue_axis: [[f32; 2]; HUE_SECTORS],
     pub hue_evidence: [f32; HUE_SECTORS],
     pub regions: [RegionTone; REGION_COUNT],
-}
-
-impl serde::Serialize for LookProfile {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        Raw::from(self).serialize(s)
-    }
-}
-impl<'de> serde::Deserialize<'de> for LookProfile {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Raw::deserialize(d)?.into())
-    }
-}
-
-// `RegionTone` and the fixed-size arrays above don't derive
-// Serialize/Deserialize themselves, so `LookProfile` round-trips through this
-// plain-data mirror instead.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Raw {
-    tone: Vec<f32>,
-    cast: Vec<[f32; 2]>,
-    cast_evidence: Vec<f32>,
-    chroma: f32,
-    hue_chroma: Vec<f32>,
-    hue_axis: Vec<[f32; 2]>,
-    hue_evidence: Vec<f32>,
-    regions: Vec<(f32, f32, [f32; 2], f32)>,
-}
-impl From<&LookProfile> for Raw {
-    fn from(p: &LookProfile) -> Self {
-        Self {
-            tone: p.tone.to_vec(),
-            cast: p.cast.to_vec(),
-            cast_evidence: p.cast_evidence.to_vec(),
-            chroma: p.chroma,
-            hue_chroma: p.hue_chroma.to_vec(),
-            hue_axis: p.hue_axis.to_vec(),
-            hue_evidence: p.hue_evidence.to_vec(),
-            regions: p.regions.iter().map(|r| (r.lightness, r.chroma, r.hue_axis, r.share)).collect(),
-        }
-    }
-}
-impl From<Raw> for LookProfile {
-    fn from(r: Raw) -> Self {
-        let arr = |v: Vec<f32>, n: usize| -> Vec<f32> { let mut v = v; v.resize(n, 0.0); v };
-        let tone: [f32; LOOK_ANCHORS.len()] = arr(r.tone, LOOK_ANCHORS.len()).try_into().unwrap();
-        let mut cast = [[0f32; 2]; 3];
-        for (slot, v) in cast.iter_mut().zip(r.cast) { *slot = v; }
-        let cast_evidence: [f32; 3] = arr(r.cast_evidence, 3).try_into().unwrap();
-        let mut hue_chroma = [0f32; HUE_SECTORS];
-        for (slot, v) in hue_chroma.iter_mut().zip(arr(r.hue_chroma, HUE_SECTORS)) { *slot = v; }
-        let mut hue_axis = [[0f32; 2]; HUE_SECTORS];
-        for (slot, v) in hue_axis.iter_mut().zip(r.hue_axis) { *slot = v; }
-        let mut hue_evidence = [0f32; HUE_SECTORS];
-        for (slot, v) in hue_evidence.iter_mut().zip(arr(r.hue_evidence, HUE_SECTORS)) { *slot = v; }
-        let mut regions = [RegionTone::default(); REGION_COUNT];
-        for (slot, v) in regions.iter_mut().zip(r.regions) {
-            *slot = RegionTone { lightness: v.0, chroma: v.1, hue_axis: v.2, share: v.3 };
-        }
-        Self { tone, cast, cast_evidence, chroma: r.chroma, hue_chroma, hue_axis, hue_evidence, regions }
-    }
 }
 
 impl LookProfile {
@@ -1476,11 +1419,7 @@ pub fn damp_lut_skin_hue(lut: &mut [f32], n: usize, reference: &LookProfile) {
     let Some(hue_degrees) = skin_hue_degrees(reference) else { return };
     let radius = 60.0f32;
     for i in 0..n * n * n {
-        let rgb = [
-            (i % n) as f32 / (n - 1) as f32,
-            ((i / n) % n) as f32 / (n - 1) as f32,
-            (i / (n * n)) as f32 / (n - 1) as f32,
-        ];
+        let rgb = voxel_rgb(i, n);
         let lab = linear_to_oklab([srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])]);
         let chroma = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
         if chroma <= 1e-4 {
@@ -1587,7 +1526,7 @@ fn bake_look_chain(chain: &[LookTransfer]) -> Vec<f32> {
     const N: usize = 33;
     let mut result = Vec::with_capacity(3 * N * N * N);
     for i in 0..N * N * N {
-        let rgb = [(i % N) as f32 / 32.0, ((i / N) % N) as f32 / 32.0, (i / (N * N)) as f32 / 32.0];
+        let rgb = voxel_rgb(i, N);
         let mut lab = linear_to_oklab([srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])]);
         for t in chain {
             lab = apply_transfer_to_lab(lab, t);
@@ -1601,8 +1540,10 @@ fn blend_lut(id: &[f32], v: &[f32], t: f32) -> Vec<f32> {
     id.iter().zip(v).map(|(a, b)| a + (b - a) * t).collect()
 }
 
-fn compose_lut33(inner: &[f32], outer: &[f32]) -> Vec<f32> {
-    inner.chunks_exact(3).flat_map(|rgb| sample_cube(outer, 33, [rgb[0], rgb[1], rgb[2]])).collect()
+// Evaluate `outer` at the colors `inner` produces, so a single pass through
+// the result does what applying `inner` then `outer` in sequence would do.
+pub(crate) fn compose_luts(inner: &[f32], outer: &[f32], n: usize) -> Vec<f32> {
+    inner.chunks_exact(3).flat_map(|rgb| sample_cube(outer, n, [rgb[0], rgb[1], rgb[2]])).collect()
 }
 
 // Derive a chain of conservative corrections that carries `img` (as it
@@ -1665,7 +1606,7 @@ pub fn baked_lut(state: &EditState) -> Option<Vec<f32>> {
             look_lut = blend_lut(&identity_photo_lut(), &look_lut, state.look_strength);
         }
         lut = Some(match lut {
-            Some(base) => compose_lut33(&base, &look_lut),
+            Some(base) => compose_luts(&base, &look_lut, 33),
             None => look_lut,
         });
     }
