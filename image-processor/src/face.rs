@@ -43,6 +43,22 @@ impl Detector {
     }
 
     pub fn detect(&self, img: &image::RgbaImage) -> FaceStats {
+        let boxes = self.detect_boxes(img);
+        FaceStats {
+            count: boxes.len().min(u8::MAX as usize) as u8,
+            largest_area: boxes
+                .iter()
+                .map(|b| (b[2] * b[3]).clamp(0.0, 1.0))
+                .fold(0.0, f32::max),
+        }
+    }
+
+    // Face rectangles as fractions of the image: [x, y, width, height] in 0..1.
+    //
+    // The look transfer needs these, not just a count: skin is a small share of
+    // most frames but the part a viewer judges first, so it gets measured and
+    // matched on its own rather than being averaged into the whole picture.
+    pub fn detect_boxes(&self, img: &image::RgbaImage) -> Vec<[f32; 4]> {
         let resized = image::imageops::resize(
             img,
             INPUT_SIZE,
@@ -63,10 +79,10 @@ impl Detector {
         }
         let Ok(input) = Tensor::from_slice(&[1, 3, INPUT_SIZE as usize, INPUT_SIZE as usize], &chw)
         else {
-            return FaceStats::default();
+            return Vec::new();
         };
         let Ok(outputs) = self.runnable.run([input]) else {
-            return FaceStats::default();
+            return Vec::new();
         };
 
         let mut detections = Vec::new();
@@ -98,14 +114,18 @@ impl Detector {
                 });
             }
         }
-        let detections = nms(&mut detections);
-        FaceStats {
-            count: detections.len().min(u8::MAX as usize) as u8,
-            largest_area: detections
-                .iter()
-                .map(|d| (d.w * d.h / (INPUT_SIZE * INPUT_SIZE) as f32).clamp(0.0, 1.0))
-                .fold(0.0, f32::max),
-        }
+        let side = INPUT_SIZE as f32;
+        nms(&mut detections)
+            .iter()
+            .map(|d| {
+                [
+                    (d.x / side).clamp(0.0, 1.0),
+                    (d.y / side).clamp(0.0, 1.0),
+                    (d.w / side).clamp(0.0, 1.0),
+                    (d.h / side).clamp(0.0, 1.0),
+                ]
+            })
+            .collect()
     }
 }
 
