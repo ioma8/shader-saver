@@ -2155,6 +2155,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "half",
  "image 0.25.10",
  "imagepipe",
  "jpgfromraw",

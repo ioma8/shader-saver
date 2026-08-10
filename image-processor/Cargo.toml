@@ -23,6 +23,7 @@ trash = "5"
 kamadak-exif = "0.5"
 tract = "0.23"
 rayon = "1"
+half = "2"
 
 [patch.crates-io]
 block = { path = "vendor/block" }

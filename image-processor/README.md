@@ -26,6 +26,10 @@ images.
   brightness (Capture One-style midtone bias), contrast (logistic S-curve),
   blacks/shadows/highlights/whites tonal zones, box blur, unsharp mask,
   vignette — all hue-preserving (computed on luminance)
+- **16-bit pipeline** — the GPU editing pipeline runs on 16-bit integer input
+  and 16-bit half-float working textures (falling back to half-float input on
+  devices without the 16-bit-norm feature); RAW development feeds the editor
+  as 16-bit gamma-encoded RGBA, and export writes 16-bit PNGs
 - **Levels** — draggable black/gamma/white handles under the live
   GPU-computed luminance histogram
 - **Curves** — Photoshop-style: click the histogram to add points,

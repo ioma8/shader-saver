@@ -1,5 +1,5 @@
 @group(0) @binding(0) var input_tex:  texture_2d<f32>;
-@group(0) @binding(1) var output_tex: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var output_tex: texture_storage_2d<rgba16float, write>;
 
 struct Params {
     v0: f32, v1: f32, v2: f32, v3: f32,
@@ -32,6 +32,20 @@ fn photo_lut_apply(rgb: vec3<f32>) -> vec3<f32> {
     let c01 = mix(photo_lut_sample(lo.r, lo.g, hi.b), photo_lut_sample(hi.r, lo.g, hi.b), d.r);
     let c11 = mix(photo_lut_sample(lo.r, hi.g, hi.b), photo_lut_sample(hi.r, hi.g, hi.b), d.r);
     return mix(mix(c00, c10, d.g), mix(c01, c11, d.g), d.b);
+}
+
+// 16-bit working passes write half-float; the final display pass converts the
+// result to an 8-bit sRGB texture for the UI and for the on-screen histogram.
+@group(0) @binding(0) var display_in: texture_2d<f32>;
+@group(0) @binding(1) var display_out: texture_storage_2d<rgba8unorm, write>;
+
+@compute @workgroup_size(8, 8)
+fn display_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(display_in);
+    if gid.x >= dims.x || gid.y >= dims.y { return; }
+    let c = textureLoad(display_in, vec2<i32>(gid.xy), 0);
+    // Pipeline values are gamma-encoded 0..1; clamp and store (8-bit).
+    textureStore(display_out, vec2<i32>(gid.xy), vec4<f32>(clamp(c.rgb, vec3<f32>(0.0), vec3<f32>(1.0)), c.a));
 }
 
 // Shared helper — clamp-to-edge load used by all passes

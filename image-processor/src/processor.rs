@@ -1,4 +1,5 @@
 use std::path::Path;
+use half::f16;
 
 #[repr(align(4))]
 struct AlignedPhotoLuts([u8; 1_293_732]);
@@ -130,6 +131,11 @@ pub struct Processor {
     blur_h_pipeline: wgpu::ComputePipeline,
     blur_v_pipeline: wgpu::ComputePipeline,
     compute_bgl: wgpu::BindGroupLayout,
+    display_pipeline: wgpu::ComputePipeline,
+    display_bgl: wgpu::BindGroupLayout,
+    // True when the device supports 16-bit integer input textures; false falls
+    // back to 16-bit half-float input.
+    input_u16: bool,
 
     input_tex: Option<wgpu::Texture>,
     source_tex: Option<wgpu::Texture>,
@@ -138,7 +144,8 @@ pub struct Processor {
     tex2: Option<wgpu::Texture>,       // tonal output
     tex3: Option<wgpu::Texture>,       // sharpen output
     tex4: Option<wgpu::Texture>,       // blur_h output
-    output_tex: Option<wgpu::Texture>, // blur_v output (final)
+    output_tex: Option<wgpu::Texture>, // blur_v output (final, half-float)
+    display_tex: Option<wgpu::Texture>, // 8-bit sRGB copy for the UI
 
     contrast_buf: wgpu::Buffer,
     tonal_buf: wgpu::Buffer,
@@ -203,7 +210,7 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::StorageTexture {
                     access: wgpu::StorageTextureAccess::WriteOnly,
-                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     view_dimension: wgpu::TextureViewDimension::D2,
                 },
                 count: None,
@@ -225,6 +232,35 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
                     min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+// Final pass: half-float result -> 8-bit sRGB texture for the UI.
+fn create_display_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D2,
                 },
                 count: None,
             },
@@ -274,6 +310,24 @@ fn percentile(histogram: &[u32; 256], total: f64, p: f64) -> f32 {
     255.0
 }
 
+/// Resize 16-bit gamma-encoded RGBA through a float intermediate (used when a
+/// replacement image's dimensions differ slightly from the loaded render).
+fn resize_u16(pixels: &[u16], w: u32, h: u32, nw: u32, nh: u32) -> Vec<u16> {
+    let img = image::Rgba32FImage::from_raw(
+        w,
+        h,
+        pixels.iter().map(|&v| f32::from(v) / 65535.0).collect(),
+    )
+    .expect("u16 pixel buffer matches dimensions");
+    let resized = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+    resized
+        .pixels()
+        .flat_map(|p| {
+            [p[0], p[1], p[2], p[3]].map(|v| (v.clamp(0.0, 1.0) * 65535.0).round() as u16)
+        })
+        .collect()
+}
+
 impl Processor {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -310,6 +364,19 @@ impl Processor {
         };
 
         let histogram_bgl = create_histogram_bgl(device);
+        let display_bgl = create_display_bgl(device);
+        let display_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[&display_bgl],
+                push_constant_ranges: &[],
+            })),
+            module: &shader,
+            entry_point: "display_pass",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
         let histogram_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
             source: wgpu::ShaderSource::Wgsl(include_str!("histogram.wgsl").into()),
@@ -349,6 +416,11 @@ impl Processor {
             blur_h_pipeline: make_pipeline("blur_h_pass"),
             blur_v_pipeline: make_pipeline("blur_v_pass"),
             compute_bgl,
+            display_pipeline,
+            display_bgl,
+            input_u16: device
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM),
             input_tex: None,
             source_tex: None,
             source_image: None,
@@ -357,6 +429,7 @@ impl Processor {
             tex3: None,
             tex4: None,
             output_tex: None,
+            display_tex: None,
             contrast_buf: make_buf(48),
             tonal_buf: make_buf(48),
             blur_buf: make_buf(48),
@@ -589,26 +662,64 @@ impl Processor {
         queue: &wgpu::Queue,
     ) {
         let (width, height) = img.dimensions();
+        // 8-bit source -> 16-bit input (u8 -> u16 on the way in); the working
+        // pipeline below runs in 16-bit from here on.
+        let pixels: Vec<u16> = img
+            .pixels()
+            .flat_map(|p| {
+                let widen = |v: u8| u16::from(v) * 257;
+                [widen(p[0]), widen(p[1]), widen(p[2]), widen(p[3])]
+            })
+            .collect();
+        self.upload_u16(width, height, &pixels, device, queue);
+        self.source_image = Some(img.clone());
+    }
 
-        let make_input = || device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
-        });
-        let source_tex = make_input();
-        let input_tex = make_input();
+    /// Upload 16-bit gamma-encoded RGBA (u16 per channel) as the new image.
+    /// RAW development feeds this directly so the sensor's precision survives
+    /// into the editor.
+    pub fn upload_u16(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: &[u16],
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        let make_input = |format: wgpu::TextureFormat, view_formats: &'static [wgpu::TextureFormat]| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats,
+            })
+        };
+        // 16-bit integer input (65536 levels) when the device supports it,
+        // half-float otherwise; 8-bit sRGB original for display.
+        let source_tex = make_input(wgpu::TextureFormat::Rgba8Unorm, &[wgpu::TextureFormat::Rgba8UnormSrgb]);
+        let input_format = if self.input_u16 {
+            wgpu::TextureFormat::Rgba16Unorm
+        } else {
+            wgpu::TextureFormat::Rgba16Float
+        };
+        let input_tex = make_input(input_format, &[]);
+        // The original is an 8-bit copy of the source bytes; the input carries
+        // the full 16-bit data.
+        let source_pixels: Vec<u8> = pixels
+            .chunks_exact(4)
+            .flat_map(|p| [p[0] as u8, p[1] as u8, p[2] as u8, p[3] as u8])
+            .collect();
         queue.write_texture(
             source_tex.as_image_copy(),
-            img,
+            &source_pixels,
             wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * width),
@@ -620,12 +731,20 @@ impl Processor {
                 depth_or_array_layers: 1,
             },
         );
+        let input_data: Vec<u16> = if self.input_u16 {
+            pixels.to_vec()
+        } else {
+            pixels
+                .iter()
+                .map(|&v| f16::from_f32(f32::from(v) / 65535.0).to_bits())
+                .collect()
+        };
         queue.write_texture(
             input_tex.as_image_copy(),
-            img,
+            bytemuck::cast_slice(&input_data),
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * width),
+                bytes_per_row: Some(8 * width),
                 rows_per_image: None,
             },
             wgpu::Extent3d {
@@ -646,28 +765,43 @@ impl Processor {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: wgpu::TextureFormat::Rgba16Float,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING
                     | wgpu::TextureUsages::STORAGE_BINDING
                     | extra,
-                view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+                view_formats: &[],
             })
         };
 
         self.source_tex = Some(source_tex);
-        self.source_image = Some(img.clone());
         self.input_tex = Some(input_tex);
         self.tex1 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex2 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex3 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex4 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.output_tex = Some(make_intermediate(wgpu::TextureUsages::COPY_SRC));
+        self.display_tex = Some(device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
+        }));
         self.image_size = Some((width, height));
 
         self.process(device, queue);
     }
 
-    /// Replace the effective input with a full-resolution neural ISP result;
+    /// Replace the effective input with a full-resolution development result;
     /// the untouched source remains available for the original-image view and
     /// for Reset All Edits.  The replacement is decoded from the RAW file
     /// independently, so its dimensions can differ slightly from the editor's
@@ -678,28 +812,55 @@ impl Processor {
         img: &image::RgbaImage,
         queue: &wgpu::Queue,
     ) -> bool {
+        let (width, height) = img.dimensions();
+        let pixels: Vec<u16> = img
+            .pixels()
+            .flat_map(|p| {
+                let widen = |v: u8| u16::from(v) * 257;
+                [widen(p[0]), widen(p[1]), widen(p[2]), widen(p[3])]
+            })
+            .collect();
+        self.replace_input_u16(width, height, &pixels, queue)
+    }
+
+    /// Replace the effective input with 16-bit gamma-encoded RGBA pixels.
+    pub fn replace_input_u16(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: &[u16],
+        queue: &wgpu::Queue,
+    ) -> bool {
         let Some(input) = self.input_tex.as_ref() else {
             return false;
         };
-        let Some((width, height)) = self.image_size else {
+        let Some((tw, th)) = self.image_size else {
             return false;
         };
-        let img: image::RgbaImage = if img.dimensions() == (width, height) {
-            img.clone()
+        let pixels = if (width, height) == (tw, th) {
+            pixels.to_vec()
         } else {
-            image::imageops::resize(img, width, height, image::imageops::FilterType::Triangle)
+            resize_u16(pixels, width, height, tw, th)
+        };
+        let input_data: Vec<u16> = if self.input_u16 {
+            pixels
+        } else {
+            pixels
+                .iter()
+                .map(|&v| f16::from_f32(f32::from(v) / 65535.0).to_bits())
+                .collect()
         };
         queue.write_texture(
             input.as_image_copy(),
-            &img,
+            bytemuck::cast_slice(&input_data),
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * width),
+                bytes_per_row: Some(8 * tw),
                 rows_per_image: None,
             },
             wgpu::Extent3d {
-                width,
-                height,
+                width: tw,
+                height: th,
                 depth_or_array_layers: 1,
             },
         );
@@ -713,9 +874,8 @@ impl Processor {
         };
         self.replace_input_rgba(&source, queue)
     }
-
     pub fn output_view(&self) -> Option<wgpu::TextureView> {
-        self.output_tex.as_ref().map(|t| {
+        self.display_tex.as_ref().map(|t| {
             t.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
                 ..Default::default()
@@ -736,7 +896,7 @@ impl Processor {
         self.input_tex.is_some()
     }
 
-    // Pipeline: contrast → sharpen → blur_h → blur_v
+    // Pipeline: contrast → sharpen → blur_h → blur_v → display
     // Sharpen operates on the contrast-adjusted image (pre-blur) so the unsharp
     fn write_uniforms(&self, queue: &wgpu::Queue) {
         queue.write_buffer(
@@ -848,13 +1008,14 @@ impl Processor {
 
     // mask anchors off clean signal, independent of the box-blur slider.
     pub fn process(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let (Some(input), Some(t1), Some(t2), Some(t3), Some(t4), Some(output)) = (
+        let (Some(input), Some(t1), Some(t2), Some(t3), Some(t4), Some(output), Some(display)) = (
             self.input_tex.as_ref(),
             self.tex1.as_ref(),
             self.tex2.as_ref(),
             self.tex3.as_ref(),
             self.tex4.as_ref(),
             self.output_tex.as_ref(),
+            self.display_tex.as_ref(),
         ) else {
             return;
         };
@@ -867,6 +1028,7 @@ impl Processor {
         let t3v = t3.create_view(&wgpu::TextureViewDescriptor::default());
         let t4v = t4.create_view(&wgpu::TextureViewDescriptor::default());
         let ov = output.create_view(&wgpu::TextureViewDescriptor::default());
+        let dv = display.create_view(&wgpu::TextureViewDescriptor::default());
 
         let bgl = &self.compute_bgl;
         let curve_buf = &self.curve_buf;
@@ -901,6 +1063,20 @@ impl Processor {
         let sharpen_bg = make_bg(&t2v, &t3v, &self.sharpen_buf);
         let blur_h_bg = make_bg(&t3v, &t4v, &self.blur_buf);
         let blur_vert_bg = make_bg(&t4v, &ov, &self.blur_buf);
+        let display_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.display_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&ov),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&dv),
+                },
+            ],
+        });
 
         let (w, h) = self.image_size.unwrap();
         let wg = (w.div_ceil(8), h.div_ceil(8));
@@ -917,18 +1093,20 @@ impl Processor {
         dispatch(&self.sharpen_pipeline, &sharpen_bg);
         dispatch(&self.blur_h_pipeline, &blur_h_bg);
         dispatch(&self.blur_v_pipeline, &blur_vert_bg);
+        dispatch(&self.display_pipeline, &display_bg);
         queue.submit([encoder.finish()]);
 
-        // Separate submission: blur_v write must be visible before histogram reads.
-        self.read_histogram(device, queue, &ov, w, h);
+        // Separate submission: display write must be visible before histogram reads.
+        self.read_histogram(device, queue, &dv, w, h);
     }
 
     // Read the rendered output back to CPU RGBA8 bytes, synchronously. Used
     // where the caller needs the *actual* rendered pixels rather than the
     // edit sliders — e.g. capturing a look, since an AI-adjusted photo keeps
-    // its whole look in the LUT, not in any slider value.
+    // its whole look in the LUT, not in any slider value.  Reads the 8-bit
+    // display copy (what the user sees).
     pub fn output_pixels(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Vec<u8>> {
-        let (output, (width, height)) = (self.output_tex.as_ref()?, self.image_size?);
+        let (display, (width, height)) = (self.display_tex.as_ref()?, self.image_size?);
 
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let bytes_per_row = (width * 4).div_ceil(align) * align;
@@ -942,7 +1120,7 @@ impl Processor {
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_texture_to_buffer(
-            output.as_image_copy(),
+            display.as_image_copy(),
             wgpu::ImageCopyBuffer {
                 buffer: &staging,
                 layout: wgpu::ImageDataLayout {
@@ -979,12 +1157,10 @@ impl Processor {
             out
         };
         staging.unmap();
-        // The processing shaders read/write display-space normalized RGB in
-        // their Rgba8Unorm storage textures. A texture copy is therefore
-        // already in the same byte space used by the UI and image crate.
         Some(pixels)
     }
 
+    // Export the half-float result as a 16-bit sRGB PNG (gamma-encoded u16).
     pub fn export(&self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) {
         let (Some(output), Some((width, height))) = (self.output_tex.as_ref(), self.image_size)
         else {
@@ -992,7 +1168,7 @@ impl Processor {
         };
 
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let bytes_per_row = (width * 4).div_ceil(align) * align;
+        let bytes_per_row = (width * 8).div_ceil(align) * align;
 
         let staging = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -1030,13 +1206,18 @@ impl Processor {
             return;
         }
 
-        // Copy pixel data out of the mapped range so we can unmap before the file write
-        let pixels: Vec<u8> = {
+        // Half-float RGBA -> gamma-encoded u16 RGBA (values are 0..1).
+        let pixels: Vec<u16> = {
             let data = slice.get_mapped_range();
             let mut out = Vec::with_capacity((width * height * 4) as usize);
             for row in 0..height {
                 let start = (row * bytes_per_row) as usize;
-                out.extend_from_slice(&data[start..start + (width * 4) as usize]);
+                let row_bytes = &data[start..start + (width * 8) as usize];
+                for channel in row_bytes.chunks_exact(2) {
+                    let bits = u16::from_le_bytes([channel[0], channel[1]]);
+                    let value = f16::from_bits(bits).to_f32();
+                    out.push((value.clamp(0.0, 1.0) * 65535.0).round() as u16);
+                }
             }
             out
         };
@@ -1045,7 +1226,11 @@ impl Processor {
         // File I/O on a background thread so the main thread is unblocked
         let path = path.to_owned();
         std::thread::spawn(move || {
-            if let Some(img) = image::RgbaImage::from_raw(width, height, pixels) {
+            if let Some(img) = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(
+                width,
+                height,
+                pixels,
+            ) {
                 img.save(path).ok();
             }
         });
@@ -1668,6 +1853,13 @@ pub fn baked_lut(state: &EditState) -> Option<Vec<f32>> {
 fn photo_lut_enabled(state: &EditState) -> bool {
     state.ai_lut_enabled || state.raw_development.is_some() || !state.look.is_empty()
 }
+
+
+
+
+
+
+
 
 #[cfg(test)]
 mod tests {

@@ -806,6 +806,23 @@ pub fn develop_raw(path: &Path, max_dim: u32, curve: &SCurve) -> Option<RgbaImag
     Some(to_rgba(&oriented))
 }
 
+/// Like `develop_raw`, but gamma-encoded 16-bit RGBA (u16 per channel) so the
+/// sensor's precision survives into the 16-bit editor input.  Returns
+/// `(width, height, pixels)`.
+pub fn develop_raw_u16(path: &Path, max_dim: u32, curve: &SCurve) -> Option<(u32, u32, Vec<u16>)> {
+    let linear = develop_linear(path, max_dim)?;
+    let tone = apply_s_curve(&linear, curve);
+    let oriented = apply_orientation(&tone, tone.orientation);
+    let mut pixels = Vec::with_capacity(oriented.width as usize * oriented.height as usize * 4);
+    for value in oriented.data.chunks_exact(3) {
+        for &v in value {
+            pixels.push((srgb_encode(v.clamp(0.0, 1.0)) * 65535.0).round() as u16);
+        }
+        pixels.push(65535);
+    }
+    Some((oriented.width, oriented.height, pixels))
+}
+
 /// Apply the S-curve hue-preservingly: exposure-normalize each pixel's luma by
 /// the anchor (median linear luminance), map through the curve, and scale RGB
 /// by `display / luma` so the output keeps hue and lands on the curve's luma.
@@ -1125,6 +1142,36 @@ mod tests {
             let oriented = apply_orientation(&pattern, orientation);
             assert_eq!(to_rows(&oriented), expected, "{orientation:?}");
         }
+    }
+
+    #[test]
+    fn u16_develop_matches_8bit_develop() {
+        let path = Path::new(
+            "/Users/jakubkolcar/Downloads/PXL_20260806_114652240.RAW-02.ORIGINAL.dng",
+        );
+        if !path.exists() {
+            return;
+        }
+        let curve = SCurve::load().unwrap();
+        let dev8 = develop_raw(path, 512, &curve).unwrap();
+        let (w, h, pixels) = develop_raw_u16(path, 512, &curve).unwrap();
+        assert_eq!((w, h), dev8.dimensions());
+        assert_eq!(pixels.len(), (w * h * 4) as usize);
+        // u16 output is the same srgb-encoded value at 16-bit resolution.
+        let mut checked = 0;
+        for (pixel, px16) in dev8.pixels().zip(pixels.chunks_exact(4)) {
+            for channel in 0..3 {
+                let expected = u32::from(pixel[channel]) * 257;
+                let actual = u32::from(px16[channel]);
+                assert!(
+                    actual.abs_diff(expected) <= 257,
+                    "u16 develop diverges at {channel}: {actual} vs {expected}"
+                );
+            }
+            assert_eq!(px16[3], 65535);
+            checked += 1;
+        }
+        assert!(checked > 1000);
     }
 
     #[test]
