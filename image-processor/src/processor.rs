@@ -715,7 +715,11 @@ impl Processor {
         // the full 16-bit data.
         let source_pixels: Vec<u8> = pixels
             .chunks_exact(4)
-            .flat_map(|p| [p[0] as u8, p[1] as u8, p[2] as u8, p[3] as u8])
+            .flat_map(|p| {
+                // Scale 16-bit -> 8-bit; low-byte truncation would show e.g.
+                // 0xC800 (78% white) as black.
+                [p[0], p[1], p[2], p[3]].map(|v| (u32::from(v) * 255 / 65535) as u8)
+            })
             .collect();
         queue.write_texture(
             source_tex.as_image_copy(),
@@ -1853,6 +1857,9 @@ pub fn baked_lut(state: &EditState) -> Option<Vec<f32>> {
 fn photo_lut_enabled(state: &EditState) -> bool {
     state.ai_lut_enabled || state.raw_development.is_some() || !state.look.is_empty()
 }
+
+
+
 
 
 
