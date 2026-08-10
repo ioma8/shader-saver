@@ -1024,8 +1024,13 @@ impl App {
         processor.upload_rgba(&img, &gpu.device, &gpu.queue);
         if state.raw_isp_enabled && imgload::is_raw(path) {
             if let Some(curve) = self.s_curve.as_ref() {
-                if let Some((w, h, pixels)) = raw_develop::develop_raw_u16(path, 2048, curve) {
-                    processor.replace_input_u16(w, h, &pixels, &gpu.queue);
+                if let Some(developed) = raw_develop::develop_raw_u16(path, 2048, curve) {
+                    processor.replace_input_u16(
+                        developed.width(),
+                        developed.height(),
+                        developed.as_raw(),
+                        &gpu.queue,
+                    );
                 }
             }
         }
@@ -1149,8 +1154,13 @@ impl App {
                                     let max_dim = proc
                                         .image_size
                                         .map_or(2048, |(w, h)| w.max(h));
-                                    if let Some((w, h, pixels)) = raw_develop::develop_raw_u16(path, max_dim, curve) {
-                                        proc.replace_input_u16(w, h, &pixels, &gpu.queue);
+                                    if let Some(developed) = raw_develop::develop_raw_u16(path, max_dim, curve) {
+                                        proc.replace_input_u16(
+                                            developed.width(),
+                                            developed.height(),
+                                            developed.as_raw(),
+                                            &gpu.queue,
+                                        );
                                     }
                                 }
                             }
@@ -2927,12 +2937,17 @@ impl App {
                         .map_or_else(|| "<none>".to_string(), |p| p.display().to_string())
                 );
             }
-            if let (Some(processor), Some(gpu), Some((w, h, pixels))) =
+            if let (Some(processor), Some(gpu), Some(developed)) =
                 (self.processor.as_mut(), self.gpu.as_ref(), development)
             {
                 processor.raw_isp_enabled = true;
                 processor.raw_development = None;
-                processor.replace_input_u16(w, h, &pixels, &gpu.queue);
+                processor.replace_input_u16(
+                    developed.width(),
+                    developed.height(),
+                    developed.as_raw(),
+                    &gpu.queue,
+                );
                 needs_process = true;
             }
         }

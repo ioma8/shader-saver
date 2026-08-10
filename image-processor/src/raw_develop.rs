@@ -203,9 +203,10 @@ fn develop_from_raw(raw: &RawImage, max_dim: u32, path: &Path) -> Option<LinearI
 }
 
 /// The DNG's as-shot white balance as WB multipliers (inverse of the
-/// AsShotNeutral values).  kamadak-exif re-reads the file, which is cheap next
-/// to the rawloader decode itself.  Returns None when the tag is absent;
-/// callers treat a flat (1,1,1) placeholder the same way.
+/// AsShotNeutral values).  kamadak-exif re-reads the whole file, which is a
+/// few tens of ms per image next to the rawloader decode itself.
+/// # ponytail: full-file re-read per develop; switch to a header-only IFD0
+/// scan if batch work (the 46-pair fit) ever grows past a few seconds.
 fn dng_as_shot_neutral(path: &Path) -> Option<[f32; 4]> {
     let file = std::fs::File::open(path).ok()?;
     let exif = exif::Reader::new()
@@ -239,14 +240,17 @@ fn dng_as_shot_neutral(path: &Path) -> Option<[f32; 4]> {
 /// the as-shot white balance's neutral to sRGB D65 white, matching what the
 /// phone's JPEGs do.  The raw pseudoinverse alone would not even keep the
 /// neutral axis neutral for cameras whose ColorMatrix is not row-balanced.
+// Canonical sRGB/XYZ matrices — the literal digits document the standard
+// values (Lindbloom); truncating them changes nothing numerically.
+#[allow(clippy::excessive_precision)]
 fn camera_to_srgb_matrix(raw: &RawImage) -> [[f32; 3]; 3] {
     const XYZ_TO_SRGB: [[f32; 3]; 3] = [
-        [3.2404542, -1.5371385, -0.4985314],
-        [-0.9692660, 1.8760108, 0.0415560],
-        [0.0556434, -0.2040259, 1.0572252],
+        [3.2404542f32, -1.5371385f32, -0.4985314f32],
+        [-0.9692660f32, 1.8760108f32, 0.0415560f32],
+        [0.0556434f32, -0.2040259f32, 1.0572252f32],
     ];
     // D65 white point (Y = 1), used to reference camera-neutral to sRGB white.
-    const D65_WHITE: [f32; 3] = [0.9504559, 1.0, 1.088754];
+    const D65_WHITE: [f32; 3] = [0.9504559f32, 1.0f32, 1.088754f32];
     let cam_to_xyz = raw.cam_to_xyz_normalized(); // rows=XYZ, cols=RGB(E)
     let mut out = [[0.0f32; 3]; 3];
     for row in 0..3 {
@@ -337,12 +341,12 @@ fn malvar(plane: &[f32], width: usize, height: usize, cfa: &rawloader::CFA) -> V
     let mut row_blue = vec![false; height];
     let mut col_red = vec![false; width];
     let mut col_blue = vec![false; width];
-    for y in 0..height {
-        for x in 0..width {
+    for (y, row) in row_red.iter_mut().enumerate() {
+        for (x, col) in col_red.iter_mut().enumerate() {
             match cfa.color_at(y, x) {
                 0 => {
-                    row_red[y] = true;
-                    col_red[x] = true;
+                    *row = true;
+                    *col = true;
                 }
                 2 => {
                     row_blue[y] = true;
@@ -354,6 +358,9 @@ fn malvar(plane: &[f32], width: usize, height: usize, cfa: &rawloader::CFA) -> V
     }
 
     let mut out = vec![0.0f32; width * height * 3];
+    // Flat-buffer indexing (i = y * width + x) plus per-coordinate CFA lookup;
+    // clippy's enumerate rewrite would break both.
+    #[allow(clippy::needless_range_loop)]
     for y in 0..height {
         for x in 0..width {
             let i = y * width + x;
@@ -557,6 +564,24 @@ pub fn to_rgba(image: &LinearImage) -> RgbaImage {
     out
 }
 
+/// 16-bit gamma-encoded RGBA image (dimensions and pixels travel together).
+pub type Rgba16Image = image::ImageBuffer<image::Rgba<u16>, Vec<u16>>;
+
+/// Convert a linear RGB image to a 16-bit sRGB RGBA image, clipping at 1.0.
+/// RAW development feeds this to the editor so the sensor's precision
+/// survives past the 8-bit boundary.
+pub fn to_rgba16(image: &LinearImage) -> Rgba16Image {
+    let mut out = Rgba16Image::new(image.width, image.height);
+    for (pixel, value) in out.pixels_mut().zip(image.data.chunks_exact(3)) {
+        for channel in 0..3 {
+            pixel[channel] =
+                (srgb_encode(value[channel].clamp(0.0, 1.0)) * 65535.0).round() as u16;
+        }
+        pixel[3] = 65535;
+    }
+    out
+}
+
 /// Decode one sRGB-encoded component to linear light (inverse of `srgb_encode`).
 pub fn srgb_decode(value: f32) -> f32 {
     if value <= 0.04045 {
@@ -640,7 +665,9 @@ impl SCurve {
     /// curve's domain.  Used for exposure compensation (place the image
     /// median at a predicted display value).
     pub fn inverse_x(&self, y: f32) -> f32 {
-        let last = self.points[self.points.len() - 1];
+        let Some(last) = self.points.last().copied() else {
+            return 0.0;
+        };
         if y >= last[1] {
             return last[0];
         }
@@ -796,31 +823,24 @@ pub fn fit_s_curve(folder: &Path, output: &Path) -> Result<usize, String> {
 
 // --- Development ------------------------------------------------------------
 
-/// Fully develop a RAW file to an 8-bit sRGB RGBA image: linear development,
-/// exposure-normalized S-curve, then the file's EXIF orientation (so the
-/// result matches the camera's pre-oriented JPEG).
-pub fn develop_raw(path: &Path, max_dim: u32, curve: &SCurve) -> Option<RgbaImage> {
+/// Fully develop a RAW file: linear development, exposure-normalized
+/// S-curve, then the file's EXIF orientation (so the result matches the
+/// camera's pre-oriented JPEG).  Shared by the 8-bit and 16-bit encoders.
+fn develop_toned(path: &Path, max_dim: u32, curve: &SCurve) -> Option<LinearImage> {
     let linear = develop_linear(path, max_dim)?;
     let tone = apply_s_curve(&linear, curve);
-    let oriented = apply_orientation(&tone, tone.orientation);
-    Some(to_rgba(&oriented))
+    Some(apply_orientation(&tone, tone.orientation))
 }
 
-/// Like `develop_raw`, but gamma-encoded 16-bit RGBA (u16 per channel) so the
-/// sensor's precision survives into the 16-bit editor input.  Returns
-/// `(width, height, pixels)`.
-pub fn develop_raw_u16(path: &Path, max_dim: u32, curve: &SCurve) -> Option<(u32, u32, Vec<u16>)> {
-    let linear = develop_linear(path, max_dim)?;
-    let tone = apply_s_curve(&linear, curve);
-    let oriented = apply_orientation(&tone, tone.orientation);
-    let mut pixels = Vec::with_capacity(oriented.width as usize * oriented.height as usize * 4);
-    for value in oriented.data.chunks_exact(3) {
-        for &v in value {
-            pixels.push((srgb_encode(v.clamp(0.0, 1.0)) * 65535.0).round() as u16);
-        }
-        pixels.push(65535);
-    }
-    Some((oriented.width, oriented.height, pixels))
+/// Fully develop a RAW file to an 8-bit sRGB RGBA image.
+pub fn develop_raw(path: &Path, max_dim: u32, curve: &SCurve) -> Option<RgbaImage> {
+    develop_toned(path, max_dim, curve).map(|oriented| to_rgba(&oriented))
+}
+
+/// Like `develop_raw`, but gamma-encoded 16-bit RGBA so the sensor's
+/// precision survives into the 16-bit editor input.
+pub fn develop_raw_u16(path: &Path, max_dim: u32, curve: &SCurve) -> Option<Rgba16Image> {
+    develop_toned(path, max_dim, curve).map(|oriented| to_rgba16(&oriented))
 }
 
 /// Apply the S-curve hue-preservingly: exposure-normalize each pixel's luma by
@@ -1154,12 +1174,11 @@ mod tests {
         }
         let curve = SCurve::load().unwrap();
         let dev8 = develop_raw(path, 512, &curve).unwrap();
-        let (w, h, pixels) = develop_raw_u16(path, 512, &curve).unwrap();
-        assert_eq!((w, h), dev8.dimensions());
-        assert_eq!(pixels.len(), (w * h * 4) as usize);
+        let dev16 = develop_raw_u16(path, 512, &curve).unwrap();
+        assert_eq!(dev16.dimensions(), dev8.dimensions());
         // u16 output is the same srgb-encoded value at 16-bit resolution.
         let mut checked = 0;
-        for (pixel, px16) in dev8.pixels().zip(pixels.chunks_exact(4)) {
+        for (pixel, px16) in dev8.pixels().zip(dev16.pixels()) {
             for channel in 0..3 {
                 let expected = u32::from(pixel[channel]) * 257;
                 let actual = u32::from(px16[channel]);
