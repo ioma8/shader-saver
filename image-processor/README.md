@@ -17,10 +17,11 @@ images.
   demosaic swaps in shortly after if you stay on that image
 - **RAW development** — the "Develop RAW" button re-renders the DNG with a
   small, deterministic pipeline: rawloader decode (crop, black/white level,
-  as-shot white balance, demosaic, camera→sRGB matrix) followed by one global
-  phone S-curve fitted from 46 Pixel DNG/JPEG pairs
-  (`models/raw_s_curve.json`, a few KB), with each image auto-exposed to the
-  median linear luminance before the curve. No neural network. Refit the
+  as-shot white balance, demosaic, camera→sRGB matrix) followed by a compact
+  phone tone/color model fitted from 46 Pixel DNG/JPEG pairs
+  (`models/raw_s_curve.json`, 33 KB). It matches new images to nearby RAW
+  histogram shapes for scene-adaptive exposure, contrast, and white balance,
+  then applies fitted chroma, local-contrast, and detail rendering. No neural network. Refit the
   curve with `cargo run --release -- --fit-raw-scurve <folder>`
 - **Adjustments** — white balance (temp/tint), exposure (stops),
   brightness (Capture One-style midtone bias), contrast (logistic S-curve),
