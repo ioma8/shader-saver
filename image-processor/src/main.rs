@@ -1215,9 +1215,14 @@ impl App {
             }
             if self.current_path.as_deref() == Some(path.as_path()) {
                 if let (Some(gpu), Some(processor)) = (self.gpu.as_ref(), self.processor.as_mut()) {
-                    processor.upload_rgba(&img, &gpu.device, &gpu.queue);
-                    self.rebind_image_textures();
-                    self.flags.output_dirty = true;
+                    // A developed RAW's input is the 16-bit develop result; the
+                    // full-res imagepipe render is 8-bit and would clobber it,
+                    // so keep the developed input for those.
+                    if !(processor.raw_isp_enabled && imgload::is_raw(&path)) {
+                        processor.upload_rgba(&img, &gpu.device, &gpu.queue);
+                        self.rebind_image_textures();
+                        self.flags.output_dirty = true;
+                    }
                 }
             }
         }
