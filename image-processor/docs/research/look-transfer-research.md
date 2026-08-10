@@ -1,10 +1,19 @@
 # Research: reliable reference-conditioned look transfer
 
 > Historical research input, not a current-state architecture description.
-> The implemented application uses one constrained profile-conditioned model,
-> trained from valid cross-content synthetic grades and GUI-approved examples,
-> then applies its result through one LUT. See
+> The implemented application uses CanonCGT canonicalize/restylize inference as
+> its primary path and blends it with a constrained profile-conditioned fallback
+> trained from synthetic grades and GUI-approved examples. See
+> [`src/canoncgt.rs`](../../src/canoncgt.rs) and
 > [`src/look_model.rs`](../../src/look_model.rs).
+
+Implementation update (2026-08-10): the runtime now embeds CanonCGT's official
+self-supervised checkpoint rather than the earlier end-to-end checkpoint. A
+reproducible LUT-only exporter lives at
+[`tools/export_canoncgt.py`](../../tools/export_canoncgt.py). We deliberately did
+not fine-tune on a small collection of unrelated JPEGs: without known desired
+outputs they provide no valid look-transfer labels and can teach the model to
+confuse scene content or camera processing with the requested grade.
 
 Date: 2026-08-08
 

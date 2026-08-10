@@ -40,9 +40,12 @@ images.
   natural cubic spline, applied as a 256-entry LUT
 - **Auto** — one-click auto levels, brightness, contrast,
   shadows/highlights from the histogram
-- **Reference look transfer** — capture a finished photo's look, apply it to
-  RAW or standard images through one constrained model, and teach the model
-  from approved edits directly in the editor
+- **Reference look transfer** — CanonCGT canonicalizes the target's existing
+  exposure/illumination and restylizes it with a finished reference's grade as
+  one smooth 33³ LUT; the self-supervised checkpoint uses a 448px intermediate
+  to preserve the canonicalized color mixtures before restyling, while a
+  constrained profile model and approved edits provide a safe fallback and
+  personalization for RAW or standard images
 - **Persistent edits** — every image's edit state is saved to SQLite
   (`~/.image-processor/edits.db`) and restored when reopened;
   Reset All Edits reverts to defaults

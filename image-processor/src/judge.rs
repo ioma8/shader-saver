@@ -126,6 +126,7 @@ mod tests {
             .map(|dir| crate::look_model::load_examples(&crate::existing_look_examples_path(&dir)))
             .unwrap_or_default();
         let model = crate::look_model::LookModel::train_with_examples(&examples);
+        let canon = crate::canoncgt::CanonCgt::load();
         let started = std::time::Instant::now();
         let target = load(&tp);
         let faces = detector
@@ -133,7 +134,14 @@ mod tests {
             .map(|d| d.detect_boxes(&target))
             .unwrap_or_default();
         let mut state = EditState::default();
-        look_chain_for(&target, &mut state, &captured, &model, &faces);
+        look_chain_for(
+            &target,
+            &mut state,
+            &captured,
+            &model,
+            canon.as_ref(),
+            &faces,
+        );
         let Some(lut) = baked_lut(&state) else {
             panic!("look model did not produce a LUT")
         };
@@ -229,6 +237,7 @@ mod tests {
             return;
         };
         let model = crate::look_model::LookModel::train();
+        let canon = crate::canoncgt::CanonCgt::load();
         let detector = Detector::load();
 
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -273,7 +282,14 @@ mod tests {
                     .map(|d| d.detect_boxes(target))
                     .unwrap_or_default();
                 let mut state = EditState::default();
-                look_chain_for(target, &mut state, &captured, &model, &faces);
+                look_chain_for(
+                    target,
+                    &mut state,
+                    &captured,
+                    &model,
+                    canon.as_ref(),
+                    &faces,
+                );
                 let Some(lut) = baked_lut(&state) else {
                     continue;
                 };

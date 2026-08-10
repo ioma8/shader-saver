@@ -36,13 +36,43 @@ pub fn load_preview_rgba(path: &Path, max_dim: u32) -> Option<image::RgbaImage> 
         FindJpegType::Largest
     };
     let bytes = pollster::block_on(jpgfromraw::process_file_bytes(path, find_type)).ok()?;
-    let image = image::load_from_memory(&bytes).ok()?;
+    let image = orient_preview(
+        image::load_from_memory(&bytes).ok()?,
+        exif_orientation(path),
+    );
     let image = if max_dim > 0 {
         image.thumbnail(max_dim, max_dim)
     } else {
         image
     };
     Some(image.to_rgba8())
+}
+
+fn exif_orientation(path: &Path) -> u32 {
+    let Ok(file) = std::fs::File::open(path) else {
+        return 1;
+    };
+    exif::Reader::new()
+        .read_from_container(&mut std::io::BufReader::new(file))
+        .ok()
+        .and_then(|exif| {
+            exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
+                .and_then(|field| field.value.get_uint(0))
+        })
+        .unwrap_or(1)
+}
+
+fn orient_preview(image: image::DynamicImage, orientation: u32) -> image::DynamicImage {
+    match orientation {
+        2 => image.fliph(),
+        3 => image.rotate180(),
+        4 => image.flipv(),
+        5 => image.fliph().rotate270(),
+        6 => image.rotate90(),
+        7 => image.fliph().rotate90(),
+        8 => image.rotate270(),
+        _ => image,
+    }
 }
 
 pub fn load_edit_rgba(path: &Path) -> Option<(image::RgbaImage, bool)> {
@@ -80,8 +110,40 @@ pub fn load_rgba(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
 
 #[cfg(test)]
 mod tests {
-    use super::load_rgba;
+    use super::{is_raw, load_preview_rgba, load_rgba};
     use std::path::Path;
+
+    #[test]
+    fn raw_browse_previews_match_editor_orientation() {
+        let Ok(folder) = std::env::var("RAW_PREVIEW_FOLDER") else {
+            return;
+        };
+        let mut checked = 0;
+        for path in std::fs::read_dir(folder)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| is_raw(path))
+            .take(200)
+        {
+            let (Some(preview), Some(editor)) =
+                (load_preview_rgba(&path, 220), load_rgba(&path, 220))
+            else {
+                continue;
+            };
+            assert_eq!(
+                preview.width() > preview.height(),
+                editor.width() > editor.height(),
+                "{}: preview {}x{}, editor {}x{}",
+                path.display(),
+                preview.width(),
+                preview.height(),
+                editor.width(),
+                editor.height()
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no RAW preview/editor pairs decoded");
+    }
 
     #[test]
     fn raw_and_jpeg_are_decoded_from_their_real_pixels() {

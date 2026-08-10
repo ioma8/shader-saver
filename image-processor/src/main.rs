@@ -1,3 +1,4 @@
+mod canoncgt;
 mod classify;
 mod cull;
 mod enhance;
@@ -205,6 +206,7 @@ fn look_chain_for(
     state: &mut EditState,
     look: &CapturedLook,
     model: &look_model::LookModel,
+    canon: Option<&canoncgt::CanonCgt>,
     faces: &[[f32; 4]],
 ) {
     if let Some(current) =
@@ -212,12 +214,32 @@ fn look_chain_for(
     {
         state.ai_lut_enabled = false;
         state.look = vec![model.predict(&current, &look.profile)];
+        if let Some(canon) = canon {
+            let fallback =
+                processor::baked_lut(state).unwrap_or_else(processor::identity_photo_lut);
+            if let Some(lut) = canon.predict_lut(img, &look.reference_full, &fallback) {
+                state.look.clear();
+                state.look_lut = Some(lut);
+            }
+        }
     }
 }
 
 // Downscale for the judge, which works at 512 square regardless.
 fn look_reference_thumb(img: &image::RgbaImage) -> image::RgbaImage {
     image::imageops::thumbnail(img, 512, 512)
+}
+
+fn load_look_input(
+    path: &Path,
+    curve: Option<&raw_develop::SCurve>,
+    max_dim: u32,
+) -> Option<image::RgbaImage> {
+    if imgload::is_raw(path) {
+        raw_develop::develop_raw(path, max_dim, curve?)
+    } else {
+        imgload::load_rgba(path, max_dim)
+    }
 }
 
 fn load_bool_pref(conn: &rusqlite::Connection, key: &str, default: bool) -> bool {
@@ -554,6 +576,7 @@ struct App {
     look: Option<Arc<CapturedLook>>,
     face_detector: Option<Arc<face::Detector>>,
     look_model: Arc<look_model::LookModel>,
+    canon: Option<Arc<canoncgt::CanonCgt>>,
     look_examples: Vec<look_model::TrainingExample>,
     s_curve: Option<Arc<raw_develop::SCurve>>,
     similar_tx: std::sync::mpsc::Sender<(PathBuf, Option<similar::Analysis>)>,
@@ -658,6 +681,7 @@ impl App {
             look,
             face_detector: face::Detector::load().map(Arc::new),
             look_model: Arc::new(look_model::LookModel::train_with_examples(&look_examples)),
+            canon: canoncgt::CanonCgt::load().map(Arc::new),
             look_examples,
             s_curve: raw_develop::SCurve::load().map(Arc::new),
             similar_tx,
@@ -865,6 +889,7 @@ impl App {
         self.adjust_progress = Some((0, paths.len()));
         let detector = self.face_detector.clone();
         let look_model = self.look_model.clone();
+        let canon = self.canon.clone();
         let s_curve = self.s_curve.clone();
         // Workers have no GPU context, so each renders its own preview on the CPU
         // to derive the transfer. The LUT stage is everything a look-transferred
@@ -874,17 +899,23 @@ impl App {
             let img = if imgload::is_raw(path) {
                 // Develop straight from the RAW file; the imagepipe render is
                 // only an open preview and would stack its own tone curve.
-                let curve = s_curve.as_ref()?;
                 state.raw_isp_enabled = true;
-                raw_develop::develop_raw(path, 768, curve)?
+                load_look_input(path, s_curve.as_deref(), 768)?
             } else {
-                imgload::load_rgba(path, 768)?
+                load_look_input(path, None, 768)?
             };
             let faces = detector
                 .as_ref()
                 .map(|d| d.detect_boxes(&img))
                 .unwrap_or_default();
-            look_chain_for(&img, &mut state, &look, look_model.as_ref(), &faces);
+            look_chain_for(
+                &img,
+                &mut state,
+                &look,
+                look_model.as_ref(),
+                canon.as_deref(),
+                &faces,
+            );
             Some(state)
         };
         spawn_folder_workers(paths, work, self.adjust_tx.clone());
@@ -1025,12 +1056,17 @@ impl App {
         if state.raw_isp_enabled && imgload::is_raw(path) {
             if let Some(curve) = self.s_curve.as_ref() {
                 if let Some(developed) = raw_develop::develop_raw_u16(path, 2048, curve) {
-                    processor.replace_input_u16(
+                    if processor.replace_input_u16(
                         developed.width(),
                         developed.height(),
                         developed.as_raw(),
                         &gpu.queue,
-                    );
+                    ) {
+                        // `upload_rgba` processed the temporary embedded preview.
+                        // Render the restored edits again after swapping in the
+                        // persisted RAW development input.
+                        processor.process(&gpu.device, &gpu.queue);
+                    }
                 }
             }
         }
@@ -1151,10 +1187,10 @@ impl App {
                         if state.raw_isp_enabled {
                             if let Some(path) = self.current_path.as_deref() {
                                 if let Some(curve) = self.s_curve.as_ref() {
-                                    let max_dim = proc
-                                        .image_size
-                                        .map_or(2048, |(w, h)| w.max(h));
-                                    if let Some(developed) = raw_develop::develop_raw_u16(path, max_dim, curve) {
+                                    let max_dim = proc.image_size.map_or(2048, |(w, h)| w.max(h));
+                                    if let Some(developed) =
+                                        raw_develop::develop_raw_u16(path, max_dim, curve)
+                                    {
                                         proc.replace_input_u16(
                                             developed.width(),
                                             developed.height(),
@@ -2880,7 +2916,7 @@ impl App {
                 let look = self.look.as_ref()?;
                 let proc = self.processor.as_ref()?;
                 let gpu = self.gpu.as_ref()?;
-                let target = imgload::load_rgba(path, 768)?;
+                let target = load_look_input(path, self.s_curve.as_deref(), 768)?;
                 let faces = self
                     .face_detector
                     .as_ref()
@@ -3335,10 +3371,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_bool_pref, load_look, look_reference_thumb, move_file, save_bool_pref, save_look,
-        CapturedLook,
+        load_bool_pref, load_edits, load_look, look_reference_thumb, move_file, save_bool_pref,
+        save_edits, save_look, CapturedLook,
     };
-    use crate::processor::LookProfile;
+    use crate::processor::{EditState, LookProfile};
+
+    #[test]
+    fn raw_development_and_applied_look_round_trip_through_database() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE edits (
+                path    TEXT PRIMARY KEY,
+                params  TEXT NOT NULL,
+                updated INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        let path = std::path::Path::new("/photos/image.dng");
+        let state = EditState {
+            raw_isp_enabled: true,
+            raw_development: Some(vec![0.0, 0.25, 0.5, 0.75, 1.0]),
+            look_lut: Some(vec![1.0, 0.8, 0.6, 0.4, 0.2, 0.0]),
+            look_strength: 0.73,
+            ..Default::default()
+        };
+
+        save_edits(&conn, path, &state);
+        let restored = load_edits(&conn, path).expect("saved edit state");
+
+        assert!(restored.raw_isp_enabled);
+        assert_eq!(restored.raw_development, state.raw_development);
+        assert_eq!(restored.look_lut, state.look_lut);
+        assert_eq!(restored.look_strength, state.look_strength);
+    }
 
     #[test]
     fn captured_look_round_trips_through_the_database() {

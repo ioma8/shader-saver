@@ -1,5 +1,5 @@
-use std::path::Path;
 use half::f16;
+use std::path::Path;
 
 #[repr(align(4))]
 struct AlignedPhotoLuts([u8; 1_293_732]);
@@ -87,6 +87,8 @@ pub struct EditState {
     pub raw_development: Option<Vec<f32>>,
     // The constrained model's captured-look transform.
     pub look: Vec<LookTransfer>,
+    // Reference-conditioned canonicalize/restylize transform.
+    pub look_lut: Option<Vec<f32>>,
     pub look_strength: f32,
 }
 
@@ -119,6 +121,7 @@ impl Default for EditState {
             raw_isp_enabled: false,
             raw_development: None,
             look: Vec::new(),
+            look_lut: None,
             look_strength: 1.0,
         }
     }
@@ -140,11 +143,11 @@ pub struct Processor {
     input_tex: Option<wgpu::Texture>,
     source_tex: Option<wgpu::Texture>,
     source_image: Option<image::RgbaImage>,
-    tex1: Option<wgpu::Texture>,       // contrast output
-    tex2: Option<wgpu::Texture>,       // tonal output
-    tex3: Option<wgpu::Texture>,       // sharpen output
-    tex4: Option<wgpu::Texture>,       // blur_h output
-    output_tex: Option<wgpu::Texture>, // blur_v output (final, half-float)
+    tex1: Option<wgpu::Texture>,        // contrast output
+    tex2: Option<wgpu::Texture>,        // tonal output
+    tex3: Option<wgpu::Texture>,        // sharpen output
+    tex4: Option<wgpu::Texture>,        // blur_h output
+    output_tex: Option<wgpu::Texture>,  // blur_v output (final, half-float)
     display_tex: Option<wgpu::Texture>, // 8-bit sRGB copy for the UI
 
     contrast_buf: wgpu::Buffer,
@@ -188,6 +191,7 @@ pub struct Processor {
     pub raw_isp_enabled: bool,
     pub raw_development: Option<Vec<f32>>,
     pub look: Vec<LookTransfer>,
+    pub look_lut: Option<Vec<f32>>,
     pub look_strength: f32,
 }
 
@@ -367,11 +371,13 @@ impl Processor {
         let display_bgl = create_display_bgl(device);
         let display_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
-            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[&display_bgl],
-                push_constant_ranges: &[],
-            })),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[&display_bgl],
+                    push_constant_ranges: &[],
+                }),
+            ),
             module: &shader,
             entry_point: "display_pass",
             compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -472,6 +478,7 @@ impl Processor {
             raw_isp_enabled: false,
             raw_development: None,
             look: Vec::new(),
+            look_lut: None,
             look_strength: 1.0,
         }
     }
@@ -567,6 +574,7 @@ impl Processor {
             raw_isp_enabled: self.raw_isp_enabled,
             raw_development: self.raw_development.clone(),
             look: self.look.clone(),
+            look_lut: self.look_lut.clone(),
             look_strength: self.look_strength,
         }
     }
@@ -602,6 +610,7 @@ impl Processor {
         self.raw_isp_enabled = s.raw_isp_enabled;
         self.raw_development = s.raw_development.clone();
         self.look = s.look.clone();
+        self.look_lut = s.look_lut.clone();
         self.look_strength = s.look_strength;
     }
 
@@ -686,7 +695,8 @@ impl Processor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
-        let make_input = |format: wgpu::TextureFormat, view_formats: &'static [wgpu::TextureFormat]| {
+        let make_input = |format: wgpu::TextureFormat,
+                          view_formats: &'static [wgpu::TextureFormat]| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
                 size: wgpu::Extent3d {
@@ -704,7 +714,10 @@ impl Processor {
         };
         // 16-bit integer input (65536 levels) when the device supports it,
         // half-float otherwise; 8-bit sRGB original for display.
-        let source_tex = make_input(wgpu::TextureFormat::Rgba8Unorm, &[wgpu::TextureFormat::Rgba8UnormSrgb]);
+        let source_tex = make_input(
+            wgpu::TextureFormat::Rgba8Unorm,
+            &[wgpu::TextureFormat::Rgba8UnormSrgb],
+        );
         let input_format = if self.input_u16 {
             wgpu::TextureFormat::Rgba16Unorm
         } else {
@@ -811,11 +824,7 @@ impl Processor {
     /// independently, so its dimensions can differ slightly from the editor's
     /// loaded render; it is resized to the input texture instead of being
     /// dropped.
-    pub fn replace_input_rgba(
-        &mut self,
-        img: &image::RgbaImage,
-        queue: &wgpu::Queue,
-    ) -> bool {
+    pub fn replace_input_rgba(&mut self, img: &image::RgbaImage, queue: &wgpu::Queue) -> bool {
         let (width, height) = img.dimensions();
         let pixels: Vec<u16> = img
             .pixels()
@@ -1230,11 +1239,9 @@ impl Processor {
         // File I/O on a background thread so the main thread is unblocked
         let path = path.to_owned();
         std::thread::spawn(move || {
-            if let Some(img) = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(
-                width,
-                height,
-                pixels,
-            ) {
+            if let Some(img) =
+                image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(width, height, pixels)
+            {
                 img.save(path).ok();
             }
         });
@@ -1851,25 +1858,27 @@ pub fn baked_lut(state: &EditState) -> Option<Vec<f32>> {
             None => look_lut,
         });
     }
+    if let Some(predicted) = &state.look_lut {
+        let strength = state.look_strength.clamp(0.0, 1.0);
+        let predicted = if (strength - 1.0).abs() >= 1e-3 {
+            blend_lut(&identity_photo_lut(), predicted, strength)
+        } else {
+            predicted.clone()
+        };
+        lut = Some(match lut {
+            Some(base) => compose_luts(&base, &predicted, 33),
+            None => predicted,
+        });
+    }
     lut
 }
 
 fn photo_lut_enabled(state: &EditState) -> bool {
-    state.ai_lut_enabled || state.raw_development.is_some() || !state.look.is_empty()
+    state.ai_lut_enabled
+        || state.raw_development.is_some()
+        || !state.look.is_empty()
+        || state.look_lut.is_some()
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[cfg(test)]
 mod tests {

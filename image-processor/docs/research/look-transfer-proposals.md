@@ -1,9 +1,10 @@
 # Look-transfer proposals
 
-> Historical design research. The application now uses one constrained
-> profile-conditioned look model for both single-image and folder application;
-> CanonCGT and the deterministic semantic transfer are no longer runtime paths.
-> See [`src/look_model.rs`](../../src/look_model.rs) and
+> Historical design research. The application now uses CanonCGT's
+> canonicalize/restylize LUT as its primary single-image and folder path, with
+> the constrained profile-conditioned model as its fallback and personalization
+> layer. See [`src/canoncgt.rs`](../../src/canoncgt.rs),
+> [`src/look_model.rs`](../../src/look_model.rs), and
 > [`look_chain_for`](../../src/main.rs).
 
 ## Scope
@@ -20,10 +21,26 @@ The implementation already has three relevant pieces:
 - The deterministic fallback derives several conservative Oklab transfer passes and bakes them into a 33³ LUT.
 - CanonCGT is the primary reference-conditioned model. It predicts canonicalize/restylize LUTs, composes them, upsamples to 33³, and applies the result in the existing WGSL shader.
 
+The shipped artifact is the official self-supervised checkpoint, exported by
+[`tools/export_canoncgt.py`](../../tools/export_canoncgt.py) as LUT-only ONNX.
+The exporter replaces the unsupported 5-D grid sampler with primitive
+gather/interpolation operations and verifies its two predicted LUTs against the
+native PyTorch model before writing the artifact. The encoders remain 224px;
+the 448px ONNX input only improves the canonical-LUT render used by the second
+stage.
+
 There are two practical concerns:
 
 1. A release test running one CanonCGT inference takes about 2.14 seconds even with tiny synthetic images. That includes model loading, so warm inference may be lower, but normal image decode, resizing, face detection, profile measurement, and LUT post-processing still consume time.
-2. The comments describe pre-normalizing the target before CanonCGT inference, but [`look_chain_for`](../../src/main.rs:201) passes the original target to `predict_lut_prenormalized`; [`predict_lut_prenormalized`](../../src/canoncgt.rs:132) predicts on that original image and blends the result with the deterministic LUT afterward. This is a design discrepancy worth resolving and benchmarking rather than assuming pre-normalization is helping the network.
+2. A global LUT cannot reproduce spatial relighting, and arbitrary unrelated
+   JPEGs are not valid supervised pairs. Calibration must use target/reference/
+   expected-output triplets or explicit user-approved edits.
+
+The eight official CanonCGT examples are an executable, opt-in regression
+benchmark (`CANONCGT_EXAMPLES=... cargo test benchmark_official_examples
+--release -- --nocapture`). The self-supervised 448px artifact reduced mean RGB
+MAE from 0.06781 for the previous 224px E2E artifact to 0.05990; the production
+blend measured 0.05957. Unchanged targets measured 0.10110.
 
 The current reported quality result—mean style similarity 0.8648 and minimum 0.5218 over 72 ordered pairs—is encouraging, but it does not establish universal reliability across cameras, white balances, exposure gaps, indoor/outdoor scenes, or hard/soft lighting.
 

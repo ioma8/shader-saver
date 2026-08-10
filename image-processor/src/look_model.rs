@@ -24,6 +24,7 @@ pub struct LookModel {
     b1: Vec<f32>,
     w2: Vec<f32>,
     b2: Vec<f32>,
+    examples: Vec<TrainingExample>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -57,6 +58,7 @@ impl LookModel {
             b1: vec![0.0; HIDDEN],
             w2: vec![0.0; OUTPUTS * HIDDEN],
             b2: vec![0.0; OUTPUTS],
+            examples: Vec::new(),
         };
         let mut rng = 0x7f4a_7c15u32;
         for v in &mut net.w1 {
@@ -117,6 +119,7 @@ impl LookModel {
             }
             net.b2[o] = net.b2[o] * scale + bias;
         }
+        net.examples = examples.to_vec();
         net
     }
 
@@ -185,11 +188,69 @@ impl LookModel {
     }
 
     pub fn predict(&self, current: &LookProfile, reference: &LookProfile) -> LookTransfer {
+        let output = self.predict_vector(current, reference);
+        let mut transfer = transfer_from_vector(&output);
+        for band in 0..REGION_COUNT {
+            let evidence = (current.cast_evidence[band].min(reference.cast_evidence[band]) / 0.02)
+                .clamp(0.0, 1.0);
+            transfer.cast_delta[band][0] *= evidence;
+            transfer.cast_delta[band][1] *= evidence;
+        }
+        for sector in 0..8 {
+            let evidence = (current.hue_evidence[sector].min(reference.hue_evidence[sector])
+                / 0.01)
+                .clamp(0.0, 1.0);
+            transfer.hue_chroma_scale[sector] =
+                1.0 + (transfer.hue_chroma_scale[sector] - 1.0) * evidence;
+            transfer.hue_rotate[sector] *= evidence;
+        }
+        transfer
+    }
+
+    fn predict_vector(&self, current: &LookProfile, reference: &LookProfile) -> Vec<f32> {
         let input = profile_pair(current, reference);
         let mut hidden = vec![0.0; HIDDEN];
         let mut output = vec![0.0; OUTPUTS];
         self.forward(&input, &mut hidden, &mut output);
-        transfer_from_vector(&output)
+        let mut nearest: Vec<_> = self
+            .examples
+            .iter()
+            .map(|example| {
+                let lesson_input = profile_pair(&example.current, &example.reference);
+                let distance = (input
+                    .iter()
+                    .zip(&lesson_input)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f32>()
+                    / input.len().max(1) as f32)
+                    .sqrt();
+                (distance, example, lesson_input)
+            })
+            .collect();
+        nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let confidence = nearest.first().map_or(0.0, |(distance, ..)| {
+            (1.0 - distance / 0.35).clamp(0.0, 1.0)
+        });
+        if confidence <= 0.0 {
+            return output;
+        }
+        let mut residual = [0.0; OUTPUTS];
+        let mut weights = 0.0;
+        for (distance, example, lesson_input) in nearest.into_iter().take(3) {
+            let labels = transfer_vector(&example.current, &example.desired);
+            let mut lesson_hidden = vec![0.0; HIDDEN];
+            let mut lesson_output = vec![0.0; OUTPUTS];
+            self.forward(&lesson_input, &mut lesson_hidden, &mut lesson_output);
+            let weight = 1.0 / distance.max(1e-3);
+            for i in 0..OUTPUTS {
+                residual[i] += (labels[i] - lesson_output[i]) * weight;
+            }
+            weights += weight;
+        }
+        for i in 0..OUTPUTS {
+            output[i] += residual[i] / weights.max(1e-5) * confidence;
+        }
+        output
     }
 
     fn forward(&self, input: &[f32], hidden: &mut [f32], output: &mut [f32]) {
@@ -443,20 +504,15 @@ fn sample_tone_delta(delta: &[f32], x: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        constrained_tone, load_examples, profile_pair, transfer_vector, LookModel, HIDDEN, OUTPUTS,
-    };
+    use super::{constrained_tone, load_examples, transfer_vector, LookModel, OUTPUTS};
     use crate::processor::LookProfile;
 
     fn lesson_error(model: &LookModel, examples: &[super::TrainingExample]) -> f32 {
         let mut sum = 0.0;
         let mut count = 0;
         for example in examples {
-            let input = profile_pair(&example.current, &example.reference);
             let labels = transfer_vector(&example.current, &example.desired);
-            let mut hidden = vec![0.0; HIDDEN];
-            let mut output = vec![0.0; OUTPUTS];
-            model.forward(&input, &mut hidden, &mut output);
+            let output = model.predict_vector(&example.current, &example.reference);
             sum += output
                 .iter()
                 .zip(labels)
@@ -489,11 +545,11 @@ mod tests {
         let held_after = lesson_error(&LookModel::train_with_examples(&train), &holdout);
         println!("manual lesson MSE: {before:.6} -> {after:.6}; held out: {held_before:.6} -> {held_after:.6}");
         assert!(
-            after < before * 0.90,
+            after < before * 0.05,
             "manual teaching must materially reduce lesson error"
         );
         assert!(
-            held_after < held_before * 0.95,
+            held_after < held_before * 0.80,
             "manual teaching must improve unseen lessons, not merely memorize them"
         );
     }
