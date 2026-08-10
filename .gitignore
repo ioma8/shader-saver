@@ -8,3 +8,4 @@ DerivedData/
 .netrc
 stl-viewer/target/
 image-processor/target/
+image-processor/.venv-train/

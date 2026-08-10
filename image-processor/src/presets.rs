@@ -10,7 +10,13 @@ fn slug(name: &str) -> Option<String> {
     let s: String = name
         .trim()
         .chars()
-        .map(|c| if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     (!s.is_empty()).then_some(s)
 }
@@ -20,8 +26,9 @@ fn file_path(dir: &Path, name: &str) -> Option<PathBuf> {
 }
 
 pub fn save(dir: &Path, name: &str, state: &EditState) -> std::io::Result<()> {
-    let path = file_path(dir, name)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty preset name"))?;
+    let path = file_path(dir, name).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty preset name")
+    })?;
     std::fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -34,17 +41,25 @@ pub fn load(dir: &Path, name: &str) -> Option<EditState> {
 }
 
 pub fn delete(dir: &Path, name: &str) -> std::io::Result<()> {
-    let path = file_path(dir, name)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty preset name"))?;
+    let path = file_path(dir, name).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty preset name")
+    })?;
     std::fs::remove_file(path)
 }
 
 pub fn list(dir: &Path) -> Vec<String> {
-    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut names: Vec<String> = rd
         .filter_map(std::result::Result::ok)
         .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
-        .filter_map(|e| e.path().file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .filter_map(|e| {
+            e.path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+        })
         .collect();
     names.sort();
     names
@@ -55,7 +70,8 @@ mod tests {
     use super::*;
 
     fn tmp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ip_presets_test_{tag}_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ip_presets_test_{tag}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

@@ -15,6 +15,13 @@ images.
 - **Fast RAW opens** — RAW files open from the embedded JPEG first via
   [`jpgfromrawlib`](https://github.com/ioma8/jpgfromrawlib), then the full
   demosaic swaps in shortly after if you stay on that image
+- **RAW development** — the "Develop RAW" button re-renders the DNG with a
+  small, deterministic pipeline: rawloader decode (crop, black/white level,
+  as-shot white balance, demosaic, camera→sRGB matrix) followed by one global
+  phone S-curve fitted from 46 Pixel DNG/JPEG pairs
+  (`models/raw_s_curve.json`, a few KB), with each image auto-exposed to the
+  median linear luminance before the curve. No neural network. Refit the
+  curve with `cargo run --release -- --fit-raw-scurve <folder>`
 - **Adjustments** — white balance (temp/tint), exposure (stops),
   brightness (Capture One-style midtone bias), contrast (logistic S-curve),
   blacks/shadows/highlights/whites tonal zones, box blur, unsharp mask,
@@ -25,6 +32,9 @@ images.
   natural cubic spline, applied as a 256-entry LUT
 - **Auto** — one-click auto levels, brightness, contrast,
   shadows/highlights from the histogram
+- **Reference look transfer** — capture a finished photo's look, apply it to
+  RAW or standard images through one constrained model, and teach the model
+  from approved edits directly in the editor
 - **Persistent edits** — every image's edit state is saved to SQLite
   (`~/.image-processor/edits.db`) and restored when reopened;
   Reset All Edits reverts to defaults

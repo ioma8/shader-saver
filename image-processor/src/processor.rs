@@ -3,8 +3,7 @@ use std::path::Path;
 #[repr(align(4))]
 struct AlignedPhotoLuts([u8; 1_293_732]);
 
-static PHOTO_LUTS: AlignedPhotoLuts =
-    AlignedPhotoLuts(*include_bytes!("../models/photo_luts.f32"));
+static PHOTO_LUTS: AlignedPhotoLuts = AlignedPhotoLuts(*include_bytes!("../models/photo_luts.f32"));
 
 fn photo_luts() -> &'static [f32] {
     bytemuck::cast_slice(&PHOTO_LUTS.0)
@@ -44,9 +43,7 @@ fn combined_photo_lut(weights: [f32; 3]) -> Vec<f32> {
             let source_chroma = input[channel] - input_lum;
             let model_chroma = output[channel] - output_lum;
             result.push(
-                softened_lum
-                    + source_chroma
-                    + (model_chroma - source_chroma) * COLOR_STRENGTH,
+                softened_lum + source_chroma + (model_chroma - source_chroma) * COLOR_STRENGTH,
             );
         }
     }
@@ -61,6 +58,8 @@ pub struct EditState {
     pub exposure: f32,
     pub brightness: f32,
     pub contrast: f32,
+    pub saturation: f32,
+    pub vibrance: f32,
     pub wb_temp: f32,
     pub wb_tint: f32,
     pub levels_black: f32,
@@ -79,14 +78,15 @@ pub struct EditState {
     pub ai_lut_enabled: bool,
     pub ai_lut_weights: [f32; 3],
     pub ai_lut_strength: f32,
-    // A captured-look transfer, applied on top of the AI LUT above. See
-    // `derive_look_chain`/`baked_lut`.
+    // Full-resolution neural RAW development has already been baked into the
+    // processor input texture.  It is persisted as a flag so reopening an
+    // image repeats the deterministic inference.
+    pub raw_isp_enabled: bool,
+    // Device rendering predicted from paired camera RAW/JPEG captures.
+    pub raw_development: Option<Vec<f32>>,
+    // The constrained model's captured-look transform.
     pub look: Vec<LookTransfer>,
     pub look_strength: f32,
-    // Set instead of `look` when CanonCGT (see `canoncgt.rs`) produced the
-    // transfer; takes priority over `look` in `baked_lut`. Already
-    // gamut-mapped before being stored here.
-    pub canon_lut: Option<Vec<f32>>,
 }
 
 impl Default for EditState {
@@ -95,6 +95,8 @@ impl Default for EditState {
             exposure: 0.0,
             brightness: 0.0,
             contrast: 0.0,
+            saturation: 0.0,
+            vibrance: 0.0,
             wb_temp: 0.0,
             wb_tint: 0.0,
             levels_black: 0.0,
@@ -113,9 +115,10 @@ impl Default for EditState {
             ai_lut_enabled: false,
             ai_lut_weights: [0.0; 3],
             ai_lut_strength: 1.0,
+            raw_isp_enabled: false,
+            raw_development: None,
             look: Vec::new(),
             look_strength: 1.0,
-            canon_lut: None,
         }
     }
 }
@@ -129,6 +132,8 @@ pub struct Processor {
     compute_bgl: wgpu::BindGroupLayout,
 
     input_tex: Option<wgpu::Texture>,
+    source_tex: Option<wgpu::Texture>,
+    source_image: Option<image::RgbaImage>,
     tex1: Option<wgpu::Texture>,       // contrast output
     tex2: Option<wgpu::Texture>,       // tonal output
     tex3: Option<wgpu::Texture>,       // sharpen output
@@ -150,6 +155,8 @@ pub struct Processor {
     pub image_size: Option<(u32, u32)>,
     pub exposure: f32,     // stops
     pub contrast: f32,     // -100..100, 0 = neutral
+    pub saturation: f32,   // -100..100, 0 = neutral
+    pub vibrance: f32,     // -100..100, 0 = neutral
     pub wb_temp: f32,      // -100..100, blue ↔ yellow
     pub wb_tint: f32,      // -100..100, green ↔ magenta
     pub levels_black: f32, // 0–255
@@ -171,9 +178,10 @@ pub struct Processor {
     pub ai_lut_enabled: bool,
     pub ai_lut_weights: [f32; 3],
     pub ai_lut_strength: f32,
+    pub raw_isp_enabled: bool,
+    pub raw_development: Option<Vec<f32>>,
     pub look: Vec<LookTransfer>,
     pub look_strength: f32,
-    pub canon_lut: Option<Vec<f32>>,
 }
 
 fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -342,15 +350,17 @@ impl Processor {
             blur_v_pipeline: make_pipeline("blur_v_pass"),
             compute_bgl,
             input_tex: None,
+            source_tex: None,
+            source_image: None,
             tex1: None,
             tex2: None,
             tex3: None,
             tex4: None,
             output_tex: None,
-            contrast_buf: make_buf(32),
-            tonal_buf: make_buf(32),
-            blur_buf: make_buf(32),
-            sharpen_buf: make_buf(32),
+            contrast_buf: make_buf(48),
+            tonal_buf: make_buf(48),
+            blur_buf: make_buf(48),
+            sharpen_buf: make_buf(48),
             curve_buf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: ((256 + 33 * 33 * 33 * 3) * 4) as u64,
@@ -365,6 +375,8 @@ impl Processor {
             image_size: None,
             exposure: 0.0,
             contrast: 0.0,
+            saturation: 0.0,
+            vibrance: 0.0,
             wb_temp: 0.0,
             wb_tint: 0.0,
             levels_black: 0.0,
@@ -384,9 +396,10 @@ impl Processor {
             ai_lut_enabled: false,
             ai_lut_weights: [0.0; 3],
             ai_lut_strength: 1.0,
+            raw_isp_enabled: false,
+            raw_development: None,
             look: Vec::new(),
             look_strength: 1.0,
-            canon_lut: None,
         }
     }
 
@@ -416,7 +429,8 @@ impl Processor {
                 let a_idx = h0;
                 diag[idx] = 2.0 * (h0 + h1);
                 upper[idx] = h1;
-                rhs[idx] = 6.0 * ((pts[idx + 1][1] - pts[idx][1]) / h1 - (pts[idx][1] - pts[idx - 1][1]) / h0);
+                rhs[idx] = 6.0
+                    * ((pts[idx + 1][1] - pts[idx][1]) / h1 - (pts[idx][1] - pts[idx - 1][1]) / h0);
                 let fac = a_idx / diag[idx - 1];
                 diag[idx] -= fac * upper[idx - 1];
                 rhs[idx] -= fac * rhs[idx - 1];
@@ -457,6 +471,8 @@ impl Processor {
             exposure: self.exposure,
             brightness: self.brightness,
             contrast: self.contrast,
+            saturation: self.saturation,
+            vibrance: self.vibrance,
             wb_temp: self.wb_temp,
             wb_tint: self.wb_tint,
             levels_black: self.levels_black,
@@ -475,9 +491,10 @@ impl Processor {
             ai_lut_enabled: self.ai_lut_enabled,
             ai_lut_weights: self.ai_lut_weights,
             ai_lut_strength: self.ai_lut_strength,
+            raw_isp_enabled: self.raw_isp_enabled,
+            raw_development: self.raw_development.clone(),
             look: self.look.clone(),
             look_strength: self.look_strength,
-            canon_lut: self.canon_lut.clone(),
         }
     }
 
@@ -485,6 +502,8 @@ impl Processor {
         self.exposure = s.exposure;
         self.brightness = s.brightness;
         self.contrast = s.contrast;
+        self.saturation = s.saturation;
+        self.vibrance = s.vibrance;
         self.wb_temp = s.wb_temp;
         self.wb_tint = s.wb_tint;
         self.levels_black = s.levels_black;
@@ -507,9 +526,10 @@ impl Processor {
         self.ai_lut_enabled = s.ai_lut_enabled;
         self.ai_lut_weights = s.ai_lut_weights;
         self.ai_lut_strength = s.ai_lut_strength;
+        self.raw_isp_enabled = s.raw_isp_enabled;
+        self.raw_development = s.raw_development.clone();
         self.look = s.look.clone();
         self.look_strength = s.look_strength;
-        self.canon_lut = s.canon_lut.clone();
     }
 
     // Derive auto adjustments from the luminance histogram. Call with the
@@ -570,7 +590,7 @@ impl Processor {
     ) {
         let (width, height) = img.dimensions();
 
-        let input_tex = device.create_texture(&wgpu::TextureDescriptor {
+        let make_input = || device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
                 width,
@@ -584,6 +604,22 @@ impl Processor {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
         });
+        let source_tex = make_input();
+        let input_tex = make_input();
+        queue.write_texture(
+            source_tex.as_image_copy(),
+            img,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
         queue.write_texture(
             input_tex.as_image_copy(),
             img,
@@ -618,6 +654,8 @@ impl Processor {
             })
         };
 
+        self.source_tex = Some(source_tex);
+        self.source_image = Some(img.clone());
         self.input_tex = Some(input_tex);
         self.tex1 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex2 = Some(make_intermediate(wgpu::TextureUsages::empty()));
@@ -627,6 +665,53 @@ impl Processor {
         self.image_size = Some((width, height));
 
         self.process(device, queue);
+    }
+
+    /// Replace the effective input with a full-resolution neural ISP result;
+    /// the untouched source remains available for the original-image view and
+    /// for Reset All Edits.  The replacement is decoded from the RAW file
+    /// independently, so its dimensions can differ slightly from the editor's
+    /// loaded render; it is resized to the input texture instead of being
+    /// dropped.
+    pub fn replace_input_rgba(
+        &mut self,
+        img: &image::RgbaImage,
+        queue: &wgpu::Queue,
+    ) -> bool {
+        let Some(input) = self.input_tex.as_ref() else {
+            return false;
+        };
+        let Some((width, height)) = self.image_size else {
+            return false;
+        };
+        let img: image::RgbaImage = if img.dimensions() == (width, height) {
+            img.clone()
+        } else {
+            image::imageops::resize(img, width, height, image::imageops::FilterType::Triangle)
+        };
+        queue.write_texture(
+            input.as_image_copy(),
+            &img,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        true
+    }
+
+    /// Restore the original sensor render after Reset All Edits.
+    pub fn restore_source(&mut self, queue: &wgpu::Queue) -> bool {
+        let Some(source) = self.source_image.clone() else {
+            return false;
+        };
+        self.replace_input_rgba(&source, queue)
     }
 
     pub fn output_view(&self) -> Option<wgpu::TextureView> {
@@ -639,7 +724,7 @@ impl Processor {
     }
 
     pub fn input_view(&self) -> Option<wgpu::TextureView> {
-        self.input_tex.as_ref().map(|t| {
+        self.source_tex.as_ref().map(|t| {
             t.create_view(&wgpu::TextureViewDescriptor {
                 format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
                 ..Default::default()
@@ -658,17 +743,35 @@ impl Processor {
             &self.contrast_buf,
             0,
             bytemuck::cast_slice(&[
-                self.contrast, self.levels_black, self.levels_white, self.levels_gamma,
-                self.exposure, self.wb_temp, self.wb_tint,
-                if self.ai_lut_enabled || !self.look.is_empty() || self.canon_lut.is_some() { 1.0 } else { 0.0 },
+                self.contrast,
+                self.levels_black,
+                self.levels_white,
+                self.levels_gamma,
+                self.exposure,
+                self.wb_temp,
+                self.wb_tint,
+                if photo_lut_enabled(&self.edit_state()) {
+                    1.0
+                } else {
+                    0.0
+                },
             ]),
         );
         queue.write_buffer(
             &self.tonal_buf,
             0,
             bytemuck::cast_slice(&[
-                self.blacks, self.shadows, self.highlights, self.whites,
-                self.brightness, self.vignette, self.vignette_mid, 0f32,
+                self.blacks,
+                self.shadows,
+                self.highlights,
+                self.whites,
+                self.brightness,
+                self.vignette,
+                self.vignette_mid,
+                self.saturation,
+                self.vibrance,
+                0f32,
+                0f32,
             ]),
         );
         queue.write_buffer(
@@ -680,8 +783,14 @@ impl Processor {
             &self.sharpen_buf,
             0,
             bytemuck::cast_slice(&[
-                self.unsharp_strength, self.unsharp_blur_radius,
-                0f32, 0f32, 0f32, 0f32, 0f32, 0f32,
+                self.unsharp_strength,
+                self.unsharp_blur_radius,
+                0f32,
+                0f32,
+                0f32,
+                0f32,
+                0f32,
+                0f32,
             ]),
         );
         let mut data = Vec::with_capacity(256 + 33 * 33 * 33 * 3);
@@ -703,8 +812,14 @@ impl Processor {
             label: None,
             layout: &self.histogram_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(hist_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: self.histogram_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(hist_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.histogram_buf.as_entire_binding(),
+                },
             ],
         });
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -719,7 +834,9 @@ impl Processor {
 
         let slice = self.histogram_staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
         device.poll(wgpu::Maintain::Wait);
         if rx.recv().unwrap().is_ok() {
             let data = slice.get_mapped_range();
@@ -759,19 +876,31 @@ impl Processor {
                     label: None,
                     layout: bgl,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(in_view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(out_view) },
-                        wgpu::BindGroupEntry { binding: 2, resource: buf.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 3, resource: curve_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(in_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(out_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: curve_buf.as_entire_binding(),
+                        },
                     ],
                 })
             };
 
-        let contrast_bg  = make_bg(&iv,  &t1v, &self.contrast_buf);
-        let tonal_bg     = make_bg(&t1v, &t2v, &self.tonal_buf);
-        let sharpen_bg   = make_bg(&t2v, &t3v, &self.sharpen_buf);
-        let blur_h_bg    = make_bg(&t3v, &t4v, &self.blur_buf);
-        let blur_vert_bg = make_bg(&t4v, &ov,  &self.blur_buf);
+        let contrast_bg = make_bg(&iv, &t1v, &self.contrast_buf);
+        let tonal_bg = make_bg(&t1v, &t2v, &self.tonal_buf);
+        let sharpen_bg = make_bg(&t2v, &t3v, &self.sharpen_buf);
+        let blur_h_bg = make_bg(&t3v, &t4v, &self.blur_buf);
+        let blur_vert_bg = make_bg(&t4v, &ov, &self.blur_buf);
 
         let (w, h) = self.image_size.unwrap();
         let wg = (w.div_ceil(8), h.div_ceil(8));
@@ -784,10 +913,10 @@ impl Processor {
             pass.dispatch_workgroups(wg.0, wg.1, 1);
         };
         dispatch(&self.contrast_pipeline, &contrast_bg);
-        dispatch(&self.tonal_pipeline,    &tonal_bg);
-        dispatch(&self.sharpen_pipeline,  &sharpen_bg);
-        dispatch(&self.blur_h_pipeline,   &blur_h_bg);
-        dispatch(&self.blur_v_pipeline,   &blur_vert_bg);
+        dispatch(&self.tonal_pipeline, &tonal_bg);
+        dispatch(&self.sharpen_pipeline, &sharpen_bg);
+        dispatch(&self.blur_h_pipeline, &blur_h_bg);
+        dispatch(&self.blur_v_pipeline, &blur_vert_bg);
         queue.submit([encoder.finish()]);
 
         // Separate submission: blur_v write must be visible before histogram reads.
@@ -822,7 +951,11 @@ impl Processor {
                     rows_per_image: None,
                 },
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         queue.submit([encoder.finish()]);
 
@@ -846,6 +979,9 @@ impl Processor {
             out
         };
         staging.unmap();
+        // The processing shaders read/write display-space normalized RGB in
+        // their Rgba8Unorm storage textures. A texture copy is therefore
+        // already in the same byte space used by the UI and image crate.
         Some(pixels)
     }
 
@@ -916,8 +1052,6 @@ impl Processor {
     }
 }
 
-
-
 // The normalized RGB coordinate voxel `i` of an `n`-cube grid sits at, laid
 // out R-fastest -- the one indexing scheme every LUT in this app shares,
 // whether it's being built, resampled, or walked for a post-process pass.
@@ -939,112 +1073,120 @@ pub fn sample_cube(lut: &[f32], n: usize, rgb: [f32; 3]) -> [f32; 3] {
     let p = rgb.map(|v| v.clamp(0.0, 1.0) * max_idx);
     let lo = p.map(|v| v.floor() as usize);
     let hi = lo.map(|v| (v + 1).min(n - 1));
-    let d = [p[0] - lo[0] as f32, p[1] - lo[1] as f32, p[2] - lo[2] as f32];
-    let cell = |r: usize, g: usize, b: usize, channel: usize| {
-        lut[(r + g * n + b * n * n) * 3 + channel]
-    };
+    let d = [
+        p[0] - lo[0] as f32,
+        p[1] - lo[1] as f32,
+        p[2] - lo[2] as f32,
+    ];
+    let cell =
+        |r: usize, g: usize, b: usize, channel: usize| lut[(r + g * n + b * n * n) * 3 + channel];
     let mut out = [0.0f32; 3];
     for (channel, slot) in out.iter_mut().enumerate() {
         let mix = |a: f32, b: f32, t: f32| a + (b - a) * t;
-        let c00 = mix(cell(lo[0], lo[1], lo[2], channel), cell(hi[0], lo[1], lo[2], channel), d[0]);
-        let c10 = mix(cell(lo[0], hi[1], lo[2], channel), cell(hi[0], hi[1], lo[2], channel), d[0]);
-        let c01 = mix(cell(lo[0], lo[1], hi[2], channel), cell(hi[0], lo[1], hi[2], channel), d[0]);
-        let c11 = mix(cell(lo[0], hi[1], hi[2], channel), cell(hi[0], hi[1], hi[2], channel), d[0]);
+        let c00 = mix(
+            cell(lo[0], lo[1], lo[2], channel),
+            cell(hi[0], lo[1], lo[2], channel),
+            d[0],
+        );
+        let c10 = mix(
+            cell(lo[0], hi[1], lo[2], channel),
+            cell(hi[0], hi[1], lo[2], channel),
+            d[0],
+        );
+        let c01 = mix(
+            cell(lo[0], lo[1], hi[2], channel),
+            cell(hi[0], lo[1], hi[2], channel),
+            d[0],
+        );
+        let c11 = mix(
+            cell(lo[0], hi[1], hi[2], channel),
+            cell(hi[0], hi[1], hi[2], channel),
+            d[0],
+        );
         *slot = mix(mix(c00, c10, d[1]), mix(c01, c11, d[1]), d[2]);
     }
     out
 }
 
-fn lut_pixels(img: &image::RgbaImage, lut: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(img.as_raw().len());
-    for px in img.as_raw().chunks_exact(4) {
-        let rgb = sample_cube(lut, 33, [f32::from(px[0])/255.0, f32::from(px[1])/255.0, f32::from(px[2])/255.0]);
-        for v in rgb { out.push((v.clamp(0.0, 1.0) * 255.0).round() as u8); }
-        out.push(px[3]);
+fn srgb_to_linear(v: f32) -> f32 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
     }
-    out
 }
-
-pub const LUM: [f32; 3] = [0.2126, 0.7152, 0.0722];
-fn luminance(rgb: [f32; 3]) -> f32 { rgb[0]*LUM[0] + rgb[1]*LUM[1] + rgb[2]*LUM[2] }
-
-fn srgb_to_linear(v: f32) -> f32 { if v <= 0.04045 { v/12.92 } else { ((v+0.055)/1.055).powf(2.4) } }
-fn linear_to_srgb(v: f32) -> f32 { if v <= 0.0031308 { v*12.92 } else { 1.055*v.powf(1.0/2.4)-0.055 } }
+fn linear_to_srgb(v: f32) -> f32 {
+    if v <= 0.0031308 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    }
+}
 fn linear_to_oklab(rgb: [f32; 3]) -> [f32; 3] {
-    let l=0.41222147*rgb[0]+0.53633255*rgb[1]+0.051445995*rgb[2];
-    let m=0.2119035*rgb[0]+0.6806995*rgb[1]+0.10739696*rgb[2];
-    let s=0.08830246*rgb[0]+0.28171885*rgb[1]+0.6299787*rgb[2];
-    let (l,m,s)=(l.cbrt(),m.cbrt(),s.cbrt());
-    [0.21045426*l+0.7936178*m-0.004072047*s, 1.9779985*l-2.4285922*m+0.4505937*s, 0.025904037*l+0.78277177*m-0.80867577*s]
+    let l = 0.41222147 * rgb[0] + 0.53633255 * rgb[1] + 0.051445995 * rgb[2];
+    let m = 0.2119035 * rgb[0] + 0.6806995 * rgb[1] + 0.10739696 * rgb[2];
+    let s = 0.08830246 * rgb[0] + 0.28171885 * rgb[1] + 0.6299787 * rgb[2];
+    let (l, m, s) = (l.cbrt(), m.cbrt(), s.cbrt());
+    [
+        0.21045426 * l + 0.7936178 * m - 0.004072047 * s,
+        1.9779985 * l - 2.4285922 * m + 0.4505937 * s,
+        0.025904037 * l + 0.78277177 * m - 0.80867577 * s,
+    ]
 }
 fn oklab_to_linear(lab: [f32; 3]) -> [f32; 3] {
-    let l=lab[0]+0.39633778*lab[1]+0.21580376*lab[2];
-    let m=lab[0]-0.105561346*lab[1]-0.06385417*lab[2];
-    let s=lab[0]-0.08948418*lab[1]-1.2914855*lab[2];
-    let (l,m,s)=(l*l*l,m*m*m,s*s*s);
-    [4.0767417*l-3.3077116*m+0.23096994*s, -1.268438*l+2.6097574*m-0.34131938*s, -0.0041960863*l-0.7034186*m+1.7076147*s]
+    let l = lab[0] + 0.39633778 * lab[1] + 0.21580376 * lab[2];
+    let m = lab[0] - 0.105561346 * lab[1] - 0.06385417 * lab[2];
+    let s = lab[0] - 0.08948418 * lab[1] - 1.2914855 * lab[2];
+    let (l, m, s) = (l * l * l, m * m * m, s * s * s);
+    [
+        4.0767417 * l - 3.3077116 * m + 0.23096994 * s,
+        -1.268438 * l + 2.6097574 * m - 0.34131938 * s,
+        -0.0041960863 * l - 0.7034186 * m + 1.7076147 * s,
+    ]
 }
 fn oklab_to_srgb_in_gamut(lab: [f32; 3]) -> [f32; 3] {
-    let lt=lab[0].clamp(0.0,1.0);
-    let at=|s:f32| oklab_to_linear([lt,lab[1]*s,lab[2]*s]);
-    let fits=|rgb:&[f32;3]| rgb.iter().all(|v| *v>=-1e-4 && *v<=1.0001);
-    let mut scale=1.0;
-    if !fits(&at(1.0)) { let (mut lo,mut hi)=(0.0f32,1.0f32); for _ in 0..18 { let mid=0.5*(lo+hi); if fits(&at(mid)){lo=mid}else{hi=mid} } scale=lo; }
-    at(scale).map(|v| linear_to_srgb(v.clamp(0.0,1.0)).clamp(0.0,1.0))
-}
-// Radius-1 box blur over the cube's own neighbors (edge-clamped), per channel.
-// Meant to remove cell-to-cell jaggedness in a *predicted* LUT (e.g. a
-// network's per-cell output that isn't perfectly smooth) without touching the
-// grade's actual low-frequency shape -- a deliberate color grade varies slowly
-// over the cube; single-cell noise doesn't, so this averaging suppresses the
-// noise far more than the grade.
-pub fn smooth_lut(lut: &[f32], n: usize) -> Vec<f32> {
-    let idx = |r: usize, g: usize, b: usize, c: usize| (r + g * n + b * n * n) * 3 + c;
-    let clamp = |v: isize| v.clamp(0, n as isize - 1) as usize;
-    let mut out = vec![0f32; lut.len()];
-    for b in 0..n {
-        for g in 0..n {
-            for r in 0..n {
-                for c in 0..3 {
-                    let mut sum = 0f32;
-                    let mut count = 0f32;
-                    for db in -1..=1isize {
-                        for dg in -1..=1isize {
-                            for dr in -1..=1isize {
-                                let rr = clamp(r as isize + dr);
-                                let gg = clamp(g as isize + dg);
-                                let bb = clamp(b as isize + db);
-                                sum += lut[idx(rr, gg, bb, c)];
-                                count += 1.0;
-                            }
-                        }
-                    }
-                    out[idx(r, g, b, c)] = sum / count;
-                }
+    let lt = lab[0].clamp(0.0, 1.0);
+    let at = |s: f32| oklab_to_linear([lt, lab[1] * s, lab[2] * s]);
+    let fits = |rgb: &[f32; 3]| rgb.iter().all(|v| *v >= -1e-4 && *v <= 1.0001);
+    let mut scale = 1.0;
+    if !fits(&at(1.0)) {
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..18 {
+            let mid = 0.5 * (lo + hi);
+            if fits(&at(mid)) {
+                lo = mid
+            } else {
+                hi = mid
             }
         }
+        scale = lo;
     }
-    out
+    at(scale).map(|v| linear_to_srgb(v.clamp(0.0, 1.0)).clamp(0.0, 1.0))
 }
-
-pub fn gamut_map_lut(lut: &mut [f32]) {
-    for cell in lut.chunks_exact_mut(3) {
-        let rgb=[cell[0],cell[1],cell[2]];
-        if rgb.iter().all(|v| *v>=0.0 && *v<=1.0) { continue; }
-        let mapped = oklab_to_srgb_in_gamut(linear_to_oklab([srgb_to_linear(rgb[0]),srgb_to_linear(rgb[1]),srgb_to_linear(rgb[2])]));
-        cell.copy_from_slice(&mapped);
-    }
-}
-
-
 pub const REGION_COUNT: usize = 3;
 
-struct RegionPrior { hue: (f32, f32), chroma: (f32, f32), lightness: (f32, f32) }
+struct RegionPrior {
+    hue: (f32, f32),
+    chroma: (f32, f32),
+    lightness: (f32, f32),
+}
 
 const REGION_PRIORS: [RegionPrior; REGION_COUNT] = [
-    RegionPrior { hue: (10.0, 85.0), chroma: (0.02, 0.20), lightness: (0.30, 0.98) },
-    RegionPrior { hue: (95.0, 175.0), chroma: (0.03, 0.40), lightness: (0.15, 0.95) },
-    RegionPrior { hue: (200.0, 285.0), chroma: (0.02, 0.40), lightness: (0.45, 1.00) },
+    RegionPrior {
+        hue: (10.0, 85.0),
+        chroma: (0.02, 0.20),
+        lightness: (0.30, 0.98),
+    },
+    RegionPrior {
+        hue: (95.0, 175.0),
+        chroma: (0.03, 0.40),
+        lightness: (0.15, 0.95),
+    },
+    RegionPrior {
+        hue: (200.0, 285.0),
+        chroma: (0.02, 0.40),
+        lightness: (0.45, 1.00),
+    },
 ];
 
 #[derive(Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
@@ -1058,13 +1200,19 @@ pub struct RegionTone {
 const REGION_SHARE_FLOOR: [f32; REGION_COUNT] = [0.002, 0.02, 0.02];
 
 fn in_prior(prior: &RegionPrior, lightness: f32, chroma: f32, hue_degrees: f32) -> bool {
-    hue_degrees >= prior.hue.0 && hue_degrees <= prior.hue.1
-        && chroma >= prior.chroma.0 && chroma <= prior.chroma.1
-        && lightness >= prior.lightness.0 && lightness <= prior.lightness.1
+    hue_degrees >= prior.hue.0
+        && hue_degrees <= prior.hue.1
+        && chroma >= prior.chroma.0
+        && chroma <= prior.chroma.1
+        && lightness >= prior.lightness.0
+        && lightness <= prior.lightness.1
 }
 
 pub fn measure_regions(
-    pixels: &[u8], width: u32, height: u32, faces: &[[f32; 4]],
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    faces: &[[f32; 4]],
 ) -> [RegionTone; REGION_COUNT] {
     let mut sum_lightness = [0.0f64; REGION_COUNT];
     let mut sum_chroma = [0.0f64; REGION_COUNT];
@@ -1072,14 +1220,22 @@ pub fn measure_regions(
     let mut counted = [0.0f64; REGION_COUNT];
 
     #[derive(Clone, Copy)]
-    struct SkinEllipse { cx: f32, cy: f32, rx: f32, ry: f32 }
+    struct SkinEllipse {
+        cx: f32,
+        cy: f32,
+        rx: f32,
+        ry: f32,
+    }
     let skin_ellipses: Vec<SkinEllipse> = faces
         .iter()
-        .filter(|b| b[2].abs() >= 0.03 && b[2].abs() <= 0.80
-                 && b[3].abs() >= 0.03 && b[3].abs() <= 0.80)
+        .filter(|b| {
+            b[2].abs() >= 0.03 && b[2].abs() <= 0.80 && b[3].abs() >= 0.03 && b[3].abs() <= 0.80
+        })
         .map(|b| SkinEllipse {
-            cx: b[0] + b[2] * 0.5, cy: b[1] + b[3] * 0.45,
-            rx: b[2] * 0.20, ry: b[3] * 0.22,
+            cx: b[0] + b[2] * 0.5,
+            cy: b[1] + b[3] * 0.45,
+            rx: b[2] * 0.20,
+            ry: b[3] * 0.22,
         })
         .collect();
     let has_faces = !skin_ellipses.is_empty();
@@ -1100,7 +1256,9 @@ pub fn measure_regions(
             srgb_to_linear(f32::from(px[2]) / 255.0),
         ]);
         let chroma = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
-        if chroma <= 1e-5 { continue; }
+        if chroma <= 1e-5 {
+            continue;
+        }
         let hue = lab[2].atan2(lab[1]).to_degrees().rem_euclid(360.0);
         let passes_skin_prior = in_prior(&REGION_PRIORS[0], lab[0], chroma, hue);
 
@@ -1110,8 +1268,12 @@ pub fn measure_regions(
                 2 => y < 0.5,
                 _ => true,
             };
-            if !allowed { continue; }
-            if region != 0 && !in_prior(&REGION_PRIORS[region], lab[0], chroma, hue) { continue; }
+            if !allowed {
+                continue;
+            }
+            if region != 0 && !in_prior(&REGION_PRIORS[region], lab[0], chroma, hue) {
+                continue;
+            }
 
             if region == 0 {
                 skin_global[0] += f64::from(lab[0]);
@@ -1119,11 +1281,13 @@ pub fn measure_regions(
                 skin_global[2] += f64::from(lab[1] / chroma);
                 skin_global[3] += f64::from(lab[2] / chroma);
                 skin_global[4] += 1.0;
-                if has_faces && skin_ellipses.iter().any(|e| {
-                    let dx = (x - e.cx) / e.rx;
-                    let dy = (y - e.cy) / e.ry;
-                    dx * dx + dy * dy <= 1.0
-                }) {
+                if has_faces
+                    && skin_ellipses.iter().any(|e| {
+                        let dx = (x - e.cx) / e.rx;
+                        let dy = (y - e.cy) / e.ry;
+                        dx * dx + dy * dy <= 1.0
+                    })
+                {
                     skin_box[0] += f64::from(lab[0]);
                     skin_box[1] += f64::from(chroma);
                     skin_box[2] += f64::from(lab[1] / chroma);
@@ -1144,34 +1308,52 @@ pub fn measure_regions(
     let use_box = has_faces && box_share >= REGION_SHARE_FLOOR[0] as f64;
     let skin_stats = if use_box { skin_box } else { skin_global };
     let skin_share = skin_stats[4] / total;
-    let floor = if !has_faces { REGION_SHARE_FLOOR[0] * 0.1 } else { REGION_SHARE_FLOOR[0] };
+    let floor = if !has_faces {
+        REGION_SHARE_FLOOR[0] * 0.1
+    } else {
+        REGION_SHARE_FLOOR[0]
+    };
 
     let mut tones = [RegionTone::default(); REGION_COUNT];
     if skin_stats[4] > 0.0 && skin_share as f32 >= floor {
-        let length = (skin_stats[2].powi(2) + skin_stats[3].powi(2)).sqrt().max(1e-9);
+        let length = (skin_stats[2].powi(2) + skin_stats[3].powi(2))
+            .sqrt()
+            .max(1e-9);
         tones[0] = RegionTone {
             lightness: (skin_stats[0] / skin_stats[4]) as f32,
             chroma: (skin_stats[1] / skin_stats[4]) as f32,
-            hue_axis: [(skin_stats[2] / length) as f32, (skin_stats[3] / length) as f32],
+            hue_axis: [
+                (skin_stats[2] / length) as f32,
+                (skin_stats[3] / length) as f32,
+            ],
             share: skin_share as f32,
         };
     }
     for region in 1..REGION_COUNT {
-        if counted[region] == 0.0 { continue; }
+        if counted[region] == 0.0 {
+            continue;
+        }
         let share = (counted[region] / total) as f32;
-        if share < REGION_SHARE_FLOOR[region] { continue; }
-        let length = (sum_axis[region][0].powi(2) + sum_axis[region][1].powi(2)).sqrt().max(1e-9);
+        if share < REGION_SHARE_FLOOR[region] {
+            continue;
+        }
+        let length = (sum_axis[region][0].powi(2) + sum_axis[region][1].powi(2))
+            .sqrt()
+            .max(1e-9);
         tones[region] = RegionTone {
             lightness: (sum_lightness[region] / counted[region]) as f32,
             chroma: (sum_chroma[region] / counted[region]) as f32,
-            hue_axis: [(sum_axis[region][0] / length) as f32, (sum_axis[region][1] / length) as f32],
+            hue_axis: [
+                (sum_axis[region][0] / length) as f32,
+                (sum_axis[region][1] / length) as f32,
+            ],
             share,
         };
     }
     tones
 }
 
-// Captured-look statistics and transfer.
+// Captured-look statistics used by the constrained model.
 //
 // Deliberately *shape*-based, not absolute-level: `tone` records the image's
 // own lightness at fixed percentiles of its own histogram (not fixed pixel
@@ -1180,10 +1362,6 @@ pub fn measure_regions(
 // copying absolute values washed results out or blew them out depending on
 // which photo was brighter to start with.
 //
-// This is the fallback used only when CanonCGT (see `canoncgt.rs`) fails to
-// load, and as the pre-normalization step feeding CanonCGT's input for large
-// lighting gaps (see `look_chain_for` in main.rs).
-
 // Percentiles of the Oklab lightness histogram sampled as tone anchors,
 // splined between at bake time.
 pub const LOOK_ANCHORS: [f64; 5] = [0.05, 0.25, 0.5, 0.75, 0.95];
@@ -1278,12 +1456,16 @@ impl LookProfile {
             }
             // Weighted by the same neutral-tone weighting as `cast_sum` --
             // low if this band's evidence is mostly saturated object color
-            // rather than reliably-neutral content, which correctly makes
-            // `derive_transfer`'s evidence gate more reluctant to trust it.
+            // rather than reliably-neutral content, so the model can treat
+            // that measurement as uncertain.
             cast_evidence[band] = (cast_count[band] / total as f64) as f32;
         }
 
-        let chroma = if chroma_count > 0 { (chroma_sum / f64::from(chroma_count)) as f32 } else { 0.0 };
+        let chroma = if chroma_count > 0 {
+            (chroma_sum / f64::from(chroma_count)) as f32
+        } else {
+            0.0
+        };
 
         let mut hue_chroma = [0f32; HUE_SECTORS];
         let mut hue_axis = [[0f32; 2]; HUE_SECTORS];
@@ -1293,34 +1475,54 @@ impl LookProfile {
                 continue;
             }
             hue_chroma[s] = (hue_chroma_sum[s] / f64::from(hue_count[s])) as f32;
-            let len = (hue_axis_sum[s][0].powi(2) + hue_axis_sum[s][1].powi(2)).sqrt().max(1e-9);
-            hue_axis[s] = [(hue_axis_sum[s][0] / len) as f32, (hue_axis_sum[s][1] / len) as f32];
+            let len = (hue_axis_sum[s][0].powi(2) + hue_axis_sum[s][1].powi(2))
+                .sqrt()
+                .max(1e-9);
+            hue_axis[s] = [
+                (hue_axis_sum[s][0] / len) as f32,
+                (hue_axis_sum[s][1] / len) as f32,
+            ];
             hue_evidence[s] = hue_count[s] as f32 / total as f32;
         }
 
         let regions = measure_regions(pixels, width, height, faces);
 
-        Some(Self { tone, cast, cast_evidence, chroma, hue_chroma, hue_axis, hue_evidence, regions })
+        Some(Self {
+            tone,
+            cast,
+            cast_evidence,
+            chroma,
+            hue_chroma,
+            hue_axis,
+            hue_evidence,
+            regions,
+        })
     }
 }
 
-// One conservative step of a look-transfer chain -- see `derive_look_chain`.
+// The constrained, display-safe transform predicted by the look model.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct LookTransfer {
-    tone_delta: [f32; LOOK_ANCHORS.len()],
-    cast_delta: [[f32; 2]; 3],
-    hue_chroma_scale: [f32; HUE_SECTORS],
+    pub(crate) tone_delta: [f32; LOOK_ANCHORS.len()],
+    pub(crate) cast_delta: [[f32; 2]; 3],
+    pub(crate) hue_chroma_scale: [f32; HUE_SECTORS],
     // Degrees, applied as a rotation of the (a,b) chroma-plane vector rather
     // than an additive offset: a rotation of a near-zero vector stays near
     // zero, so a near-neutral pixel (grey pavement, an overcast sky) is left
     // alone. An earlier version of this field added a fixed (a,b) offset
     // instead, which shifted low-chroma neutrals by the same absolute amount
     // as fully-saturated colors -- grey stone came out visibly purple.
-    hue_rotate: [f32; HUE_SECTORS],
+    pub(crate) hue_rotate: [f32; HUE_SECTORS],
 }
 
 fn tone_band(l: f32) -> usize {
-    if l < 1.0 / 3.0 { 0 } else if l < 2.0 / 3.0 { 1 } else { 2 }
+    if l < 1.0 / 3.0 {
+        0
+    } else if l < 2.0 / 3.0 {
+        1
+    } else {
+        2
+    }
 }
 fn hue_sector(hue_degrees: f32) -> usize {
     ((hue_degrees / (360.0 / HUE_SECTORS as f32)) as usize).min(HUE_SECTORS - 1)
@@ -1386,116 +1588,6 @@ fn spline_tone_delta(l: f32, tone_delta: &[f32; LOOK_ANCHORS.len()]) -> f32 {
     tone_delta[last]
 }
 
-// Conservative gain per refinement pass -- see `derive_look_chain`.
-const LOOK_GAIN: f32 = 0.6;
-// A hue sector overlapping the skin tone is corrected far more gently: skin
-// drift was the single most visible failure mode of earlier versions of this
-// pipeline, worse than under-correcting the rest of the image.
-const SKIN_SECTOR_DAMP: f32 = 0.3;
-
-pub fn skin_hue_degrees_from_region(region: &RegionTone) -> Option<f32> {
-    if region.share <= 0.0 {
-        return None;
-    }
-    let [a, b] = region.hue_axis;
-    Some(b.atan2(a).to_degrees().rem_euclid(360.0))
-}
-
-pub fn skin_hue_degrees(profile: &LookProfile) -> Option<f32> {
-    skin_hue_degrees_from_region(&profile.regions[0])
-}
-
-fn skin_sector(profile: &LookProfile) -> Option<usize> {
-    skin_hue_degrees(profile).map(hue_sector)
-}
-
-// Damp a baked 33-cube LUT's deviation from identity within a smooth hue
-// neighborhood around the target photo's own skin hue, blending affected
-// cells back toward true identity by up to `1 - damp`. Skin drift was the
-// single most visible failure mode this pipeline has had (see
-// `SKIN_SECTOR_DAMP`), but that protection lives inside the Oklab
-// statistical stage's own transfer math -- it doesn't apply to a LUT that
-// arrived some other way (CanonCGT's direct prediction, blended in
-// `canoncgt::blend_by_confidence` with no knowledge of skin at all).
-// Re-asserting it here, on whatever LUT a caller is about to store, closes
-// that gap regardless of which stage's correction ends up stronger for a
-// given cell.
-//
-// `target_skin_hue` -- the *target* photo's own measured skin hue, i.e. the
-// face this LUT is actually about to be applied to -- takes priority over
-// `reference`'s. This used to key off `reference` alone, which meant a
-// reference photo with no detected face (partial profile, small face, no
-// face at all) silently disabled skin protection entirely, even when the
-// target being edited was full of faces. The target's own skin hue is both
-// the more correct signal (it's the thing being protected) and the one most
-// likely to be available exactly when protection matters most; `reference`
-// is only a fallback for when the target itself has no detected skin either.
-pub fn damp_lut_skin_hue(lut: &mut [f32], n: usize, target_skin_hue: Option<f32>, reference: &LookProfile) {
-    let Some(hue_degrees) = target_skin_hue.or_else(|| skin_hue_degrees(reference)) else { return };
-    let radius = 60.0f32;
-    for i in 0..n * n * n {
-        let rgb = voxel_rgb(i, n);
-        let lab = linear_to_oklab([srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])]);
-        let chroma = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
-        if chroma <= 1e-4 {
-            continue;
-        }
-        let hue = lab[2].atan2(lab[1]).to_degrees().rem_euclid(360.0);
-        let angdiff = ((hue - hue_degrees + 540.0) % 360.0 - 180.0).abs();
-        let weight = (1.0 - angdiff / radius).clamp(0.0, 1.0);
-        if weight <= 0.0 {
-            continue;
-        }
-        let local_damp = 1.0 - weight * (1.0 - SKIN_SECTOR_DAMP);
-        let idx = i * 3;
-        for (c, &identity_v) in rgb.iter().enumerate() {
-            lut[idx + c] = identity_v + (lut[idx + c] - identity_v) * local_damp;
-        }
-    }
-}
-
-fn derive_transfer(current: &LookProfile, reference: &LookProfile) -> LookTransfer {
-    let mut tone_delta = [0f32; LOOK_ANCHORS.len()];
-    for (slot, (r, c)) in tone_delta.iter_mut().zip(reference.tone.iter().zip(current.tone)) {
-        *slot = (r - c) * LOOK_GAIN;
-    }
-
-    let mut cast_delta = [[0f32; 2]; 3];
-    for (band, slot) in cast_delta.iter_mut().enumerate() {
-        if current.cast_evidence[band].min(reference.cast_evidence[band]) > 0.005 {
-            *slot = [
-                (reference.cast[band][0] - current.cast[band][0]) * LOOK_GAIN,
-                (reference.cast[band][1] - current.cast[band][1]) * LOOK_GAIN,
-            ];
-        }
-    }
-
-    // Damp whichever sector holds skin: pulling this image's matching hue
-    // range too far would be the most visible thing a viewer notices going
-    // wrong. Prefer `current`'s own skin sector -- it's the photo actually
-    // being edited, and (unlike `reference`) is available exactly when
-    // protection matters most; `reference` is only a fallback for when
-    // `current` itself has no detected skin either.
-    let damped_sector = skin_sector(current).or_else(|| skin_sector(reference));
-
-    let mut hue_chroma_scale = [1f32; HUE_SECTORS];
-    let mut hue_rotate = [0f32; HUE_SECTORS];
-    for s in 0..HUE_SECTORS {
-        if current.hue_evidence[s].min(reference.hue_evidence[s]) <= 0.003 {
-            continue;
-        }
-        let damp = if Some(s) == damped_sector { SKIN_SECTOR_DAMP } else { 1.0 };
-        let ratio = (reference.hue_chroma[s] / current.hue_chroma[s].max(1e-4)).clamp(0.4, 2.2);
-        hue_chroma_scale[s] = (1.0 + (ratio - 1.0) * LOOK_GAIN * damp).clamp(0.4, 1.8);
-        let cur_angle = current.hue_axis[s][1].atan2(current.hue_axis[s][0]).to_degrees();
-        let ref_angle = reference.hue_axis[s][1].atan2(reference.hue_axis[s][0]).to_degrees();
-        let diff = (ref_angle - cur_angle + 540.0).rem_euclid(360.0) - 180.0;
-        hue_rotate[s] = diff * LOOK_GAIN * damp * 0.5;
-    }
-
-    LookTransfer { tone_delta, cast_delta, hue_chroma_scale, hue_rotate }
-}
-
 fn apply_transfer_to_lab(lab: [f32; 3], t: &LookTransfer) -> [f32; 3] {
     let l = lab[0].clamp(0.0, 1.0);
     let new_l = (l + spline_tone_delta(l, &t.tone_delta)).clamp(0.0, 1.0);
@@ -1517,35 +1609,16 @@ fn apply_transfer_to_lab(lab: [f32; 3], t: &LookTransfer) -> [f32; 3] {
     [new_l, a, b]
 }
 
-fn render_through_transfer(img: &image::RgbaImage, t: &LookTransfer) -> image::RgbaImage {
-    let mut out = image::RgbaImage::new(img.width(), img.height());
-    for (x, y, px) in img.enumerate_pixels() {
-        let lab = linear_to_oklab([
-            srgb_to_linear(f32::from(px[0]) / 255.0),
-            srgb_to_linear(f32::from(px[1]) / 255.0),
-            srgb_to_linear(f32::from(px[2]) / 255.0),
-        ]);
-        let rgb = oklab_to_srgb_in_gamut(apply_transfer_to_lab(lab, t));
-        out.put_pixel(x, y, image::Rgba([
-            (rgb[0] * 255.0).round() as u8,
-            (rgb[1] * 255.0).round() as u8,
-            (rgb[2] * 255.0).round() as u8,
-            px[3],
-        ]));
-    }
-    out
-}
-
-fn render_through_lut33(img: &image::RgbaImage, lut: &[f32]) -> image::RgbaImage {
-    image::RgbaImage::from_raw(img.width(), img.height(), lut_pixels(img, lut)).unwrap()
-}
-
 fn bake_look_chain(chain: &[LookTransfer]) -> Vec<f32> {
     const N: usize = 33;
     let mut result = Vec::with_capacity(3 * N * N * N);
     for i in 0..N * N * N {
         let rgb = voxel_rgb(i, N);
-        let mut lab = linear_to_oklab([srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])]);
+        let mut lab = linear_to_oklab([
+            srgb_to_linear(rgb[0]),
+            srgb_to_linear(rgb[1]),
+            srgb_to_linear(rgb[2]),
+        ]);
         for t in chain {
             lab = apply_transfer_to_lab(lab, t);
         }
@@ -1561,56 +1634,16 @@ fn blend_lut(id: &[f32], v: &[f32], t: f32) -> Vec<f32> {
 // Evaluate `outer` at the colors `inner` produces, so a single pass through
 // the result does what applying `inner` then `outer` in sequence would do.
 pub(crate) fn compose_luts(inner: &[f32], outer: &[f32], n: usize) -> Vec<f32> {
-    inner.chunks_exact(3).flat_map(|rgb| sample_cube(outer, n, [rgb[0], rgb[1], rgb[2]])).collect()
+    inner
+        .chunks_exact(3)
+        .flat_map(|rgb| sample_cube(outer, n, [rgb[0], rgb[1], rgb[2]]))
+        .collect()
 }
 
-// Derive a chain of conservative corrections that carries `img` (as it
-// currently renders under `base`) toward `reference`. Each pass re-measures
-// the *previous pass's own preview*, so it only ever corrects what the prior,
-// deliberately partial (see `LOOK_GAIN`) pass conservatively left behind --
-// jumping straight to the full measured gap in one step is what produced
-// oversaturated, clipped results in earlier iterations of this pipeline.
-pub fn derive_look_chain(
-    img: &image::RgbaImage,
-    base: &EditState,
-    reference: &LookProfile,
-    faces: &[[f32; 4]],
-    passes: usize,
-) -> Vec<LookTransfer> {
-    let mut preview = match baked_lut(base) {
-        Some(lut) => render_through_lut33(img, &lut),
-        None => img.clone(),
-    };
-    let mut chain = Vec::new();
-    for _ in 0..passes {
-        let Some(current) = LookProfile::measure(preview.as_raw(), preview.width(), preview.height(), faces)
-        else {
-            break;
-        };
-        let transfer = derive_transfer(&current, reference);
-        preview = render_through_transfer(&preview, &transfer);
-        chain.push(transfer);
-    }
-    chain
-}
-
-// The single LUT `state` currently produces, composing the AI auto-adjust LUT
-// (if enabled) with the look-transfer chain (if any) -- or, if CanonCGT
-// produced a transfer, that instead (it supersedes the chain; see
-// `look_chain_for` in main.rs). `look_strength`/`ai_lut_strength` blend
-// their respective LUT toward the identity, so 0 is a no-op and 1 is the full
-// effect; `look_strength` can go up to 2 to carry a transfer further than the
-// captured look itself.
+// The single LUT `state` currently produces, composing the optional AI
+// auto-adjust LUT with the constrained look-model transform.
 pub fn baked_lut(state: &EditState) -> Option<Vec<f32>> {
-    if let Some(canon) = &state.canon_lut {
-        return Some(if (state.look_strength - 1.0).abs() < 1e-3 {
-            canon.clone()
-        } else {
-            blend_lut(&identity_photo_lut(), canon, state.look_strength)
-        });
-    }
-
-    let mut lut: Option<Vec<f32>> = None;
+    let mut lut = state.raw_development.clone();
     if state.ai_lut_enabled {
         let mut ai = combined_photo_lut(state.ai_lut_weights);
         if (state.ai_lut_strength - 1.0).abs() >= 1e-3 {
@@ -1620,8 +1653,9 @@ pub fn baked_lut(state: &EditState) -> Option<Vec<f32>> {
     }
     if !state.look.is_empty() {
         let mut look_lut = bake_look_chain(&state.look);
-        if (state.look_strength - 1.0).abs() >= 1e-3 {
-            look_lut = blend_lut(&identity_photo_lut(), &look_lut, state.look_strength);
+        let strength = state.look_strength.clamp(0.0, 1.0);
+        if (strength - 1.0).abs() >= 1e-3 {
+            look_lut = blend_lut(&identity_photo_lut(), &look_lut, strength);
         }
         lut = Some(match lut {
             Some(base) => compose_luts(&base, &look_lut, 33),
@@ -1631,12 +1665,14 @@ pub fn baked_lut(state: &EditState) -> Option<Vec<f32>> {
     lut
 }
 
+fn photo_lut_enabled(state: &EditState) -> bool {
+    state.ai_lut_enabled || state.raw_development.is_some() || !state.look.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        combined_photo_lut, damp_lut_skin_hue, derive_transfer, identity_photo_lut, linear_to_oklab,
-        percentile, photo_luts, skin_hue_degrees, srgb_to_linear, LookProfile, RegionTone,
-        HUE_SECTORS, LOOK_ANCHORS, LOOK_GAIN, REGION_COUNT, SKIN_SECTOR_DAMP,
+        combined_photo_lut, identity_photo_lut, percentile, photo_luts, EditState, LookProfile,
     };
 
     #[test]
@@ -1649,6 +1685,14 @@ mod tests {
         let lut = combined_photo_lut([1.0, 0.0, 0.0]);
         assert_eq!(lut.len(), 3 * 33 * 33 * 33);
         assert!(lut.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn raw_development_enables_the_gpu_photo_lut_pass() {
+        let mut state = EditState::default();
+        assert!(!super::photo_lut_enabled(&state));
+        state.raw_development = Some(identity_photo_lut());
+        assert!(super::photo_lut_enabled(&state));
     }
 
     // Regression test: a histogram with mass concentrated in the top bucket
@@ -1697,7 +1741,8 @@ mod tests {
                 image::Rgba([128, 128, 128, 255]) // neutral grey, 30% of pixels
             }
         });
-        let profile = LookProfile::measure(img.as_raw(), w, h, &[]).expect("measure should succeed");
+        let profile =
+            LookProfile::measure(img.as_raw(), w, h, &[]).expect("measure should succeed");
 
         for (band, evidence) in profile.cast_evidence.iter().enumerate() {
             if *evidence < 0.01 {
@@ -1712,198 +1757,5 @@ mod tests {
                  well above 0.1 here"
             );
         }
-    }
-
-    // Regression test for a reported symptom: after CanonCGT's direct
-    // prediction started getting blended into the final LUT (see
-    // `canoncgt::blend_by_confidence`), faces came out desaturated. Root
-    // cause: `SKIN_SECTOR_DAMP` only ever lived inside the Oklab statistical
-    // stage's own transfer math, so a magnitude-weighted blend could still
-    // hand back a LUT that pushed skin hard, if CanonCGT's own (undamped)
-    // opinion about skin was the stronger of the two. `damp_lut_skin_hue`
-    // re-asserts the same protection directly on the LUT a caller is about
-    // to use, regardless of which stage produced it.
-    #[test]
-    fn damp_lut_skin_hue_protects_skin_but_leaves_other_hues_alone() {
-        let profile = LookProfile {
-            tone: [0.0; LOOK_ANCHORS.len()],
-            cast: [[0.0; 2]; 3],
-            cast_evidence: [0.0; 3],
-            chroma: 0.0,
-            hue_chroma: [0.0; HUE_SECTORS],
-            hue_axis: [[0.0; 2]; HUE_SECTORS],
-            hue_evidence: [0.0; HUE_SECTORS],
-            regions: {
-                let mut r = [RegionTone::default(); REGION_COUNT];
-                r[0] = RegionTone { lightness: 0.6, chroma: 0.05, hue_axis: [1.0, 0.0], share: 0.2 };
-                r
-            },
-        };
-        assert_eq!(skin_hue_degrees(&profile), Some(0.0));
-
-        let n = 33usize;
-        // A uniform, aggressive shift on every cell -- stands in for an
-        // upstream stage (like CanonCGT's own opinion) with no idea skin
-        // needs protecting.
-        let before: Vec<f32> = identity_photo_lut().iter().map(|v| (v + 0.3).min(1.0)).collect();
-        let mut lut = before.clone();
-
-        damp_lut_skin_hue(&mut lut, n, None, &profile);
-
-        let mut near = Vec::new();
-        let mut far = Vec::new();
-        for i in 0..n * n * n {
-            let rgb = [
-                (i % n) as f32 / (n - 1) as f32,
-                ((i / n) % n) as f32 / (n - 1) as f32,
-                (i / (n * n)) as f32 / (n - 1) as f32,
-            ];
-            let lab = linear_to_oklab([srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])]);
-            let chroma = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
-            if chroma <= 0.02 {
-                continue; // hue is meaningless this close to neutral
-            }
-            let hue = lab[2].atan2(lab[1]).to_degrees().rem_euclid(360.0);
-            let idx = i * 3;
-            let before_dev = (before[idx] - rgb[0]).abs();
-            if before_dev <= 1e-4 {
-                continue;
-            }
-            let retained = (lut[idx] - rgb[0]).abs() / before_dev;
-            if !(15.0..=345.0).contains(&hue) {
-                near.push(retained);
-            } else if (170.0..190.0).contains(&hue) {
-                far.push(retained);
-            }
-        }
-        assert!(!near.is_empty() && !far.is_empty(), "test setup should sample both hue neighborhoods");
-        let avg = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
-        let (near_avg, far_avg) = (avg(&near), avg(&far));
-        println!("near-skin retained={near_avg:.3}  far-from-skin retained={far_avg:.3}");
-        assert!(near_avg < 0.6, "skin-hue cells should have most of their deviation damped away, retained {near_avg}");
-        assert!(far_avg > 0.9, "cells far from skin hue should be essentially untouched, retained {far_avg}");
-    }
-
-    // Regression test for a reported gap: `damp_lut_skin_hue` used to key
-    // *only* off the reference photo's own detected skin -- a reference with
-    // no detected face (partial profile, small face, no face at all) fully
-    // disabled skin protection, even for a target full of faces. Now the
-    // target's own skin hue takes priority. Here `reference` has no
-    // detectable skin region (share = 0.0) at all; protection should still
-    // fire, anchored on `target_skin_hue`.
-    #[test]
-    fn damp_lut_skin_hue_falls_back_to_target_when_reference_has_no_skin() {
-        let reference = LookProfile {
-            tone: [0.0; LOOK_ANCHORS.len()],
-            cast: [[0.0; 2]; 3],
-            cast_evidence: [0.0; 3],
-            chroma: 0.0,
-            hue_chroma: [0.0; HUE_SECTORS],
-            hue_axis: [[0.0; 2]; HUE_SECTORS],
-            hue_evidence: [0.0; HUE_SECTORS],
-            regions: [RegionTone::default(); REGION_COUNT], // no detected skin anywhere
-        };
-        assert_eq!(skin_hue_degrees(&reference), None, "test setup: reference must have no detected skin");
-
-        let n = 33usize;
-        let before: Vec<f32> = identity_photo_lut().iter().map(|v| (v + 0.3).min(1.0)).collect();
-        let mut lut = before.clone();
-
-        // Target's own skin sits at hue 0 degrees.
-        damp_lut_skin_hue(&mut lut, n, Some(0.0), &reference);
-
-        let mut near_retained = None;
-        for i in 0..n * n * n {
-            let rgb = [
-                (i % n) as f32 / (n - 1) as f32,
-                ((i / n) % n) as f32 / (n - 1) as f32,
-                (i / (n * n)) as f32 / (n - 1) as f32,
-            ];
-            let lab = linear_to_oklab([srgb_to_linear(rgb[0]), srgb_to_linear(rgb[1]), srgb_to_linear(rgb[2])]);
-            let chroma = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
-            if chroma <= 0.02 {
-                continue;
-            }
-            let hue = lab[2].atan2(lab[1]).to_degrees().rem_euclid(360.0);
-            if !(2.0..=358.0).contains(&hue) {
-                let idx = i * 3;
-                let before_dev = (before[idx] - rgb[0]).abs();
-                if before_dev > 1e-4 {
-                    near_retained = Some((lut[idx] - rgb[0]).abs() / before_dev);
-                    break;
-                }
-            }
-        }
-        let retained = near_retained.expect("test setup should sample a near-hue-0 cell");
-        assert!(retained < 0.6, "skin protection should fire from target_skin_hue even with a skin-less reference, retained {retained}");
-    }
-
-    // Regression test for the other half of the same gap: `derive_transfer`
-    // used to pick the damped hue sector from `reference`'s skin alone
-    // (`skin_sector(reference)`). With a reference that has no detected skin
-    // region, every sector -- including the one holding `current`'s own,
-    // real face -- got full, undamped correction. Now `current`'s own skin
-    // sector takes priority.
-    #[test]
-    fn derive_transfer_damps_current_skin_sector_even_when_reference_has_none() {
-        let unit = |deg: f32| [deg.to_radians().cos(), deg.to_radians().sin()];
-
-        let mut current = LookProfile {
-            tone: [0.0; LOOK_ANCHORS.len()],
-            cast: [[0.0; 2]; 3],
-            cast_evidence: [0.0; 3],
-            chroma: 0.0,
-            hue_chroma: [0.1; HUE_SECTORS],
-            hue_axis: [[0.0; 2]; HUE_SECTORS],
-            hue_evidence: [0.0; HUE_SECTORS],
-            regions: [RegionTone::default(); REGION_COUNT],
-        };
-        // Current's own face: skin hue 10 degrees, sector 0 (0..45).
-        current.regions[0] = RegionTone { lightness: 0.6, chroma: 0.05, hue_axis: unit(10.0), share: 0.2 };
-        current.hue_axis[0] = unit(10.0);
-        current.hue_evidence[0] = 0.5;
-        // An unrelated sector (180..225) with the same angular gap to reference,
-        // as a control that should be corrected normally (not damped).
-        current.hue_axis[4] = unit(190.0);
-        current.hue_evidence[4] = 0.5;
-
-        let reference = LookProfile {
-            tone: [0.0; LOOK_ANCHORS.len()],
-            cast: [[0.0; 2]; 3],
-            cast_evidence: [0.0; 3],
-            chroma: 0.0,
-            hue_chroma: [0.1; HUE_SECTORS],
-            hue_axis: {
-                let mut a = [[0.0; 2]; HUE_SECTORS];
-                a[0] = unit(40.0);
-                a[4] = unit(220.0);
-                a
-            },
-            hue_evidence: {
-                let mut e = [0.0; HUE_SECTORS];
-                e[0] = 0.5;
-                e[4] = 0.5;
-                e
-            },
-            regions: [RegionTone::default(); REGION_COUNT], // no detected skin
-        };
-        assert_eq!(skin_hue_degrees(&reference), None, "test setup: reference must have no detected skin");
-
-        let transfer = derive_transfer(&current, &reference);
-
-        // Both sectors have the same 30-degree gap; only sector 0 overlaps
-        // current's own skin and should come out damped.
-        let undamped = 30.0 * LOOK_GAIN * 0.5;
-        let damped = undamped * SKIN_SECTOR_DAMP;
-        println!("skin sector rotate={:.3} (expect ~{damped:.3})  control sector rotate={:.3} (expect ~{undamped:.3})",
-            transfer.hue_rotate[0], transfer.hue_rotate[4]);
-        assert!(
-            (transfer.hue_rotate[0] - damped).abs() < 0.2,
-            "current's own skin sector should be damped to ~{damped}, got {}", transfer.hue_rotate[0]
-        );
-        assert!(
-            (transfer.hue_rotate[4] - undamped).abs() < 0.2,
-            "an unrelated sector with the same gap should be corrected in full (~{undamped}), got {}", transfer.hue_rotate[4]
-        );
     }
 }

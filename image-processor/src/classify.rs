@@ -9,9 +9,26 @@ const INPUT_SIZE: u32 = 256;
 const EMBEDDING_SIZE: usize = 512;
 const MIN_CONFIDENCE: f32 = 0.05;
 const TAGS: [&str; 20] = [
-    "people", "animals", "wedding", "cars", "indoors", "nature", "landscape", "city",
-    "travel", "food", "sports", "architecture", "portrait", "family", "party", "beach",
-    "mountains", "night", "computer graphics", "document",
+    "people",
+    "animals",
+    "wedding",
+    "cars",
+    "indoors",
+    "nature",
+    "landscape",
+    "city",
+    "travel",
+    "food",
+    "sports",
+    "architecture",
+    "portrait",
+    "family",
+    "party",
+    "beach",
+    "mountains",
+    "night",
+    "computer graphics",
+    "document",
 ];
 
 pub struct Classifier {
@@ -41,8 +58,9 @@ impl Classifier {
 
     // At most two controlled tags, most confident first.
     pub fn classify(&self, img: &image::RgbaImage) -> Vec<String> {
-        self.embedding(img)
-            .map_or_else(Vec::new, |embedding| top_tags(&embedding, &self.tag_embeddings))
+        self.embedding(img).map_or_else(Vec::new, |embedding| {
+            top_tags(&embedding, &self.tag_embeddings)
+        })
     }
 
     // Normalized MobileCLIP image embedding, reused for semantic burst

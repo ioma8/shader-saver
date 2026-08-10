@@ -87,9 +87,15 @@ impl Detector {
 
         let mut detections = Vec::new();
         for (level, stride) in STRIDES.iter().copied().enumerate() {
-            let Ok(cls) = outputs[level].as_slice::<f32>() else { continue };
-            let Ok(obj) = outputs[3 + level].as_slice::<f32>() else { continue };
-            let Ok(bbox) = outputs[6 + level].as_slice::<f32>() else { continue };
+            let Ok(cls) = outputs[level].as_slice::<f32>() else {
+                continue;
+            };
+            let Ok(obj) = outputs[3 + level].as_slice::<f32>() else {
+                continue;
+            };
+            let Ok(bbox) = outputs[6 + level].as_slice::<f32>() else {
+                continue;
+            };
             let cells = (INPUT_SIZE as usize / stride).pow(2);
             for i in 0..cells {
                 // The exported YuNet heads already include sigmoid; score is
@@ -142,7 +148,10 @@ fn nms(detections: &mut Vec<Detection>) -> Vec<Detection> {
     detections.sort_by(|a, b| b.score.total_cmp(&a.score));
     let mut kept = Vec::new();
     for detection in detections.drain(..) {
-        if kept.iter().all(|&kept| iou(detection, kept) < NMS_THRESHOLD) {
+        if kept
+            .iter()
+            .all(|&kept| iou(detection, kept) < NMS_THRESHOLD)
+        {
             kept.push(detection);
         }
     }
@@ -161,9 +170,27 @@ mod tests {
     #[test]
     fn nms_removes_overlapping_lower_score_detection() {
         let mut detections = vec![
-            Detection { x: 0.0, y: 0.0, w: 100.0, h: 100.0, score: 0.9 },
-            Detection { x: 5.0, y: 5.0, w: 100.0, h: 100.0, score: 0.8 },
-            Detection { x: 300.0, y: 300.0, w: 20.0, h: 20.0, score: 0.7 },
+            Detection {
+                x: 0.0,
+                y: 0.0,
+                w: 100.0,
+                h: 100.0,
+                score: 0.9,
+            },
+            Detection {
+                x: 5.0,
+                y: 5.0,
+                w: 100.0,
+                h: 100.0,
+                score: 0.8,
+            },
+            Detection {
+                x: 300.0,
+                y: 300.0,
+                w: 20.0,
+                h: 20.0,
+                score: 0.7,
+            },
         ];
         assert_eq!(nms(&mut detections).len(), 2);
     }

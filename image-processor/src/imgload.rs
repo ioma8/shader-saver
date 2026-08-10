@@ -1,5 +1,5 @@
-// Unified image loading: standard formats via the `image` crate, camera RAW
-// formats via rawloader/imagepipe (pure-Rust decode + demosaic).
+// Unified image loading. RAW files are always decoded from sensor data by
+// imagepipe; embedded JPEG previews are used only for browse thumbnails.
 use jpgfromraw::FindJpegType;
 use std::path::Path;
 
@@ -11,18 +11,18 @@ pub const RAW_EXTS: [&str; 19] = [
 
 fn ext_of(path: &Path) -> Option<String> {
     path.extension()
-        .and_then(|e| e.to_str())
+        .and_then(|extension| extension.to_str())
         .map(str::to_lowercase)
 }
 
 pub fn is_raw(path: &Path) -> bool {
-    ext_of(path)
-        .is_some_and(|e| RAW_EXTS.contains(&e.as_str()))
+    ext_of(path).is_some_and(|extension| RAW_EXTS.contains(&extension.as_str()))
 }
 
 pub fn is_supported(path: &Path) -> bool {
-    ext_of(path)
-        .is_some_and(|e| STD_EXTS.contains(&e.as_str()) || RAW_EXTS.contains(&e.as_str()))
+    ext_of(path).is_some_and(|extension| {
+        STD_EXTS.contains(&extension.as_str()) || RAW_EXTS.contains(&extension.as_str())
+    })
 }
 
 pub fn all_exts() -> Vec<&'static str> {
@@ -30,44 +30,71 @@ pub fn all_exts() -> Vec<&'static str> {
 }
 
 pub fn load_preview_rgba(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
-    // For grid thumbnails use the smallest embedded JPEG — already tiny, no full decode needed.
-    let find_type = if max_dim > 0 { FindJpegType::Smallest } else { FindJpegType::Largest };
+    let find_type = if max_dim > 0 {
+        FindJpegType::Smallest
+    } else {
+        FindJpegType::Largest
+    };
     let bytes = pollster::block_on(jpgfromraw::process_file_bytes(path, find_type)).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?;
-    let img = if max_dim > 0 { img.thumbnail(max_dim, max_dim) } else { img };
-    Some(img.to_rgba8())
+    let image = image::load_from_memory(&bytes).ok()?;
+    let image = if max_dim > 0 {
+        image.thumbnail(max_dim, max_dim)
+    } else {
+        image
+    };
+    Some(image.to_rgba8())
 }
 
 pub fn load_edit_rgba(path: &Path) -> Option<(image::RgbaImage, bool)> {
-    if is_raw(path) {
-        let bytes = pollster::block_on(jpgfromraw::process_file_bytes(path, FindJpegType::Largest)).ok()?;
-        let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-        return Some((img, true));
-    }
-    load_rgba(path, 0).map(|img| (img, false))
+    let max_dim = if is_raw(path) { 2048 } else { 0 };
+    load_rgba(path, max_dim).map(|image| (image, false))
 }
 
-// Decode to RGBA8. max_dim = 0 loads full resolution; otherwise the result
-// fits within max_dim×max_dim (used for thumbnails — RAW decode honors the
-// limit during demosaic, which is much faster than full-size decode).
+// RAW uses a real sensor decode (demosaic, camera WB/matrix and imagepipe's
+// display curve), never the embedded camera preview. Raster images are decoded
+// normally. This is the one base image used by editing, training and export.
 pub fn load_rgba(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
     if is_raw(path) {
-        let dec = imagepipe::simple_decode_8bit(path, max_dim as usize, max_dim as usize).ok()?;
-        let mut rgba = Vec::with_capacity(dec.width * dec.height * 4);
-        for px in dec.data.chunks_exact(3) {
-            rgba.extend_from_slice(px);
+        let decoded =
+            imagepipe::simple_decode_8bit(path, max_dim as usize, max_dim as usize).ok()?;
+        let mut rgba = Vec::with_capacity(decoded.width * decoded.height * 4);
+        for pixel in decoded.data.chunks_exact(3) {
+            rgba.extend_from_slice(pixel);
             rgba.push(255);
         }
-        let w = u32::try_from(dec.width).expect("image width fits u32");
-        let h = u32::try_from(dec.height).expect("image height fits u32");
-        image::RgbaImage::from_raw(w, h, rgba)
+        return image::RgbaImage::from_raw(
+            u32::try_from(decoded.width).ok()?,
+            u32::try_from(decoded.height).ok()?,
+            rgba,
+        );
+    }
+
+    let image = image::open(path).ok()?;
+    let image = if max_dim > 0 {
+        image.thumbnail(max_dim, max_dim)
     } else {
-        let img = image::open(path).ok()?;
-        let img = if max_dim > 0 {
-            img.thumbnail(max_dim, max_dim)
-        } else {
-            img
+        image
+    };
+    Some(image.to_rgba8())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_rgba;
+    use std::path::Path;
+
+    #[test]
+    fn raw_and_jpeg_are_decoded_from_their_real_pixels() {
+        let (Ok(jpeg), Ok(raw)) = (
+            std::env::var("LOOK_PARITY_JPEG"),
+            std::env::var("LOOK_PARITY_RAW"),
+        ) else {
+            return;
         };
-        Some(img.to_rgba8())
+        for path in [&jpeg, &raw] {
+            let image = load_rgba(Path::new(path), 768)
+                .unwrap_or_else(|| panic!("decode failed for {path}"));
+            assert!(image.width() > 0 && image.height() > 0);
+        }
     }
 }

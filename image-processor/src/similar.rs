@@ -22,8 +22,10 @@ pub fn groups(candidates: &[Candidate]) -> Vec<Vec<usize>> {
     let mut parent: Vec<usize> = (0..candidates.len()).collect();
     for i in 0..candidates.len() {
         for j in (i + 1)..candidates.len() {
-            if cosine(&candidates[i].analysis.embedding, &candidates[j].analysis.embedding)
-                >= SIMILARITY_THRESHOLD
+            if cosine(
+                &candidates[i].analysis.embedding,
+                &candidates[j].analysis.embedding,
+            ) >= SIMILARITY_THRESHOLD
             {
                 union(&mut parent, i, j);
             }
@@ -71,7 +73,12 @@ mod tests {
     fn candidate(path: &str, embedding: Vec<f32>) -> Candidate {
         Candidate {
             path: PathBuf::from(path),
-            analysis: Analysis { embedding, rating: 3, face_count: 0, largest_face: 0.0 },
+            analysis: Analysis {
+                embedding,
+                rating: 3,
+                face_count: 0,
+                largest_face: 0.0,
+            },
         }
     }
 

@@ -1,4 +1,3 @@
-mod canoncgt;
 mod classify;
 mod cull;
 mod enhance;
@@ -6,9 +5,11 @@ mod face;
 mod imgload;
 #[cfg(test)]
 mod judge;
+mod look_model;
 mod presets;
 mod processor;
 mod rate;
+mod raw_develop;
 mod similar;
 mod tags;
 
@@ -29,8 +30,10 @@ const KEY_OPEN_PATH: &str = "open_path";
 const KEY_EXPORT_PATH: &str = "export_path";
 const KEY_SCAN_DIR: &str = "scan_dir";
 const KEY_AUTO: &str = "auto_adjust";
+const KEY_DEVELOP_RAW: &str = "develop_raw";
 const KEY_CAPTURE_LOOK: &str = "capture_look";
 const KEY_APPLY_LOOK: &str = "apply_look";
+const KEY_TEACH_LOOK_MODEL: &str = "teach_look_model";
 const KEY_LOOK_FOLDER: &str = "look_folder";
 const KEY_TRASH_REJECTS: &str = "trash_rejects";
 const KEY_MOVE_REJECTS: &str = "move_rejects";
@@ -41,15 +44,21 @@ const KEY_ADJUST_FOLDER: &str = "adjust_folder";
 const KEY_SIMILAR_CULL: &str = "similar_cull";
 const CULL_HELP_KEY: &str = "browse_cull_help_visible";
 
-// Refinement passes when carrying a look onto a photo. See `derive_look_chain`:
-// each pass corrects what the previous one conservatively left behind.
-const LOOK_PASSES: usize = 3;
-
 // ---- Edit persistence (SQLite, one JSON row per image path) ----
 
 pub fn app_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".image-processor"))
+}
+
+fn existing_look_examples_path(dir: &Path) -> PathBuf {
+    let current = dir.join("look-model-examples.json");
+    if current.exists() {
+        current
+    } else {
+        // One-time compatibility with examples captured by the prototype.
+        dir.join("look-student-examples.json")
+    }
 }
 
 fn open_db() -> Option<rusqlite::Connection> {
@@ -70,6 +79,10 @@ fn open_db() -> Option<rusqlite::Connection> {
             id      INTEGER PRIMARY KEY CHECK (id = 1),
             profile TEXT NOT NULL,
             thumb   BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS captured_look_full (
+            id      INTEGER PRIMARY KEY CHECK (id = 1),
+            image   BLOB NOT NULL
         );",
     )
     .ok()?;
@@ -103,17 +116,16 @@ fn load_edits(conn: &rusqlite::Connection, path: &Path) -> Option<EditState> {
     serde_json::from_str(&json).ok()
 }
 
-// A captured look: the statistics that describe it, plus a small copy of the
-// reference as it looked.
+// A captured look keeps a small model reference and a separate full-resolution
+// overlay reference. The neural path never needs the latter.
 //
 // The pixels are kept because statistics alone cannot serve as an objective. When
 // the test harness scores results against the reference itself, and that needs the
 // reference, not a summary of it.
 struct CapturedLook {
     profile: LookProfile,
-    // Kept only so the test harness can score results against the reference; the
-    // transfer itself never looks at it.
     reference: image::RgbaImage,
+    reference_full: image::RgbaImage,
 }
 
 // The captured look outlives the session: it is measured data, not GPU state.
@@ -140,6 +152,23 @@ fn save_look(conn: &rusqlite::Connection, look: &CapturedLook) {
          ON CONFLICT(id) DO UPDATE SET profile = ?1, thumb = ?2",
         rusqlite::params![profile, thumb],
     );
+    let full = image::DynamicImage::ImageRgba8(look.reference_full.clone()).to_rgb8();
+    let mut full_bytes = Vec::new();
+    if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut full_bytes, 92)
+        .encode(
+            full.as_raw(),
+            full.width(),
+            full.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .is_ok()
+    {
+        let _ = conn.execute(
+            "INSERT INTO captured_look_full (id, image) VALUES (1, ?1)
+             ON CONFLICT(id) DO UPDATE SET image = ?1",
+            rusqlite::params![full_bytes],
+        );
+    }
 }
 
 fn load_look(conn: &rusqlite::Connection) -> Option<CapturedLook> {
@@ -150,97 +179,45 @@ fn load_look(conn: &rusqlite::Connection) -> Option<CapturedLook> {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .ok()?;
+    let reference = image::load_from_memory(&thumb).ok()?.to_rgba8();
+    let reference_full = conn
+        .query_row(
+            "SELECT image FROM captured_look_full WHERE id = 1",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .ok()
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+        .map(|image| image.to_rgba8())
+        .unwrap_or_else(|| reference.clone());
     Some(CapturedLook {
         profile: serde_json::from_str(&profile).ok()?,
-        reference: image::load_from_memory(&thumb).ok()?.to_rgba8(),
+        reference,
+        reference_full,
     })
 }
 
-// Carry the captured look onto `img`, writing the result into `state`.
-//
-// CanonCGT (see `canoncgt.rs`) is the primary path: given the target and the
-// reference photo actually captured, it predicts a single reference-conditioned
-// LUT in one forward pass — a real network with content understanding, not
-// hand-built statistics, and it visibly does the job better. `canon` is `None`
-// only if the embedded model somehow failed to load (it never should; the weights
-// are compiled in), in which case this falls back to the deterministic Oklab
-// pipeline below.
-//
-// Before handing the photos to CanonCGT, the target is pre-normalized by the
-// Oklab pipeline's own tone/cast/hue correction (baked to a raw LUT and applied
-// to a small working copy, never touching the network's own output). This exists
-// because CanonCGT under-corrects when target and reference were shot under very
-// different light — its canonicalizer is trained mostly on pairs that share scene
-// light and differ only in applied grade, so a large lighting gap is plausibly
-// out of its training distribution. Two things that don't work were tried first
-// and rejected by measurement, not by reasoning about it: turning up
-// `look_strength` made results monotonically worse, and re-deriving several times
-// by feeding CanonCGT's own output back into itself diverged into incoherent
-// noise by the second pass (see canoncgt.rs). Pre-normalizing with an
-// *independent*, already-validated correction avoided both failure modes.
-// Measured over 72 ordered pairs in a real photo shoot: mean style similarity
-// 0.7389 -> 0.8648, and — the number that actually matters for reliability, since
-// it is the worst pair that reads as "broken" — the minimum across all pairs rose
-// from 0.2001 to 0.5218. It cost a little on pairs that were already a near-exact
-// match (down 0.02-0.13 on 20 of the 72), which is an acceptable trade against a
-// 2.6x better worst case.
-//
-// The fallback pipeline's own history is worth keeping in mind when touching it:
-// applied with no auto-adjust underneath, because the FiveK enhancer is an
-// aesthetic model with its own opinions, and side-by-side with the look disabled
-// entirely, the enhancer alone was what turned a sunlit tree olive green — the
-// transfer had been taking the blame for it. And deliberately deterministic: an
-// earlier version searched its parameters against a learned style-similarity
-// model, which scored well and wrecked pictures — grey pavement pushed to pink,
-// greens to neon, gradients posterized flat. A learned metric has no opinion about
-// pink pavement, so a free search finds pink pavement. The judge model is still
-// used — but to *check* this code from the test harness, never to steer it.
+// Carry the captured look onto `img` with the single constrained look model.
+// Its output is one photographic transform, baked and applied by the existing
+// LUT path. There is deliberately no model selection, blend, or fallback.
 fn look_chain_for(
     img: &image::RgbaImage,
     state: &mut EditState,
     look: &CapturedLook,
-    canon: Option<&canoncgt::CanonCGT>,
+    model: &look_model::LookModel,
     faces: &[[f32; 4]],
 ) {
-    if let Some(canon) = canon {
-        let mut pre_state = state.clone();
-        // When a previous CanonCGT look was applied on this photo,
-        // `state.canon_lut` is still set. The prenormalization LUT must be
-        // built from only the Oklab-derived pre-correction, not contaminated
-        // by an old neural prediction (which would also short-circuit
-        // `baked_lut` straight to the old LUT).
-        pre_state.canon_lut = None;
-        pre_state.look = processor::derive_look_chain(img, state, &look.profile, faces, LOOK_PASSES);
-        // A chain that derived to nothing (target and reference already match)
-        // bakes to `None`; an explicit identity keeps the prenormalized call a
-        // true no-op in that case rather than skipping straight to plain
-        // `predict_lut` and losing the (small, already-tested) benefit of routing
-        // every photo through the same code path.
-        let pre_lut = processor::baked_lut(&pre_state)
-            .unwrap_or_else(processor::identity_photo_lut);
-        // The target's own skin hue, if any -- takes priority over the
-        // reference's for skin protection (see `damp_lut_skin_hue`'s doc
-        // comment): it's the face this LUT is actually about to be applied to.
-        let target_regions = processor::measure_regions(img.as_raw(), img.width(), img.height(), faces);
-        let target_skin_hue = processor::skin_hue_degrees_from_region(&target_regions[0]);
-        if let Some(lut) = canon.predict_lut_prenormalized(img, &look.reference, &pre_lut, &look.profile, target_skin_hue) {
-            state.canon_lut = Some(lut);
-            state.ai_lut_enabled = false;
-            state.look.clear();
-            return;
-        }
-        // CanonCGT loaded but inference failed for this pair -- `pre_state.look`
-        // is already exactly what the Oklab-only fallback below would recompute
-        // from the same `img`/`state`/`look.profile`/`faces`, so reuse it instead.
-        state.look = pre_state.look;
-        return;
+    if let Some(current) =
+        processor::LookProfile::measure(img.as_raw(), img.width(), img.height(), faces)
+    {
+        state.ai_lut_enabled = false;
+        state.look = vec![model.predict(&current, &look.profile)];
     }
-    state.look = processor::derive_look_chain(img, state, &look.profile, faces, LOOK_PASSES);
 }
 
 // Downscale for the judge, which works at 512 square regardless.
 fn look_reference_thumb(img: &image::RgbaImage) -> image::RgbaImage {
-    image::imageops::resize(img, 512, 512, image::imageops::FilterType::Triangle)
+    image::imageops::thumbnail(img, 512, 512)
 }
 
 fn load_bool_pref(conn: &rusqlite::Connection, key: &str, default: bool) -> bool {
@@ -325,40 +302,63 @@ fn show_dir_item(
     let selected = current == Some(path);
     ui.horizontal(|ui| {
         ui.add_space(f32::from(depth) * 10.0);
-        let (tri_rect, tri_resp) = ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::click());
+        let (tri_rect, tri_resp) =
+            ui.allocate_exact_size(egui::vec2(12.0, 14.0), egui::Sense::click());
         if ui.is_rect_visible(tri_rect) {
             let c = tri_rect.center();
             let color = egui::Color32::from_gray(110);
             let pts = if is_exp {
-                vec![c + egui::vec2(-4.0, -2.0), c + egui::vec2(4.0, -2.0), c + egui::vec2(0.0, 3.0)]
+                vec![
+                    c + egui::vec2(-4.0, -2.0),
+                    c + egui::vec2(4.0, -2.0),
+                    c + egui::vec2(0.0, 3.0),
+                ]
             } else {
-                vec![c + egui::vec2(-2.0, -4.0), c + egui::vec2(3.0, 0.0), c + egui::vec2(-2.0, 4.0)]
+                vec![
+                    c + egui::vec2(-2.0, -4.0),
+                    c + egui::vec2(3.0, 0.0),
+                    c + egui::vec2(-2.0, 4.0),
+                ]
             };
-            ui.painter().add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+            ui.painter()
+                .add(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
         }
         if tri_resp.clicked() {
-            if is_exp { expanded.remove(path); } else { expanded.insert(path.to_owned()); }
+            if is_exp {
+                expanded.remove(path);
+            } else {
+                expanded.insert(path.to_owned());
+            }
         }
         let color = if selected {
             egui::Color32::from_rgb(90, 140, 255)
         } else {
             egui::Color32::from_gray(195)
         };
-        if ui.add(
-            egui::Label::new(egui::RichText::new(name).small().color(color))
-                .sense(egui::Sense::click()),
-        ).clicked() {
+        if ui
+            .add(
+                egui::Label::new(egui::RichText::new(name).small().color(color))
+                    .sense(egui::Sense::click()),
+            )
+            .clicked()
+        {
             expanded.insert(path.to_owned());
             ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_SCAN_DIR), path.to_owned()));
         }
     });
     if is_exp {
-        let Ok(rd) = std::fs::read_dir(path) else { return };
+        let Ok(rd) = std::fs::read_dir(path) else {
+            return;
+        };
         let mut dirs: Vec<PathBuf> = rd
             .filter_map(std::result::Result::ok)
             .filter(|e| e.file_type().is_ok_and(|ft| ft.is_dir()))
             .map(|e| e.path())
-            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|s| !s.starts_with('.')))
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|s| !s.starts_with('.'))
+            })
             .collect();
         dirs.sort_unstable();
         for dir in dirs {
@@ -390,9 +390,9 @@ enum BrowseSort {
 
 #[derive(Default)]
 struct ThumbExif {
-    capture_time: Option<i64>,      // YYYYMMDDHHMMSS for sorting
-    shutter: Option<String>,        // pre-formatted: "1/200" or "2s"
-    aperture: Option<(u32, u32)>,   // rational (numerator, denominator), displayed as "f/2.8"
+    capture_time: Option<i64>,    // YYYYMMDDHHMMSS for sorting
+    shutter: Option<String>,      // pre-formatted: "1/200" or "2s"
+    aperture: Option<(u32, u32)>, // rational (numerator, denominator), displayed as "f/2.8"
     iso: Option<u32>,
 }
 
@@ -405,8 +405,13 @@ struct ThumbEntry {
 
 fn read_exif(path: &Path) -> ThumbExif {
     let mut out = ThumbExif::default();
-    let Ok(file) = std::fs::File::open(path) else { return out };
-    let Ok(exif) = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file)) else { return out };
+    let Ok(file) = std::fs::File::open(path) else {
+        return out;
+    };
+    let Ok(exif) = exif::Reader::new().read_from_container(&mut std::io::BufReader::new(file))
+    else {
+        return out;
+    };
 
     if let Some(f) = exif.get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY) {
         if let exif::Value::Ascii(v) = &f.value {
@@ -414,12 +419,21 @@ fn read_exif(path: &Path) -> ThumbExif {
                 if let Some((date, time)) = s.split_once(' ') {
                     let mut dp = date.split(':').filter_map(|p| p.parse::<i64>().ok());
                     let mut tp = time.split(':').filter_map(|p| p.parse::<i64>().ok());
-                    if let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) =
-                        (dp.next(), dp.next(), dp.next(), tp.next(), tp.next(), tp.next())
-                    {
+                    if let (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(s)) = (
+                        dp.next(),
+                        dp.next(),
+                        dp.next(),
+                        tp.next(),
+                        tp.next(),
+                        tp.next(),
+                    ) {
                         out.capture_time = Some(
-                            y * 10_000_000_000 + mo * 100_000_000 + d * 1_000_000
-                                + h * 10_000 + mi * 100 + s,
+                            y * 10_000_000_000
+                                + mo * 100_000_000
+                                + d * 1_000_000
+                                + h * 10_000
+                                + mi * 100
+                                + s,
                         );
                     }
                 }
@@ -434,7 +448,11 @@ fn read_exif(path: &Path) -> ThumbExif {
                     // >= 1s: integer whole seconds + optional one decimal place
                     let whole = r.num / r.denom;
                     let tenths = (u64::from(r.num) * 10 / u64::from(r.denom)) % 10;
-                    if tenths < 1 { format!("{whole}s") } else { format!("{whole}.{tenths}s") }
+                    if tenths < 1 {
+                        format!("{whole}s")
+                    } else {
+                        format!("{whole}.{tenths}s")
+                    }
                 } else {
                     // sub-second: display as 1/N using integer division
                     format!("1/{}", r.denom / r.num)
@@ -459,7 +477,6 @@ fn read_exif(path: &Path) -> ThumbExif {
 
     out
 }
-
 
 struct GpuState {
     device: wgpu::Device,
@@ -486,6 +503,7 @@ struct App {
     processor: Option<Processor>,
     image_tex_id: Option<egui::TextureId>,
     original_tex_id: Option<egui::TextureId>,
+    reference_tex: Option<egui::TextureHandle>,
     flags: AppFlags,
     // Zoom state
     zoom_scale: f32,
@@ -535,7 +553,9 @@ struct App {
     adjust_progress: Option<(usize, usize)>,
     look: Option<Arc<CapturedLook>>,
     face_detector: Option<Arc<face::Detector>>,
-    canon: Option<Arc<canoncgt::CanonCGT>>,
+    look_model: Arc<look_model::LookModel>,
+    look_examples: Vec<look_model::TrainingExample>,
+    s_curve: Option<Arc<raw_develop::SCurve>>,
     similar_tx: std::sync::mpsc::Sender<(PathBuf, Option<similar::Analysis>)>,
     similar_rx: std::sync::mpsc::Receiver<(PathBuf, Option<similar::Analysis>)>,
     // (done, total) while semantic burst analysis is running
@@ -548,9 +568,13 @@ impl App {
     fn new() -> Self {
         let db = open_db();
         let meta = db.as_ref().map(cull::load_all_meta).unwrap_or_default();
-        let show_cull_help = db.as_ref().is_none_or(|db| load_bool_pref(db, CULL_HELP_KEY, true));
+        let show_cull_help = db
+            .as_ref()
+            .is_none_or(|db| load_bool_pref(db, CULL_HELP_KEY, true));
         let look = db.as_ref().and_then(load_look).map(Arc::new);
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
         let mut tree_expanded = std::collections::HashSet::new();
         let mut p = PathBuf::from("/");
         tree_expanded.insert(p.clone());
@@ -560,7 +584,15 @@ impl App {
         }
         let (full_tx, full_rx) = std::sync::mpsc::channel();
         let presets_dir = app_dir().map(|d| d.join("presets"));
-        let presets = presets_dir.as_deref().map(presets::list).unwrap_or_default();
+        let presets = presets_dir
+            .as_deref()
+            .map(presets::list)
+            .unwrap_or_default();
+        let look_examples_path = app_dir().map(|d| existing_look_examples_path(&d));
+        let look_examples = look_examples_path
+            .as_deref()
+            .map(look_model::load_examples)
+            .unwrap_or_default();
         let tags = db.as_ref().map(tags::load_all_tags).unwrap_or_default();
         let (classify_tx, classify_rx) = std::sync::mpsc::channel();
         let (rate_tx, rate_rx) = std::sync::mpsc::channel();
@@ -575,6 +607,7 @@ impl App {
             processor: None,
             image_tex_id: None,
             original_tex_id: None,
+            reference_tex: None,
             flags: AppFlags {
                 output_dirty: false,
                 zoom_fit: true,
@@ -624,7 +657,9 @@ impl App {
             adjust_progress: None,
             look,
             face_detector: face::Detector::load().map(Arc::new),
-            canon: canoncgt::CanonCGT::load().map(Arc::new),
+            look_model: Arc::new(look_model::LookModel::train_with_examples(&look_examples)),
+            look_examples,
+            s_curve: raw_develop::SCurve::load().map(Arc::new),
             similar_tx,
             similar_rx,
             similar_progress: None,
@@ -696,9 +731,10 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
                     && event.state == winit::event::ElementState::Pressed
-                    && self.view == View::Edit {
-                        self.view = View::Browse;
-                    }
+                    && self.view == View::Edit
+                {
+                    self.view = View::Browse;
+                }
             }
 
             WindowEvent::Resized(size) => {
@@ -758,23 +794,32 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel::<(usize, egui::ColorImage, ThumbExif)>();
         self.thumb_rx = Some(rx); // dropping the old rx makes a stale loader thread stop
         let ctx = self.egui_ctx.clone();
-        let n_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get).min(8);
+        let n_workers = std::thread::available_parallelism()
+            .map_or(4, std::num::NonZero::get)
+            .min(8);
         let (work_tx, work_rx) = std::sync::mpsc::channel::<(usize, PathBuf)>();
         let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
         for _ in 0..n_workers {
             let work_rx = work_rx.clone();
             let tx = tx.clone();
             let ctx = ctx.clone();
-            std::thread::spawn(move || {
-                loop {
-                    let Ok((idx, path)) = work_rx.lock().unwrap().recv() else { break };
-                    let exif = read_exif(&path);
-                    let Some(img) = imgload::load_preview_rgba(&path, 220) else { continue };
-                    let (img_w, img_h) = img.dimensions();
-                    let ci = egui::ColorImage::from_rgba_unmultiplied([img_w as usize, img_h as usize], &img);
-                    if tx.send((idx, ci, exif)).is_err() { break; }
-                    ctx.request_repaint();
+            std::thread::spawn(move || loop {
+                let Ok((idx, path)) = work_rx.lock().unwrap().recv() else {
+                    break;
+                };
+                let exif = read_exif(&path);
+                let Some(img) = imgload::load_preview_rgba(&path, 220) else {
+                    continue;
+                };
+                let (img_w, img_h) = img.dimensions();
+                let ci = egui::ColorImage::from_rgba_unmultiplied(
+                    [img_w as usize, img_h as usize],
+                    &img,
+                );
+                if tx.send((idx, ci, exif)).is_err() {
+                    break;
                 }
+                ctx.request_repaint();
             });
         }
         for (i, p) in paths.into_iter().enumerate() {
@@ -819,15 +864,27 @@ impl App {
         }
         self.adjust_progress = Some((0, paths.len()));
         let detector = self.face_detector.clone();
-        let canon = self.canon.clone();
+        let look_model = self.look_model.clone();
+        let s_curve = self.s_curve.clone();
         // Workers have no GPU context, so each renders its own preview on the CPU
         // to derive the transfer. The LUT stage is everything a look-transferred
         // state contains, so that preview matches what the GPU shows at full size.
         let work = move |path: &Path| {
-            let img = imgload::load_rgba(path, 768)?;
-            let faces = detector.as_ref().map(|d| d.detect_boxes(&img)).unwrap_or_default();
             let mut state = EditState::default();
-            look_chain_for(&img, &mut state, &look, canon.as_deref(), &faces);
+            let img = if imgload::is_raw(path) {
+                // Develop straight from the RAW file; the imagepipe render is
+                // only an open preview and would stack its own tone curve.
+                let curve = s_curve.as_ref()?;
+                state.raw_isp_enabled = true;
+                raw_develop::develop_raw(path, 768, curve)?
+            } else {
+                imgload::load_rgba(path, 768)?
+            };
+            let faces = detector
+                .as_ref()
+                .map(|d| d.detect_boxes(&img))
+                .unwrap_or_default();
+            look_chain_for(&img, &mut state, &look, look_model.as_ref(), &faces);
             Some(state)
         };
         spawn_folder_workers(paths, work, self.adjust_tx.clone());
@@ -857,7 +914,11 @@ impl App {
         for group in &groups {
             let manual_pick = group
                 .iter()
-                .filter(|&&i| self.meta.get(&candidates[i].path).is_some_and(|m| m.flag == cull::Flag::Pick))
+                .filter(|&&i| {
+                    self.meta
+                        .get(&candidates[i].path)
+                        .is_some_and(|m| m.flag == cull::Flag::Pick)
+                })
                 .copied()
                 .collect::<Vec<_>>();
             let keep = manual_pick.first().copied().unwrap_or_else(|| {
@@ -876,7 +937,12 @@ impl App {
                     .unwrap()
             });
             for &i in group {
-                if i == keep || self.meta.get(&candidates[i].path).is_some_and(|m| m.flag == cull::Flag::Pick) {
+                if i == keep
+                    || self
+                        .meta
+                        .get(&candidates[i].path)
+                        .is_some_and(|m| m.flag == cull::Flag::Pick)
+                {
                     continue;
                 }
                 let path = &candidates[i].path;
@@ -956,6 +1022,13 @@ impl App {
         };
 
         processor.upload_rgba(&img, &gpu.device, &gpu.queue);
+        if state.raw_isp_enabled && imgload::is_raw(path) {
+            if let Some(curve) = self.s_curve.as_ref() {
+                if let Some(developed) = raw_develop::develop_raw(path, 2048, curve) {
+                    processor.replace_input_rgba(&developed, &gpu.queue);
+                }
+            }
+        }
         self.rebind_image_textures();
         self.full_pending = None;
         self.wants_full = preview_quality.then(|| (path.to_owned(), std::time::Instant::now()));
@@ -968,7 +1041,11 @@ impl App {
             window.set_title(name);
         }
 
-        self.tag_edit = self.tags.get(path).map(|t| t.join(", ")).unwrap_or_default();
+        self.tag_edit = self
+            .tags
+            .get(path)
+            .map(|t| t.join(", "))
+            .unwrap_or_default();
 
         self.flags.output_dirty = true;
         self.flags.zoom_fit = true;
@@ -985,6 +1062,20 @@ impl App {
     }
 
     fn render(&mut self) {
+        if self.reference_tex.is_none() {
+            if let Some(look) = &self.look {
+                let image = &look.reference_full;
+                let color = egui::ColorImage::from_rgba_unmultiplied(
+                    [image.width() as usize, image.height() as usize],
+                    image.as_raw(),
+                );
+                self.reference_tex = Some(self.egui_ctx.load_texture(
+                    "captured-look-reference",
+                    color,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
         if self.gpu.is_none()
             || self.window.is_none()
             || self.egui_state.is_none()
@@ -1052,6 +1143,18 @@ impl App {
                 if self.current_path.as_deref() == Some(path.as_path()) {
                     if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
                         proc.apply_edit_state(&state);
+                        if state.raw_isp_enabled {
+                            if let Some(path) = self.current_path.as_deref() {
+                                if let Some(curve) = self.s_curve.as_ref() {
+                                    let max_dim = proc
+                                        .image_size
+                                        .map_or(2048, |(w, h)| w.max(h));
+                                    if let Some(developed) = raw_develop::develop_raw(path, max_dim, curve) {
+                                        proc.replace_input_rgba(&developed, &gpu.queue);
+                                    }
+                                }
+                            }
+                        }
                         proc.process(&gpu.device, &gpu.queue);
                         self.flags.output_dirty = true;
                     }
@@ -1139,7 +1242,10 @@ impl App {
                     .then_with(|| self.thumbs[a].path.cmp(&self.thumbs[b].path))
             }),
             BrowseSort::CaptureTime => visible.sort_by(|&a, &b| {
-                self.thumbs[a].exif.capture_time.unwrap_or(i64::MAX)
+                self.thumbs[a]
+                    .exif
+                    .capture_time
+                    .unwrap_or(i64::MAX)
                     .cmp(&self.thumbs[b].exif.capture_time.unwrap_or(i64::MAX))
                     .then_with(|| self.thumbs[a].path.cmp(&self.thumbs[b].path))
             }),
@@ -1161,10 +1267,17 @@ impl App {
                 }
             }
         };
-        let frame_view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let frame_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
         let image_tex_id = self.image_tex_id;
         let original_tex_id = self.original_tex_id;
+        let reference_tex_id = self.reference_tex.as_ref().map(egui::TextureHandle::id);
+        let reference_size = self
+            .look
+            .as_ref()
+            .map(|look| (look.reference_full.width(), look.reference_full.height()));
         let mut cull_actions: Vec<(PathBuf, cull::CullAction)> = Vec::new();
 
         // Scoped egui frame — all field borrows dropped at end of block
@@ -1176,8 +1289,10 @@ impl App {
             export_path,
             scan_dir,
             auto_req,
+            develop_raw_req,
             capture_look_req,
             apply_look_req,
+            teach_look_model_req,
             trash_req,
             move_rejects_dir,
             copy_picks_dir,
@@ -1224,9 +1339,10 @@ impl App {
             let enhancer_available = self.enhancer.is_some();
             let adjust_progress = self.adjust_progress;
             let look_available = self.look.is_some();
-            let similar_available = self.classifier.is_some()
-                && self.rater.is_some()
-                && self.face_detector.is_some();
+            let s_curve_available = self.s_curve.is_some();
+            let current_is_raw = current_path.as_deref().is_some_and(imgload::is_raw);
+            let similar_available =
+                self.classifier.is_some() && self.rater.is_some() && self.face_detector.is_some();
             let similar_progress = self.similar_progress;
             let similar_summary = self.similar_summary;
             let tags_map = &mut self.tags;
@@ -1791,6 +1907,10 @@ impl App {
                     .exact_width(260.0)
                     .resizable(false)
                     .show(ctx, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("editor-controls-scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
                         const MIN_DX: f32 = 0.01;
                         const GAMMA_LOG_RANGE: f32 = 1.609_438; // ln(5): gamma handle maps 0.2..5
                         // Luminance histogram + curves editor
@@ -2104,7 +2224,7 @@ impl App {
                         });
 
                         ui.add_space(6.0);
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui.button("Open Image…").clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
                                     .add_filter("Images", &imgload::all_exts())
@@ -2120,6 +2240,22 @@ impl App {
                             {
                                 ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_AUTO), true));
                             }
+                            if ui
+                                .add_enabled(
+                                    processor.has_image()
+                                        && current_is_raw
+                                        && s_curve_available,
+                                    egui::Button::new("Develop RAW"),
+                                )
+                                .on_hover_text(
+                                    "Develop this DNG with rawloader basics plus the phone S-curve fitted from Pixel DNG/JPEG pairs",
+                                )
+                                .clicked()
+                            {
+                                ctx.data_mut(|d| {
+                                    d.insert_temp(egui::Id::new(KEY_DEVELOP_RAW), true)
+                                });
+                            }
                         });
                         if processor.ai_lut_enabled
                             && ui
@@ -2133,7 +2269,7 @@ impl App {
                         {
                             needs_process = true;
                         }
-                        ui.horizontal(|ui| {
+                        ui.horizontal_wrapped(|ui| {
                             if ui
                                 .add_enabled(processor.has_image(), egui::Button::new("Capture Look"))
                                 .on_hover_text("Measure the tone and color of this photo as it looks right now")
@@ -2146,23 +2282,32 @@ impl App {
                                     processor.has_image() && look_available,
                                     egui::Button::new("Apply Look"),
                                 )
-                                .on_hover_text(
-                                    "Normalize this photo, then match its tone, color and \
-                                     skin/foliage/sky to the captured look",
-                                )
+                                .on_hover_text("Apply the captured reference's grade with the constrained look model")
                                 .clicked()
                             {
                                 ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_APPLY_LOOK), true));
                             }
+                            if ui
+                                .add_enabled(
+                                    processor.has_image() && look_available,
+                                    egui::Button::new(format!("Teach Look Model ({})", self.look_examples.len())),
+                                )
+                                .on_hover_text(
+                                    "Save this approved result and retrain the look model",
+                                )
+                                .clicked()
+                            {
+                                ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_TEACH_LOOK_MODEL), true));
+                            }
                         });
-                        if (!processor.look.is_empty() || processor.canon_lut.is_some())
+                        if !processor.look.is_empty()
                             && ui
                                 .add(
-                                    egui::Slider::new(&mut processor.look_strength, 0.0..=2.0)
+                                    egui::Slider::new(&mut processor.look_strength, 0.0..=1.0)
                                         .text("Look strength")
                                         .fixed_decimals(2),
                                 )
-                                .on_hover_text("How far to carry this photo toward the captured look")
+                                .on_hover_text("How much of the predicted look to apply")
                                 .changed()
                         {
                             needs_process = true;
@@ -2281,6 +2426,8 @@ impl App {
                         slider_row!("EXPOSURE",   processor.exposure,   -3.0..=3.0,     0.0, false);
                         slider_row!("BRIGHTNESS", processor.brightness, -100.0..=100.0, 0.0, true);
                         slider_row!("CONTRAST",   processor.contrast,   -100.0..=100.0, 0.0, true);
+                        slider_row!("SATURATION", processor.saturation, -100.0..=100.0, 0.0, true);
+                        slider_row!("VIBRANCE",   processor.vibrance,   -100.0..=100.0, 0.0, true);
                         ui.separator();
                         slider_row!("BLACKS",     processor.blacks,     -100.0..=100.0, 0.0, true);
                         slider_row!("SHADOWS",    processor.shadows,    -100.0..=100.0, 0.0, true);
@@ -2361,18 +2508,22 @@ impl App {
                                 egui::Button::new("Reset All Edits").min_size(egui::vec2(228.0, 0.0)),
                             ).clicked() {
                                 processor.apply_edit_state(&EditState::default());
+                                if let Some(gpu) = self.gpu.as_ref() {
+                                    processor.restore_source(&gpu.queue);
+                                }
                                 needs_process = true; // re-process + persist the reset
                             }
                             ui.separator();
 
                             if processor.has_image() {
                                 ui.label(
-                                    egui::RichText::new("Scroll: zoom · Double-click: 100% / fit · Hold/Space: original")
+                                    egui::RichText::new("Scroll: zoom · Double-click: 100% / fit · Hold/Space: original · Hold R: reference")
                                         .small()
                                         .color(egui::Color32::from_gray(120)),
                                 );
                             }
                     });
+                            });
                 });
 
                 if *view == View::Edit {
@@ -2489,10 +2640,23 @@ impl App {
                             .is_some_and(|t| now - t > 0.3);
                         let show_original = ctx.input(|i| i.key_down(egui::Key::Space))
                             || held_long_enough;
-                        let tex_id = if show_original { original_tex_id } else { image_tex_id };
+                        let show_reference = ctx.input(|i| i.key_down(egui::Key::R))
+                            && reference_tex_id.is_some();
+                        let tex_id = if show_reference {
+                            reference_tex_id
+                        } else if show_original {
+                            original_tex_id
+                        } else {
+                            image_tex_id
+                        };
 
                         if let Some(tid) = tex_id {
-                            if let Some((iw, ih)) = processor.image_size {
+                            let display_size = if show_reference {
+                                reference_size
+                            } else {
+                                processor.image_size
+                            };
+                            if let Some((iw, ih)) = display_size {
                                 let iw = iw as f32;
                                 let ih = ih as f32;
                                 let fit_scale = (panel_size.x / iw).min(panel_size.y / ih);
@@ -2588,12 +2752,18 @@ impl App {
             let auto_req: Option<bool> = self
                 .egui_ctx
                 .data_mut(|d| d.remove_temp(egui::Id::new(KEY_AUTO)));
+            let develop_raw_req: Option<bool> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_DEVELOP_RAW)));
             let capture_look_req: Option<bool> = self
                 .egui_ctx
                 .data_mut(|d| d.remove_temp(egui::Id::new(KEY_CAPTURE_LOOK)));
             let apply_look_req: Option<bool> = self
                 .egui_ctx
                 .data_mut(|d| d.remove_temp(egui::Id::new(KEY_APPLY_LOOK)));
+            let teach_look_model_req: Option<bool> = self
+                .egui_ctx
+                .data_mut(|d| d.remove_temp(egui::Id::new(KEY_TEACH_LOOK_MODEL)));
             let trash_req: Option<bool> = self
                 .egui_ctx
                 .data_mut(|d| d.remove_temp(egui::Id::new(KEY_TRASH_REJECTS)));
@@ -2626,8 +2796,10 @@ impl App {
                 export_path,
                 scan_dir,
                 auto_req.is_some(),
+                develop_raw_req.is_some(),
                 capture_look_req.is_some(),
                 apply_look_req.is_some(),
+                teach_look_model_req.is_some(),
                 trash_req.is_some(),
                 move_rejects_dir,
                 copy_picks_dir,
@@ -2655,9 +2827,8 @@ impl App {
                         .output_pixels(&gpu.device, &gpu.queue)
                         .and_then(|px| image::RgbaImage::from_raw(width, height, px))
                         .and_then(|rendered| {
-                            let boxes = faces
-                                .map(|d| d.detect_boxes(&rendered))
-                                .unwrap_or_default();
+                            let boxes =
+                                faces.map(|d| d.detect_boxes(&rendered)).unwrap_or_default();
                             Some(CapturedLook {
                                 profile: LookProfile::measure(
                                     rendered.as_raw(),
@@ -2666,20 +2837,103 @@ impl App {
                                     &boxes,
                                 )?,
                                 reference: look_reference_thumb(&rendered),
+                                reference_full: rendered,
                             })
                         });
                     if let Some(captured) = captured {
                         if let Some(db) = &self.db {
                             save_look(db, &captured);
                         }
+                        let image = &captured.reference_full;
+                        let color = egui::ColorImage::from_rgba_unmultiplied(
+                            [image.width() as usize, image.height() as usize],
+                            image.as_raw(),
+                        );
+                        self.reference_tex = Some(self.egui_ctx.load_texture(
+                            "captured-look-reference",
+                            color,
+                            egui::TextureOptions::LINEAR,
+                        ));
                         self.look = Some(Arc::new(captured));
                     }
                 }
             }
         }
+        if teach_look_model_req {
+            let example = (|| {
+                let path = self.current_path.as_ref()?;
+                let look = self.look.as_ref()?;
+                let proc = self.processor.as_ref()?;
+                let gpu = self.gpu.as_ref()?;
+                let target = imgload::load_rgba(path, 768)?;
+                let faces = self
+                    .face_detector
+                    .as_ref()
+                    .map(|d| d.detect_boxes(&target))
+                    .unwrap_or_default();
+                let current =
+                    LookProfile::measure(target.as_raw(), target.width(), target.height(), &faces)?;
+                let (width, height) = proc.image_size?;
+                let pixels = proc.output_pixels(&gpu.device, &gpu.queue)?;
+                let desired_image = image::RgbaImage::from_raw(width, height, pixels)?;
+                let desired = LookProfile::measure(
+                    desired_image.as_raw(),
+                    desired_image.width(),
+                    desired_image.height(),
+                    &faces,
+                )?;
+                Some(look_model::TrainingExample {
+                    current,
+                    reference: look.profile.clone(),
+                    desired,
+                })
+            })();
+            if let Some(example) = example {
+                self.look_examples.push(example);
+                if let Some(path) = app_dir().map(|d| d.join("look-model-examples.json")) {
+                    look_model::save_examples(&path, &self.look_examples);
+                }
+                self.look_model = Arc::new(look_model::LookModel::train_with_examples(
+                    &self.look_examples,
+                ));
+            }
+        }
         if apply_look_req {
             if let Some(path) = self.current_path.clone() {
                 self.spawn_look_transfer(vec![path]);
+            }
+        }
+        if develop_raw_req {
+            // Decode at the editor's current resolution so the swap is near 1:1.
+            let max_dim = self
+                .processor
+                .as_ref()
+                .and_then(|p| p.image_size.map(|(w, h)| w.max(h)))
+                .unwrap_or(2048);
+            let development = self
+                .current_path
+                .as_deref()
+                .filter(|path| imgload::is_raw(path) && self.s_curve.is_some())
+                .and_then(|path| {
+                    self.s_curve
+                        .as_ref()
+                        .and_then(|curve| raw_develop::develop_raw(path, max_dim, curve))
+                });
+            if development.is_none() {
+                eprintln!(
+                    "Develop RAW: could not develop {}",
+                    self.current_path
+                        .as_deref()
+                        .map_or_else(|| "<none>".to_string(), |p| p.display().to_string())
+                );
+            }
+            if let (Some(processor), Some(gpu), Some(developed)) =
+                (self.processor.as_mut(), self.gpu.as_ref(), development)
+            {
+                processor.raw_isp_enabled = true;
+                processor.raw_development = None;
+                processor.replace_input_rgba(&developed, &gpu.queue);
+                needs_process = true;
             }
         }
         if trash_req {
@@ -2823,6 +3077,7 @@ impl App {
             if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
                 if proc.has_image() {
                     proc.apply_edit_state(&EditState::default());
+                    proc.restore_source(&gpu.queue);
                     if let Some(state) = ai_state {
                         proc.apply_edit_state(&state);
                     } else {
@@ -2876,7 +3131,9 @@ impl App {
             size_in_pixels: [size.width, size.height],
             pixels_per_point: window.scale_factor() as f32,
         };
-        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let tris = self.egui_ctx.tessellate(shapes, pixels_per_point);
         for (id, delta) in textures_delta.set {
             egui_renderer.update_texture(&gpu.device, &gpu.queue, id, &delta);
@@ -2978,7 +3235,9 @@ fn resize_surface(gpu: &mut GpuState, size: PhysicalSize<u32>) {
 }
 
 fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    if let Ok(()) = std::fs::rename(from, to) { Ok(()) } else {
+    if let Ok(()) = std::fs::rename(from, to) {
+        Ok(())
+    } else {
         std::fs::copy(from, to)?;
         std::fs::remove_file(from)
     }
@@ -2992,7 +3251,9 @@ fn spawn_folder_workers<T: Send + 'static>(
     work: impl Fn(&Path) -> T + Send + Sync + 'static,
     tx: std::sync::mpsc::Sender<(PathBuf, T)>,
 ) {
-    let n_workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get).min(8);
+    let n_workers = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZero::get)
+        .min(8);
     let (work_tx, work_rx) = std::sync::mpsc::channel::<PathBuf>();
     let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
     let work = std::sync::Arc::new(work);
@@ -3000,13 +3261,13 @@ fn spawn_folder_workers<T: Send + 'static>(
         let work_rx = std::sync::Arc::clone(&work_rx);
         let work = std::sync::Arc::clone(&work);
         let tx = tx.clone();
-        std::thread::spawn(move || {
-            loop {
-                let Ok(path) = work_rx.lock().unwrap().recv() else { break };
-                let result = work(&path);
-                if tx.send((path, result)).is_err() {
-                    break;
-                }
+        std::thread::spawn(move || loop {
+            let Ok(path) = work_rx.lock().unwrap().recv() else {
+                break;
+            };
+            let result = work(&path);
+            if tx.send((path, result)).is_err() {
+                break;
             }
         });
     }
@@ -3016,6 +3277,22 @@ fn spawn_folder_workers<T: Send + 'static>(
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|arg| arg == "--fit-raw-scurve") {
+        let folder = args.get(2).map(PathBuf::from).unwrap_or_default();
+        let output = args
+            .get(3)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("models/raw_s_curve.json"));
+        match raw_develop::fit_s_curve(&folder, &output) {
+            Ok(count) => println!("fitted phone S-curve from {count} DNG/JPEG pairs"),
+            Err(error) => {
+                eprintln!("S-curve fit failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     let event_loop = EventLoop::new().unwrap();
     let mut app = App::new();
     event_loop.run_app(&mut app).unwrap();
@@ -3037,6 +3314,10 @@ mod tests {
                 id      INTEGER PRIMARY KEY CHECK (id = 1),
                 profile TEXT NOT NULL,
                 thumb   BLOB NOT NULL
+            );
+            CREATE TABLE captured_look_full (
+                id      INTEGER PRIMARY KEY CHECK (id = 1),
+                image   BLOB NOT NULL
             );",
         )
         .unwrap();
@@ -3054,6 +3335,7 @@ mod tests {
             )
             .unwrap(),
             reference: look_reference_thumb(&rendered),
+            reference_full: rendered.clone(),
         };
         save_look(&conn, &captured);
 
@@ -3063,7 +3345,10 @@ mod tests {
         assert_eq!(restored.profile.chroma, captured.profile.chroma);
         // The reference's skin/foliage/sky tones travel with it, since the anchors
         // are derived against them.
-        assert_eq!(restored.profile.regions[0].share, captured.profile.regions[0].share);
+        assert_eq!(
+            restored.profile.regions[0].share,
+            captured.profile.regions[0].share
+        );
         assert_eq!(
             restored.profile.regions[0].lightness,
             captured.profile.regions[0].lightness

@@ -69,7 +69,11 @@ fn mean_from_distribution(dist: &[f32]) -> f32 {
     if sum <= 0.0 {
         return 0.0;
     }
-    dist.iter().enumerate().map(|(i, &p)| (i as f32 + 1.0) * p).sum::<f32>() / sum
+    dist.iter()
+        .enumerate()
+        .map(|(i, &p)| (i as f32 + 1.0) * p)
+        .sum::<f32>()
+        / sum
 }
 
 fn stars_from_mean(mean: f32) -> u8 {

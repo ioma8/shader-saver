@@ -1,7 +1,11 @@
 @group(0) @binding(0) var input_tex:  texture_2d<f32>;
 @group(0) @binding(1) var output_tex: texture_storage_2d<rgba8unorm, write>;
 
-struct Params { v0: f32, v1: f32, v2: f32, v3: f32, v4: f32, v5: f32, v6: f32, v7: f32 }
+struct Params {
+    v0: f32, v1: f32, v2: f32, v3: f32,
+    v4: f32, v5: f32, v6: f32, v7: f32,
+    v8: f32, v9: f32, v10: f32, v11: f32,
+}
 @group(0) @binding(2) var<uniform> params: Params;
 @group(0) @binding(3) var<storage, read> curve_lut: array<f32>;
 
@@ -169,7 +173,8 @@ fn sharpen_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // Tonal adjustments — params: v0..v3 = blacks, shadows, highlights, whites
 // (each -100..100), v4 = brightness (-100..100),
-// v5 = vignette amount (-100..100), v6 = vignette midpoint (0..100).
+// v5 = vignette amount (-100..100), v6 = vignette midpoint (0..100),
+// v7 = saturation (-100..100), v8 = vibrance (-100..100).
 // Lightroom-style zones: shadows/highlights are endpoint-anchored bumps,
 // blacks/whites shift the endpoints themselves. Brightness is a Schlick
 // bias curve on luminance (Capture One-style midtone lift, endpoints fixed).
@@ -182,7 +187,8 @@ fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = textureLoad(input_tex, vec2<i32>(gid.xy), 0);
 
     if params.v0 == 0.0 && params.v1 == 0.0 && params.v2 == 0.0
-        && params.v3 == 0.0 && params.v4 == 0.0 && params.v5 == 0.0 {
+        && params.v3 == 0.0 && params.v4 == 0.0 && params.v5 == 0.0
+        && params.v7 == 0.0 && params.v8 == 0.0 {
         textureStore(output_tex, vec2<i32>(gid.xy), c);
         return;
     }
@@ -235,6 +241,15 @@ fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
         let fall = smoothstep(mid, 1.0, r);
         rgb = clamp(rgb * (1.0 + vig * fall), vec3<f32>(0.0), vec3<f32>(1.0));
     }
+
+    // Saturation scales chroma uniformly. Vibrance is gentler on already
+    // saturated colors, so it can add color without immediately clipping them.
+    let lum2 = dot(rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let chroma = length(rgb - vec3<f32>(lum2));
+    let sat = 1.0 + params.v7 * 0.01;
+    let vib = 1.0 + params.v8 * 0.01 * (1.0 - clamp(chroma * 2.0, 0.0, 1.0));
+    rgb = clamp(vec3<f32>(lum2) + (rgb - vec3<f32>(lum2)) * sat * vib,
+        vec3<f32>(0.0), vec3<f32>(1.0));
 
     textureStore(output_tex, vec2<i32>(gid.xy), vec4<f32>(rgb, c.a));
 }

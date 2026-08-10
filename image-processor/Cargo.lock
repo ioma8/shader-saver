@@ -2160,6 +2160,8 @@ dependencies = [
  "jpgfromraw",
  "kamadak-exif",
  "pollster",
+ "rawloader",
+ "rayon",
  "rfd",
  "rusqlite",
  "serde",
