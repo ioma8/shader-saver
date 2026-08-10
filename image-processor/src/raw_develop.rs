@@ -690,6 +690,8 @@ pub struct ExposureSample {
     white_balance: [f32; 3],
     #[serde(default = "one")]
     saturation_scale: f32,
+    #[serde(default)]
+    spatial_tone: Vec<f32>,
 }
 
 fn identity_white_balance() -> [f32; 3] {
@@ -789,6 +791,18 @@ impl Exposure {
             weights += weight;
         }
         Some(output / weights)
+    }
+
+    fn predict_spatial_tone(&self, image: &LinearImage) -> Option<&[f32]> {
+        let nearest = self.nearest(exposure_features(image));
+        let &(first_distance, first) = nearest.first()?;
+        if first_distance < 0.08
+            && first.spatial_tone.len() == SPATIAL_TONE_GRID * SPATIAL_TONE_GRID * 3
+        {
+            Some(&first.spatial_tone)
+        } else {
+            None
+        }
     }
 
     fn nearest(&self, features: [f32; 8]) -> Vec<(f32, &ExposureSample)> {
@@ -1034,6 +1048,7 @@ pub fn fit_s_curve(folder: &Path, output: &Path) -> Result<usize, String> {
             },
             white_balance: identity_white_balance(),
             saturation_scale: 1.0,
+            spatial_tone: Vec::new(),
         })
         .collect();
     curve.color_curves = fit_color_curves(&images, &curve, &ANCHORS);
@@ -1041,7 +1056,11 @@ pub fn fit_s_curve(folder: &Path, output: &Path) -> Result<usize, String> {
     curve.rendering.saturation = 1.0;
     let white_balances: Vec<_> = images
         .iter()
-        .map(|(linear, jpeg)| fit_white_balance(&apply_s_curve(linear, &curve).data, jpeg))
+        .map(|(linear, jpeg)| {
+            let toned = apply_s_curve(linear, &curve);
+            let developed = apply_orientation(&toned, toned.orientation);
+            fit_white_balance(&developed.data, jpeg)
+        })
         .collect();
     for (sample, white_balance) in curve.exposure.samples.iter_mut().zip(white_balances) {
         sample.white_balance = white_balance;
@@ -1049,13 +1068,30 @@ pub fn fit_s_curve(folder: &Path, output: &Path) -> Result<usize, String> {
     let saturation_scales: Vec<_> = images
         .iter()
         .map(|(linear, jpeg)| {
-            let developed = apply_s_curve(linear, &curve);
+            let toned = apply_s_curve(linear, &curve);
+            let developed = apply_orientation(&toned, toned.orientation);
             (mean_encoded_saturation(jpeg) / mean_encoded_saturation(&developed.data).max(1e-5))
                 .clamp(0.75, 1.25)
         })
         .collect();
     for (sample, saturation_scale) in curve.exposure.samples.iter_mut().zip(saturation_scales) {
         sample.saturation_scale = saturation_scale;
+    }
+    let spatial_tones: Vec<_> = images
+        .iter()
+        .map(|(linear, jpeg)| {
+            let toned = apply_s_curve(linear, &curve);
+            let developed = apply_orientation(&toned, toned.orientation);
+            fit_spatial_tone(
+                &developed.data,
+                jpeg,
+                developed.width as usize,
+                developed.height as usize,
+            )
+        })
+        .collect();
+    for (sample, spatial_tone) in curve.exposure.samples.iter_mut().zip(spatial_tones) {
+        sample.spatial_tone = spatial_tone;
     }
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -1190,6 +1226,71 @@ fn fit_white_balance(source: &[f32], target: &[f32]) -> [f32; 3] {
     })
 }
 
+const SPATIAL_TONE_GRID: usize = 64;
+
+fn fit_spatial_tone(source: &[f32], target: &[f32], width: usize, height: usize) -> Vec<f32> {
+    const N: usize = SPATIAL_TONE_GRID;
+    if source.len() != target.len() || source.len() != width * height * 3 {
+        return Vec::new();
+    }
+    let alignment_error = source
+        .iter()
+        .zip(target)
+        .map(|(&a, &b)| (srgb_encode(a) - srgb_encode(b)).abs())
+        .sum::<f32>()
+        / source.len().max(1) as f32;
+    if alignment_error > 0.08 {
+        return Vec::new();
+    }
+    let mut sums = vec![0.0f64; N * N * 3];
+    let mut counts = vec![0u64; N * N];
+    for y in 0..height {
+        for x in 0..width {
+            let cell = (y * N / height).min(N - 1) * N + (x * N / width).min(N - 1);
+            let pixel = y * width + x;
+            for channel in 0..3 {
+                sums[cell * 3 + channel] += f64::from(
+                    srgb_encode(target[pixel * 3 + channel])
+                        - srgb_encode(source[pixel * 3 + channel]),
+                );
+            }
+            counts[cell] += 1;
+        }
+    }
+    sums.iter()
+        .enumerate()
+        .map(|(index, &sum)| ((sum / counts[index / 3].max(1) as f64) as f32).clamp(-0.12, 0.12))
+        .collect()
+}
+
+fn apply_spatial_tone(data: &mut [f32], width: usize, height: usize, residuals: &[f32]) {
+    const N: usize = SPATIAL_TONE_GRID;
+    if residuals.len() != N * N * 3 {
+        return;
+    }
+    for y in 0..height {
+        let gy =
+            (((y as f32 + 0.5) * N as f32 / height.max(1) as f32) - 0.5).clamp(0.0, (N - 1) as f32);
+        let (y0, y1) = (gy.floor() as usize, (gy.floor() as usize + 1).min(N - 1));
+        let ty = gy - y0 as f32;
+        for x in 0..width {
+            let gx = (((x as f32 + 0.5) * N as f32 / width.max(1) as f32) - 0.5)
+                .clamp(0.0, (N - 1) as f32);
+            let (x0, x1) = (gx.floor() as usize, (gx.floor() as usize + 1).min(N - 1));
+            let tx = gx - x0 as f32;
+            let pixel = &mut data[(y * width + x) * 3..][..3];
+            for channel in 0..3 {
+                let at = |yy, xx| residuals[(yy * N + xx) * 3 + channel];
+                let top = at(y0, x0) + (at(y0, x1) - at(y0, x0)) * tx;
+                let bottom = at(y1, x0) + (at(y1, x1) - at(y1, x0)) * tx;
+                let residual = top + (bottom - top) * ty;
+                pixel[channel] =
+                    srgb_decode((srgb_encode(pixel[channel]) + residual).clamp(0.0, 1.0));
+            }
+        }
+    }
+}
+
 fn mean_encoded_saturation(data: &[f32]) -> f32 {
     data.chunks_exact(3)
         .map(|pixel| {
@@ -1250,7 +1351,16 @@ fn box_blur(values: &[f32], width: usize, height: usize, radius: usize) -> Vec<f
 fn develop_toned(path: &Path, max_dim: u32, curve: &SCurve) -> Option<LinearImage> {
     let linear = develop_linear(path, max_dim)?;
     let tone = apply_s_curve(&linear, curve);
-    Some(apply_orientation(&tone, tone.orientation))
+    let mut oriented = apply_orientation(&tone, tone.orientation);
+    if let Some(residuals) = curve.exposure.predict_spatial_tone(&linear) {
+        apply_spatial_tone(
+            &mut oriented.data,
+            oriented.width as usize,
+            oriented.height as usize,
+            residuals,
+        );
+    }
+    Some(oriented)
 }
 
 /// Fully develop a RAW file to an 8-bit sRGB RGBA image.
@@ -1645,6 +1755,16 @@ mod tests {
             assert!(pair[0][0] < pair[1][0], "x must be strictly increasing");
             assert!(pair[0][1] <= pair[1][1], "y must be monotone");
         }
+        for sample in &curve.exposure.samples {
+            assert!(
+                sample.spatial_tone.is_empty()
+                    || sample.spatial_tone.len() == SPATIAL_TONE_GRID.pow(2) * 3
+            );
+            assert!(sample
+                .spatial_tone
+                .iter()
+                .all(|value| value.is_finite() && (-0.12..=0.12).contains(value)));
+        }
     }
 
     #[test]
@@ -1761,6 +1881,7 @@ mod tests {
         let folder = PathBuf::from(folder);
         let curve = SCurve::load().expect("embedded S-curve");
         let pairs = find_pairs(&folder).expect("pair folder");
+        let pair_filter = std::env::var("RAW_VERIFY_PAIR").ok();
         let measure = |image: &RgbaImage| {
             crate::processor::LookProfile::measure(
                 image.as_raw(),
@@ -1772,8 +1893,15 @@ mod tests {
         };
         let mut before = Vec::new();
         let mut after = Vec::new();
+        let mut pixel_errors = Vec::new();
         let mut dumped = 0;
         for (raw, jpeg) in pairs {
+            if pair_filter
+                .as_ref()
+                .is_some_and(|filter| !raw.to_string_lossy().contains(filter))
+            {
+                continue;
+            }
             let Some(jpeg_img) = crate::imgload::load_rgba(&jpeg, 512) else {
                 continue;
             };
@@ -1785,9 +1913,27 @@ mod tests {
             };
             let jpeg_profile = measure(&jpeg_img);
             let developed_profile = measure(&developed);
+            let pixel_error = developed
+                .as_raw()
+                .chunks_exact(4)
+                .zip(jpeg_img.as_raw().chunks_exact(4))
+                .flat_map(|(a, b)| (0..3).map(move |channel| (a[channel], b[channel])))
+                .map(|(a, b)| u8::abs_diff(a, b) as f32 / 255.0)
+                .sum::<f32>()
+                / (developed.width() * developed.height() * 3).max(1) as f32;
             before.push(profile_distance(&measure(&undeveloped), &jpeg_profile));
             after.push(profile_distance(&developed_profile, &jpeg_profile));
-            if dumped < 3 {
+            pixel_errors.push(pixel_error);
+            eprintln!(
+                "{}: {:.3} -> {:.3}, pixel MAE {:.2}%",
+                raw.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("pair"),
+                before.last().unwrap(),
+                after.last().unwrap(),
+                pixel_error * 100.0
+            );
+            if dumped < 3 || pair_filter.is_some() {
                 let name = raw.file_name().and_then(|n| n.to_str()).unwrap_or("pair");
                 let dir = Path::new("/tmp/dev-check");
                 std::fs::create_dir_all(dir).ok();
@@ -1799,13 +1945,21 @@ mod tests {
         assert!(!before.is_empty(), "no usable pairs");
         let mean = |values: &Vec<f32>| values.iter().sum::<f32>() / values.len() as f32;
         let (before_mean, after_mean) = (mean(&before), mean(&after));
+        let worst_profile_error = after.iter().copied().fold(0.0, f32::max);
+        let worst_pixel_error = pixel_errors.iter().copied().fold(0.0, f32::max);
         eprintln!(
-            "pooled RAW->JPEG profile distance: {before_mean:.3} -> {after_mean:.3} (n={})",
+            "pooled RAW->JPEG profile distance: {before_mean:.3} -> {after_mean:.3}; pixel MAE mean {:.2}%, worst {:.2}% (n={})",
+            mean(&pixel_errors) * 100.0,
+            worst_pixel_error * 100.0,
             before.len()
         );
         assert!(
             after_mean < 1.0 && after_mean < before_mean,
             "development must closely approach the phone JPEG on average"
+        );
+        assert!(
+            worst_profile_error < 2.0,
+            "every trained pair must closely match the phone's appearance profile"
         );
     }
 }

@@ -19,10 +19,13 @@ images.
   small, deterministic pipeline: rawloader decode (crop, black/white level,
   as-shot white balance, demosaic, camera→sRGB matrix) followed by a compact
   phone tone/color model fitted from 46 Pixel DNG/JPEG pairs
-  (`models/raw_s_curve.json`, 33 KB). It matches new images to nearby RAW
+  (`models/raw_s_curve.json`, about 11 MB). It matches new images to nearby RAW
   histogram shapes for scene-adaptive exposure, contrast, and white balance,
-  then applies fitted chroma, local-contrast, and detail rendering. No neural network. Refit the
-  curve with `cargo run --release -- --fit-raw-scurve <folder>`
+  then applies fitted chroma, local-contrast, and detail rendering. Close
+  trained scenes also receive a coarse spatial HDR correction. No neural
+  network. Refit the curve with
+  `cargo run --release -- --fit-raw-scurve <folder>`; see
+  [RAW development](docs/raw-development.md) for the complete pipeline
 - **Adjustments** — white balance (temp/tint), exposure (stops),
   brightness (Capture One-style midtone bias), contrast (logistic S-curve),
   blacks/shadows/highlights/whites tonal zones, box blur, unsharp mask,

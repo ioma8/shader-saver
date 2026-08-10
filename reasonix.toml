@@ -1,0 +1,2 @@
+[permissions]
+allow = ["Bash=git -C /Users/jakubkolcar/projects/customs/shader-saver status && git -C /Users/jakubkolcar/projects/customs/shader-saver log --oneline -10", "Bash=cd image-processor && awk 'NR<=2196' Cargo.lock | grep -n '^name = ' | tail -5 && sed -n '2180,2200p' Cargo.lock", "Bash=R=~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f; ls $R/rawloader-0.37.1/src/ ; echo ---- ; ls $R/imagepipe-0.5.0/src/", "Bash=R=~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f; sed -n '1,120p' $R/rawloader-0.37.1/src/lib.rs"]
