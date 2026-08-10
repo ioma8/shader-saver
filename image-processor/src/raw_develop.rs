@@ -61,12 +61,18 @@ fn develop_from_raw(raw: &RawImage, max_dim: u32, path: &Path) -> Option<LinearI
     let white = raw.whitelevels;
     let mut wb = raw.wb_coeffs;
     // rawloader reads DNG AsShotNeutral under the wrong tag number (0xC628 is
-    // AsShotWhiteXY), so DNGs always surface NaN here.  Read the real tag
-    // (0xC627) from the file; Pixel DNGs carry AsShotNeutral (1,1,1) — the
-    // raw is pre-white-balanced — so identity is the fallback when the tag is
-    // genuinely absent.
+    // AsShotWhiteXY), so DNGs surface NaN here.  The real tag (0xC627) is read
+    // from the file; note that Pixel DNGs carry AsShotNeutral (1,1,1) as a
+    // *placeholder* — the raw data is NOT pre-white-balanced (the sensor's
+    // green response runs ~2x red / ~1.5x blue), so identity would leave the
+    // image green-dominant.  A flat (1,1,1) or a missing tag falls back to
+    // rawloader's D65-neutral camera gains, which is what matches the phone's
+    // JPEGs.
     if wb[0].is_nan() || wb[1].is_nan() || wb[2].is_nan() {
-        wb = dng_as_shot_neutral(path).unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        match dng_as_shot_neutral(path) {
+            Some(v) if !(v[0] == 1.0 && v[1] == 1.0 && v[2] == 1.0) => wb = v,
+            _ => wb = raw.neutralwb(),
+        }
     }
     let wb = wb.map(|v| if v.is_finite() && v > 0.0 { v } else { 1.0 });
     let is_integer = matches!(raw.data, RawImageData::Integer(_));
@@ -198,7 +204,8 @@ fn develop_from_raw(raw: &RawImage, max_dim: u32, path: &Path) -> Option<LinearI
 
 /// The DNG's as-shot white balance as WB multipliers (inverse of the
 /// AsShotNeutral values).  kamadak-exif re-reads the file, which is cheap next
-/// to the rawloader decode itself.
+/// to the rawloader decode itself.  Returns None when the tag is absent;
+/// callers treat a flat (1,1,1) placeholder the same way.
 fn dng_as_shot_neutral(path: &Path) -> Option<[f32; 4]> {
     let file = std::fs::File::open(path).ok()?;
     let exif = exif::Reader::new()
@@ -225,22 +232,27 @@ fn dng_as_shot_neutral(path: &Path) -> Option<[f32; 4]> {
 
 // --- Demosaic ---------------------------------------------------------------
 
-/// Combined camera-to-linear-sRGB matrix: rawloader's camera->XYZ (the raw
-/// pseudoinverse, not the normalized variant, so as-shot neutral stays D65
-/// neutral through the pipeline) followed by the standard sRGB-D65
-/// XYZ->linear-RGB matrix.
+/// Combined camera-to-linear-sRGB matrix.  rawloader's *normalized* camera->XYZ
+/// keeps camera (1,1,1) on the neutral axis (rows scaled so it maps to equal
+/// XYZ), but equal-energy XYZ lands warm in sRGB (sRGB's white is D65, not E),
+/// so the rows are re-referenced to the D65 white point.  The composite maps
+/// the as-shot white balance's neutral to sRGB D65 white, matching what the
+/// phone's JPEGs do.  The raw pseudoinverse alone would not even keep the
+/// neutral axis neutral for cameras whose ColorMatrix is not row-balanced.
 fn camera_to_srgb_matrix(raw: &RawImage) -> [[f32; 3]; 3] {
     const XYZ_TO_SRGB: [[f32; 3]; 3] = [
         [3.2404542, -1.5371385, -0.4985314],
         [-0.9692660, 1.8760108, 0.0415560],
         [0.0556434, -0.2040259, 1.0572252],
     ];
-    let cam_to_xyz = raw.cam_to_xyz(); // rows=XYZ, cols=RGB(E)
+    // D65 white point (Y = 1), used to reference camera-neutral to sRGB white.
+    const D65_WHITE: [f32; 3] = [0.9504559, 1.0, 1.088754];
+    let cam_to_xyz = raw.cam_to_xyz_normalized(); // rows=XYZ, cols=RGB(E)
     let mut out = [[0.0f32; 3]; 3];
     for row in 0..3 {
         for col in 0..3 {
             for k in 0..3 {
-                out[row][col] += XYZ_TO_SRGB[row][k] * cam_to_xyz[k][col];
+                out[row][col] += XYZ_TO_SRGB[row][k] * cam_to_xyz[k][col] * D65_WHITE[k];
             }
         }
     }
@@ -557,15 +569,38 @@ pub fn srgb_decode(value: f32) -> f32 {
 // --- Phone S-curve ----------------------------------------------------------
 
 /// The entire "look" of RAW development: one global monotone curve fitted from
-/// DNG/JPEG pairs.  `points` maps exposure-normalized linear luminance (luma /
-/// anchor-percentile luma) to linear display luminance; `apply` is monotone
-/// piecewise-linear and clamps beyond the end points.
+/// DNG/JPEG pairs, plus a per-image exposure placement.  `points` maps
+/// exposure-normalized linear luminance (luma / anchor-percentile luma) to
+/// linear display luminance; `apply` is monotone piecewise-linear and clamps
+/// beyond the end points.  `exposure` compensates each image before the curve
+/// (input-scaling, like the phone's auto-exposure) so the median lands where
+/// the phone's own AE put its JPEG — a fixed curve alone always centers the
+/// tone at the pool median, which is why dark scenes came out too bright and
+/// bright scenes too dark.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SCurve {
     /// Percentile of linear luminance used as the exposure anchor (0.5).
     pub anchor_percentile: f64,
+    /// Per-image exposure placement, fitted from the pairs.
+    pub exposure: Exposure,
     /// `(x, y)` pairs, `x` strictly increasing, first point at (0, 0).
     pub points: Vec<[f32; 2]>,
+}
+
+/// Per-image exposure placement: the phone's JPEG median (linear display
+/// luma) as a power law of the RAW's median linear luma, `a * m^b`, fitted
+/// from the DNG/JPEG pairs in log-log space.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct Exposure {
+    pub scale_a: f32,
+    pub scale_b: f32,
+}
+
+impl Exposure {
+    /// Predicted JPEG median (linear display luma) for a RAW median `m`.
+    pub fn predict_median(&self, m: f32) -> f32 {
+        self.scale_a * m.powf(self.scale_b)
+    }
 }
 
 impl SCurve {
@@ -599,6 +634,27 @@ impl SCurve {
             }
         }
         last[1]
+    }
+
+    /// Inverse of `apply`: the x whose mapped value is `y`, clamped to the
+    /// curve's domain.  Used for exposure compensation (place the image
+    /// median at a predicted display value).
+    pub fn inverse_x(&self, y: f32) -> f32 {
+        let last = self.points[self.points.len() - 1];
+        if y >= last[1] {
+            return last[0];
+        }
+        for pair in self.points.windows(2) {
+            let (x0, y0) = (pair[0][0], pair[0][1]);
+            let (x1, y1) = (pair[1][0], pair[1][1]);
+            if y >= y0 && y < y1 {
+                if y1 > y0 {
+                    return x0 + (x1 - x0) * (y - y0) / (y1 - y0);
+                }
+                return x0;
+            }
+        }
+        last[0]
     }
 }
 
@@ -644,9 +700,12 @@ pub fn fit_s_curve(folder: &Path, output: &Path) -> Result<usize, String> {
         0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 1.0,
     ];
     let pairs = find_pairs(folder)?;
+    // One pair's samples: anchor-normalized x values, y values, and the raw /
+    // jpeg medians for the exposure fit.
+    type PairSample = (Vec<f32>, Vec<f32>, f32, f32);
     // Each pair decodes independently (a full DNG decode each), so the per-
     // pair percentile samples are computed in parallel across cores.
-    let pair_samples: Vec<Option<(Vec<f32>, Vec<f32>)>> = pairs
+    let pair_samples: Vec<Option<PairSample>> = pairs
         .par_iter()
         .map(|(raw_path, jpeg_path)| {
             let linear = develop_linear(raw_path, 512)?;
@@ -668,7 +727,7 @@ pub fn fit_s_curve(folder: &Path, output: &Path) -> Result<usize, String> {
             let jpeg_luma = LumaHistogram::from_rgb_max(&jpeg_linear, 1.0);
             let xs = ANCHORS.map(|anchor| luma.percentile(anchor) / median).to_vec();
             let ys = ANCHORS.map(|anchor| jpeg_luma.percentile(anchor)).to_vec();
-            Some((xs, ys))
+            Some((xs, ys, median, jpeg_luma.percentile(0.5)))
         })
         .collect();
     let usable = pair_samples.iter().filter(|sample| sample.is_some()).count();
@@ -677,11 +736,15 @@ pub fn fit_s_curve(folder: &Path, output: &Path) -> Result<usize, String> {
     }
     let mut x_samples: Vec<Vec<f32>> = vec![Vec::new(); ANCHORS.len()];
     let mut y_samples: Vec<Vec<f32>> = vec![Vec::new(); ANCHORS.len()];
-    for (xs, ys) in pair_samples.into_iter().flatten() {
+    let mut raw_medians = Vec::new();
+    let mut jpeg_medians = Vec::new();
+    for (xs, ys, m, j) in pair_samples.into_iter().flatten() {
         for (i, (&x, &y)) in xs.iter().zip(&ys).enumerate() {
             x_samples[i].push(x);
             y_samples[i].push(y);
         }
+        raw_medians.push(m);
+        jpeg_medians.push(j);
     }
     let mut points: Vec<[f32; 2]> = ANCHORS
         .iter()
@@ -712,8 +775,15 @@ pub fn fit_s_curve(folder: &Path, output: &Path) -> Result<usize, String> {
     } else {
         deduped[0][1] = 0.0;
     }
+    // The shape curve's value at the anchor (x = 1), i.e. the pooled JPEG
+    // median; used to turn the exposure predictor into a scale.
+    let anchor_idx = ANCHORS.iter().position(|&p| p == 0.5).unwrap_or(7);
+    let mut shape_median_y = y_samples[anchor_idx].clone();
+    shape_median_y.sort_by(f32::total_cmp);
+    let shape_median_y = shape_median_y[shape_median_y.len() / 2];
     let curve = SCurve {
         anchor_percentile: 0.5,
+        exposure: fitted_exposure(&raw_medians, &jpeg_medians, shape_median_y),
         points: deduped,
     };
     if let Some(parent) = output.parent() {
@@ -739,13 +809,53 @@ pub fn develop_raw(path: &Path, max_dim: u32, curve: &SCurve) -> Option<RgbaImag
 /// Apply the S-curve hue-preservingly: exposure-normalize each pixel's luma by
 /// the anchor (median linear luminance), map through the curve, and scale RGB
 /// by `display / luma` so the output keeps hue and lands on the curve's luma.
+/// Fit the phone's per-image exposure placement: JPEG median (linear display
+/// luma) as a power law of the RAW's median linear luma, least-squares in
+/// log-log space over all pairs.  `shape_median_y` is the shape curve's value
+/// at the anchor, used as the fallback scale for degenerate fits.
+fn fitted_exposure(raw_medians: &[f32], jpeg_medians: &[f32], shape_median_y: f32) -> Exposure {
+    let mut log_x = Vec::new();
+    let mut log_y = Vec::new();
+    for (&m, &j) in raw_medians.iter().zip(jpeg_medians) {
+        if m > 0.0 && j > 0.0 {
+            log_x.push((m as f64).ln());
+            log_y.push((j as f64).ln());
+        }
+    }
+    let n = log_x.len() as f64;
+    if n < 2.0 {
+        return Exposure {
+            scale_a: shape_median_y,
+            scale_b: 0.0,
+        };
+    }
+    let mean_x = log_x.iter().sum::<f64>() / n;
+    let mean_y = log_y.iter().sum::<f64>() / n;
+    let mut cov = 0.0;
+    let mut var = 0.0;
+    for (&x, &y) in log_x.iter().zip(&log_y) {
+        cov += (x - mean_x) * (y - mean_y);
+        var += (x - mean_x).powi(2);
+    }
+    let scale_b = (cov / var) as f32;
+    let scale_a = (mean_y - scale_b as f64 * mean_x).exp() as f32;
+    Exposure { scale_a, scale_b }
+}
+
 fn apply_s_curve(image: &LinearImage, curve: &SCurve) -> LinearImage {
     let anchor = image.luminance_percentile(curve.anchor_percentile).max(1e-3);
+    // Per-image exposure compensation, applied to the linear values *before*
+    // the curve (as the phone's AE does): pick the curve input k whose output
+    // is the predicted JPEG median for this exposure level, then map through
+    // the shape curve.  Scaling before the curve keeps the neutral axis intact
+    // and clips highlights the way a real exposure change would.
+    let target = curve.exposure.predict_median(anchor);
+    let k = curve.inverse_x(target);
     let mut data = image.data.clone();
     for pixel in data.chunks_exact_mut(3) {
         let luma = 0.2126 * pixel[0] + 0.7152 * pixel[1] + 0.0722 * pixel[2];
         let scale = if luma > 0.0 {
-            curve.apply(luma / anchor) / luma
+            curve.apply(luma / anchor * k) / luma
         } else {
             0.0
         };
@@ -903,6 +1013,7 @@ mod tests {
     fn s_curve_applies_monotonically_and_clamps() {
         let curve = SCurve {
             anchor_percentile: 0.5,
+            exposure: Exposure { scale_a: 0.158, scale_b: 0.0 },
             points: vec![[0.0, 0.0], [0.5, 0.2], [1.0, 0.5], [2.0, 1.0]],
         };
         assert_eq!(curve.apply(0.0), 0.0);
@@ -923,6 +1034,7 @@ mod tests {
     fn s_curve_round_trips_through_json() {
         let curve = SCurve {
             anchor_percentile: 0.5,
+            exposure: Exposure { scale_a: 0.158, scale_b: 0.0 },
             points: vec![[0.0, 0.0], [1.0, 0.5], [2.0, 0.9]],
         };
         let json = serde_json::to_string(&curve).unwrap();
@@ -930,6 +1042,7 @@ mod tests {
         assert_eq!(restored.anchor_percentile, 0.5);
         assert_eq!(restored.points, curve.points);
     }
+
 
 
     #[test]
