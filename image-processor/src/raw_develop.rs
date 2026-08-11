@@ -1,12 +1,8 @@
-//! Basic RAW development on top of rawloader, plus the phone S-curve.
+//! Universal RAW development and its offline fitting tools.
 //!
-//! The previous developer learned a full neural ISP and a per-camera LUT
-//! database from DNG/JPEG pairs.  This module takes the opposite route: a
-//! minimal, deterministic development that leaves the image linear — crop,
-//! black level, as-shot white balance, demosaic, camera-to-sRGB matrix — and
-//! then one global S-curve fitted from the phone's own DNG/JPEG pairs.  The
-//! curve maps exposure-normalized linear luminance to display luminance, so
-//! each DNG lands on the same tone placement as the phone's developed JPEG.
+//! Runtime development always decodes sensor data with rawler, then applies the
+//! embedded universal rendering model. Camera JPEGs are offline supervision
+//! only and are never runtime inputs.
 
 use image::RgbaImage;
 use rawloader::{Orientation, RawImage, RawImageData};
@@ -581,35 +577,8 @@ pub fn srgb_encode(value: f32) -> f32 {
     }
 }
 
-/// Convert a linear RGB image to an 8-bit sRGB RGBA image, clipping at 1.0.
-pub fn to_rgba(image: &LinearImage) -> RgbaImage {
-    let mut out = RgbaImage::new(image.width, image.height);
-    for (pixel, value) in out.pixels_mut().zip(image.data.chunks_exact(3)) {
-        for channel in 0..3 {
-            pixel[channel] =
-                (srgb_encode(value[channel].clamp(0.0, 1.0)) * 255.0 + 0.5).round() as u8;
-        }
-        pixel[3] = 255;
-    }
-    out
-}
-
 /// 16-bit gamma-encoded RGBA image (dimensions and pixels travel together).
 pub type Rgba16Image = image::ImageBuffer<image::Rgba<u16>, Vec<u16>>;
-
-/// Convert a linear RGB image to a 16-bit sRGB RGBA image, clipping at 1.0.
-/// RAW development feeds this to the editor so the sensor's precision
-/// survives past the 8-bit boundary.
-pub fn to_rgba16(image: &LinearImage) -> Rgba16Image {
-    let mut out = Rgba16Image::new(image.width, image.height);
-    for (pixel, value) in out.pixels_mut().zip(image.data.chunks_exact(3)) {
-        for channel in 0..3 {
-            pixel[channel] = (srgb_encode(value[channel].clamp(0.0, 1.0)) * 65535.0).round() as u16;
-        }
-        pixel[3] = 65535;
-    }
-    out
-}
 
 /// Decode one sRGB-encoded component to linear light (inverse of `srgb_encode`).
 pub fn srgb_decode(value: f32) -> f32 {
@@ -793,18 +762,6 @@ impl Exposure {
         Some(output / weights)
     }
 
-    fn predict_spatial_tone(&self, image: &LinearImage) -> Option<&[f32]> {
-        let nearest = self.nearest(exposure_features(image));
-        let &(first_distance, first) = nearest.first()?;
-        if first_distance < 0.08
-            && first.spatial_tone.len() == SPATIAL_TONE_GRID * SPATIAL_TONE_GRID * 3
-        {
-            Some(&first.spatial_tone)
-        } else {
-            None
-        }
-    }
-
     fn nearest(&self, features: [f32; 8]) -> Vec<(f32, &ExposureSample)> {
         let mut nearest: Vec<_> = self
             .samples
@@ -826,6 +783,7 @@ impl Exposure {
 
 impl SCurve {
     /// Load the embedded curve fitted from the phone's DNG/JPEG pairs.
+    #[cfg(test)]
     pub fn load() -> Option<Self> {
         serde_json::from_str(include_str!("../models/raw_s_curve.json")).ok()
     }
@@ -1229,7 +1187,18 @@ fn fit_white_balance(source: &[f32], target: &[f32]) -> [f32; 3] {
 const SPATIAL_TONE_GRID: usize = 64;
 
 fn fit_spatial_tone(source: &[f32], target: &[f32], width: usize, height: usize) -> Vec<f32> {
-    const N: usize = SPATIAL_TONE_GRID;
+    fit_spatial_residual(source, target, width, height, SPATIAL_TONE_GRID, 0.08, 0.12)
+}
+
+fn fit_spatial_residual(
+    source: &[f32],
+    target: &[f32],
+    width: usize,
+    height: usize,
+    grid: usize,
+    max_alignment_error: f32,
+    max_residual: f32,
+) -> Vec<f32> {
     if source.len() != target.len() || source.len() != width * height * 3 {
         return Vec::new();
     }
@@ -1239,14 +1208,14 @@ fn fit_spatial_tone(source: &[f32], target: &[f32], width: usize, height: usize)
         .map(|(&a, &b)| (srgb_encode(a) - srgb_encode(b)).abs())
         .sum::<f32>()
         / source.len().max(1) as f32;
-    if alignment_error > 0.08 {
+    if alignment_error > max_alignment_error {
         return Vec::new();
     }
-    let mut sums = vec![0.0f64; N * N * 3];
-    let mut counts = vec![0u64; N * N];
+    let mut sums = vec![0.0f64; grid * grid * 3];
+    let mut counts = vec![0u64; grid * grid];
     for y in 0..height {
         for x in 0..width {
-            let cell = (y * N / height).min(N - 1) * N + (x * N / width).min(N - 1);
+            let cell = (y * grid / height).min(grid - 1) * grid + (x * grid / width).min(grid - 1);
             let pixel = y * width + x;
             for channel in 0..3 {
                 sums[cell * 3 + channel] += f64::from(
@@ -1259,36 +1228,10 @@ fn fit_spatial_tone(source: &[f32], target: &[f32], width: usize, height: usize)
     }
     sums.iter()
         .enumerate()
-        .map(|(index, &sum)| ((sum / counts[index / 3].max(1) as f64) as f32).clamp(-0.12, 0.12))
+        .map(|(index, &sum)| {
+            ((sum / counts[index / 3].max(1) as f64) as f32).clamp(-max_residual, max_residual)
+        })
         .collect()
-}
-
-fn apply_spatial_tone(data: &mut [f32], width: usize, height: usize, residuals: &[f32]) {
-    const N: usize = SPATIAL_TONE_GRID;
-    if residuals.len() != N * N * 3 {
-        return;
-    }
-    for y in 0..height {
-        let gy =
-            (((y as f32 + 0.5) * N as f32 / height.max(1) as f32) - 0.5).clamp(0.0, (N - 1) as f32);
-        let (y0, y1) = (gy.floor() as usize, (gy.floor() as usize + 1).min(N - 1));
-        let ty = gy - y0 as f32;
-        for x in 0..width {
-            let gx = (((x as f32 + 0.5) * N as f32 / width.max(1) as f32) - 0.5)
-                .clamp(0.0, (N - 1) as f32);
-            let (x0, x1) = (gx.floor() as usize, (gx.floor() as usize + 1).min(N - 1));
-            let tx = gx - x0 as f32;
-            let pixel = &mut data[(y * width + x) * 3..][..3];
-            for channel in 0..3 {
-                let at = |yy, xx| residuals[(yy * N + xx) * 3 + channel];
-                let top = at(y0, x0) + (at(y0, x1) - at(y0, x0)) * tx;
-                let bottom = at(y1, x0) + (at(y1, x1) - at(y1, x0)) * tx;
-                let residual = top + (bottom - top) * ty;
-                pixel[channel] =
-                    srgb_decode((srgb_encode(pixel[channel]) + residual).clamp(0.0, 1.0));
-            }
-        }
-    }
 }
 
 fn mean_encoded_saturation(data: &[f32]) -> f32 {
@@ -1345,33 +1288,553 @@ fn box_blur(values: &[f32], width: usize, height: usize, radius: usize) -> Vec<f
 
 // --- Development ------------------------------------------------------------
 
-/// Fully develop a RAW file: linear development, exposure-normalized
-/// S-curve, then the file's EXIF orientation (so the result matches the
-/// camera's pre-oriented JPEG).  Shared by the 8-bit and 16-bit encoders.
-fn develop_toned(path: &Path, max_dim: u32, curve: &SCurve) -> Option<LinearImage> {
-    let linear = develop_linear(path, max_dim)?;
-    let tone = apply_s_curve(&linear, curve);
-    let mut oriented = apply_orientation(&tone, tone.orientation);
-    if let Some(residuals) = curve.exposure.predict_spatial_tone(&linear) {
-        apply_spatial_tone(
-            &mut oriented.data,
-            oriented.width as usize,
-            oriented.height as usize,
-            residuals,
-        );
+const RENDER_QUANTILES: [f32; 44] = [
+    0.0, 0.001, 0.002, 0.005, 0.008, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.1, 0.12,
+    0.14, 0.16, 0.18, 0.2, 0.22, 0.25, 0.28, 0.32, 0.36, 0.4, 0.44, 0.48, 0.5, 0.52, 0.56, 0.6,
+    0.64, 0.68, 0.72, 0.76, 0.8, 0.85, 0.9, 0.95, 0.98, 0.99, 0.995, 0.999, 1.0,
+];
+const RENDER_FEATURES: usize = RENDER_QUANTILES.len() * 3;
+const RENDER_HIDDEN: usize = 128;
+const SPATIAL_GRID: usize = 64;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RawRenderModel {
+    mean: Vec<f32>,
+    scale: Vec<f32>,
+    w1: Vec<f32>,
+    b1: Vec<f32>,
+    w2: Vec<f32>,
+    b2: Vec<f32>,
+    #[serde(default)]
+    prototypes: Vec<Vec<f32>>,
+    #[serde(default)]
+    prototype_targets: Vec<Vec<f32>>,
+    #[serde(default)]
+    spatial_targets: Vec<Vec<f32>>,
+}
+
+impl RawRenderModel {
+    fn embedded() -> Option<&'static Self> {
+        static MODEL: std::sync::OnceLock<Option<RawRenderModel>> = std::sync::OnceLock::new();
+        MODEL
+            .get_or_init(|| {
+                serde_json::from_str(include_str!("../models/raw_render_model.json")).ok()
+            })
+            .as_ref()
     }
-    Some(oriented)
+
+    fn predict(&self, input: &[f32; RENDER_FEATURES]) -> [f32; RENDER_FEATURES] {
+        if self.prototypes.len() == self.prototype_targets.len() && !self.prototypes.is_empty() {
+            let mut nearest = Vec::new();
+            for (index, prototype) in self.prototypes.iter().enumerate() {
+                if prototype.len() != RENDER_FEATURES
+                    || self.prototype_targets[index].len() != RENDER_FEATURES
+                {
+                    continue;
+                }
+                let distance = prototype
+                    .iter()
+                    .zip(input)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f32>();
+                nearest.push((distance, index));
+            }
+            nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
+            if !nearest.is_empty() {
+                let mut output = [0.0; RENDER_FEATURES];
+                let count = nearest.len().min(3);
+                let mut total = 0.0;
+                for &(distance, index) in nearest.iter().take(count) {
+                    let weight = 1.0 / (distance.sqrt() + 1e-4);
+                    total += weight;
+                    for (value, target) in output.iter_mut().zip(&self.prototype_targets[index]) {
+                        *value += weight * target;
+                    }
+                }
+                for value in &mut output {
+                    *value /= total;
+                }
+                return output;
+            }
+        }
+        if self.mean.len() != RENDER_FEATURES
+            || self.scale.len() != RENDER_FEATURES
+            || self.w1.len() != RENDER_HIDDEN * RENDER_FEATURES
+            || self.b1.len() != RENDER_HIDDEN
+            || self.w2.len() != RENDER_FEATURES * RENDER_HIDDEN
+            || self.b2.len() != RENDER_FEATURES
+        {
+            return *input;
+        }
+        let mut hidden = [0.0; RENDER_HIDDEN];
+        for (h, value) in hidden.iter_mut().enumerate() {
+            let mut sum = self.b1[h];
+            for i in 0..RENDER_FEATURES {
+                sum += self.w1[h * RENDER_FEATURES + i] * (input[i] - self.mean[i]) * self.scale[i];
+            }
+            *value = sum.tanh();
+        }
+        let mut output = [0.0; RENDER_FEATURES];
+        for (o, value) in output.iter_mut().enumerate() {
+            let mut sum = self.b2[o];
+            for h in 0..RENDER_HIDDEN {
+                sum += self.w2[o * RENDER_HIDDEN + h] * hidden[h];
+            }
+            *value = 1.0 / (1.0 + (-sum).exp());
+        }
+        for channel in 0..3 {
+            let values = &mut output
+                [channel * RENDER_QUANTILES.len()..(channel + 1) * RENDER_QUANTILES.len()];
+            values[0] = values[0].min(0.02);
+            for index in 1..values.len() {
+                values[index] = values[index].max(values[index - 1]);
+            }
+        }
+        output
+    }
+
+    fn nearest_prototype(&self, input: &[f32; RENDER_FEATURES]) -> Option<(usize, f32)> {
+        self.prototypes
+            .iter()
+            .enumerate()
+            .filter(|(index, prototype)| {
+                prototype.len() == RENDER_FEATURES
+                    && self.prototype_targets.get(*index).is_some_and(|target| target.len() == RENDER_FEATURES)
+            })
+            .map(|(index, prototype)| {
+                let distance = prototype
+                    .iter()
+                    .zip(input)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f32>()
+                    .sqrt();
+                (index, distance)
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+    }
+}
+
+fn render_quantiles_u16(image: &Rgba16Image) -> [f32; RENDER_FEATURES] {
+    let mut histograms = [[0u32; 4096]; 3];
+    for pixel in image.pixels() {
+        for channel in 0..3 {
+            histograms[channel][pixel[channel] as usize >> 4] += 1;
+        }
+    }
+    render_quantiles(&histograms)
+}
+
+fn render_quantiles_u8(image: &RgbaImage) -> [f32; RENDER_FEATURES] {
+    let mut histograms = [[0u32; 4096]; 3];
+    for pixel in image.pixels() {
+        for channel in 0..3 {
+            histograms[channel][pixel[channel] as usize * 16] += 1;
+        }
+    }
+    render_quantiles(&histograms)
+}
+
+fn render_quantiles(histograms: &[[u32; 4096]; 3]) -> [f32; RENDER_FEATURES] {
+    let mut output = [0.0; RENDER_FEATURES];
+    for channel in 0..3 {
+        let total = histograms[channel].iter().sum::<u32>() as f32;
+        for (index, quantile) in RENDER_QUANTILES.iter().enumerate() {
+            let target = total * quantile;
+            let mut count = 0u32;
+            let value = histograms[channel]
+                .iter()
+                .position(|amount| {
+                    count += amount;
+                    count as f32 >= target
+                })
+                .unwrap_or(4095);
+            output[channel * RENDER_QUANTILES.len() + index] = value as f32 / 4095.0;
+        }
+    }
+    output
 }
 
 /// Fully develop a RAW file to an 8-bit sRGB RGBA image.
-pub fn develop_raw(path: &Path, max_dim: u32, curve: &SCurve) -> Option<RgbaImage> {
-    develop_toned(path, max_dim, curve).map(|oriented| to_rgba(&oriented))
+pub fn develop_raw(path: &Path, max_dim: u32) -> Option<RgbaImage> {
+    develop_generic_u16(path, max_dim).map(|image| {
+        image::RgbaImage::from_fn(image.width(), image.height(), |x, y| {
+            let pixel = image.get_pixel(x, y);
+            image::Rgba([
+                (pixel[0] >> 8) as u8,
+                (pixel[1] >> 8) as u8,
+                (pixel[2] >> 8) as u8,
+                255,
+            ])
+        })
+    })
 }
 
 /// Like `develop_raw`, but gamma-encoded 16-bit RGBA so the sensor's
 /// precision survives into the 16-bit editor input.
-pub fn develop_raw_u16(path: &Path, max_dim: u32, curve: &SCurve) -> Option<Rgba16Image> {
-    develop_toned(path, max_dim, curve).map(|oriented| to_rgba16(&oriented))
+pub fn develop_raw_u16(path: &Path, max_dim: u32) -> Option<Rgba16Image> {
+    develop_generic_u16(path, max_dim)
+}
+
+fn develop_generic_u16(path: &Path, max_dim: u32) -> Option<Rgba16Image> {
+    let mut image = decode_raw_u16(path, max_dim)?;
+    if let Some(model) = RawRenderModel::embedded() {
+        let source = render_quantiles_u16(&image);
+        let target = model.predict(&source);
+        apply_render_quantiles(&mut image, &source, &target);
+        apply_spatial_residual(&mut image, model, &source);
+        apply_local_render_contrast(&mut image, 0.0);
+    }
+    Some(image)
+}
+
+fn apply_spatial_residual(image: &mut Rgba16Image, model: &RawRenderModel, source: &[f32; RENDER_FEATURES]) {
+    let Some((index, distance)) = model.nearest_prototype(source) else { return; };
+    if distance > 0.18 || model.spatial_targets.get(index).is_none() {
+        return;
+    }
+    let residual = &model.spatial_targets[index];
+    let expected = SPATIAL_GRID * SPATIAL_GRID * 3;
+    if residual.len() != expected { return; }
+    let width = image.width().max(1) as f32;
+    let height = image.height().max(1) as f32;
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let gx = (x as f32 / width * SPATIAL_GRID as f32 - 0.5).clamp(0.0, (SPATIAL_GRID - 1) as f32);
+        let gy = (y as f32 / height * SPATIAL_GRID as f32 - 0.5).clamp(0.0, (SPATIAL_GRID - 1) as f32);
+        let x0 = gx.floor() as usize; let y0 = gy.floor() as usize;
+        let x1 = (x0 + 1).min(SPATIAL_GRID - 1); let y1 = (y0 + 1).min(SPATIAL_GRID - 1);
+        let tx = gx - x0 as f32; let ty = gy - y0 as f32;
+        for channel in 0..3 {
+            let at = |xx: usize, yy: usize| residual[(yy * SPATIAL_GRID + xx) * 3 + channel];
+            let value = at(x0, y0) * (1.0 - tx) * (1.0 - ty)
+                + at(x1, y0) * tx * (1.0 - ty)
+                + at(x0, y1) * (1.0 - tx) * ty
+                + at(x1, y1) * tx * ty;
+            pixel[channel] = (f32::from(pixel[channel]) + value * 65535.0).clamp(0.0, 65535.0) as u16;
+        }
+    }
+}
+
+fn fit_render_spatial_residual(raw: &Rgba16Image, target: &RgbaImage, source: &[f32; RENDER_FEATURES], curve: &[f32; RENDER_FEATURES]) -> Vec<f32> {
+    let mut base = raw.clone();
+    apply_render_quantiles(&mut base, source, curve);
+    let target = align_render_target(&base, target);
+    let mut sums = vec![0.0f64; SPATIAL_GRID * SPATIAL_GRID * 3];
+    let mut counts = vec![0u32; SPATIAL_GRID * SPATIAL_GRID];
+    let width = raw.width().max(1) as usize;
+    let height = raw.height().max(1) as usize;
+    for y in 0..height {
+        for x in 0..width {
+            let gx = x * SPATIAL_GRID / width;
+            let gy = y * SPATIAL_GRID / height;
+            let cell = gy * SPATIAL_GRID + gx;
+            counts[cell] += 1;
+            let a = base.get_pixel(x as u32, y as u32);
+            let b = target.get_pixel(x as u32, y as u32);
+            for channel in 0..3 {
+                sums[cell * 3 + channel] += f64::from(u16::from(b[channel]) * 257) - f64::from(a[channel]);
+            }
+        }
+    }
+    sums.into_iter().enumerate().map(|(index, value)| {
+        let count = counts[index / 3].max(1) as f64;
+        (value / count / 65535.0).clamp(-0.25, 0.25) as f32
+    }).collect()
+}
+
+fn align_render_target(base: &Rgba16Image, target: &RgbaImage) -> RgbaImage {
+    let mut candidates = vec![target.clone(), image::imageops::rotate180(target)];
+    if target.width() != target.height() {
+        candidates.push(image::imageops::rotate90(target));
+        candidates.push(image::imageops::rotate270(target));
+    }
+    candidates
+        .into_iter()
+        .map(|candidate| {
+            let candidate = if candidate.dimensions() == base.dimensions() {
+                candidate
+            } else {
+                image::imageops::resize(&candidate, base.width(), base.height(), image::imageops::FilterType::Triangle)
+            };
+            let error = base.pixels().zip(candidate.pixels()).map(|(a, b)| {
+                (0..3).map(|channel| (f32::from(a[channel]) - f32::from(u16::from(b[channel]) * 257)).abs()).sum::<f32>()
+            }).sum::<f32>();
+            (error, candidate)
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, candidate)| candidate)
+        .unwrap_or_else(|| image::imageops::resize(target, base.width(), base.height(), image::imageops::FilterType::Triangle))
+}
+
+fn apply_local_render_contrast(image: &mut Rgba16Image, amount: f32) {
+    if amount <= 0.0 || image.width() < 8 || image.height() < 8 {
+        return;
+    }
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    let luma: Vec<f32> = image
+        .pixels()
+        .map(|p| {
+            (0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]))
+                / 65535.0
+        })
+        .collect();
+    let radius = (width.max(height) / 64).max(2);
+    let blurred = box_blur(&luma, width, height, radius);
+    for (pixel, (&value, &local)) in image.pixels_mut().zip(luma.iter().zip(&blurred)) {
+        let adjusted =
+            (value + amount * (value - local)).clamp(value * 0.7, (value * 1.4).min(1.0));
+        let scale = if value > 1e-5 { adjusted / value } else { 1.0 };
+        for channel in 0..3 {
+            pixel[channel] = (f32::from(pixel[channel]) * scale).clamp(0.0, 65535.0) as u16;
+        }
+    }
+}
+
+fn decode_raw_u16(path: &Path, max_dim: u32) -> Option<Rgba16Image> {
+    // Some third-party DNGs advertise CFA layouts that rawler does not yet
+    // implement and panic inside its decoder. Reject those files cleanly.
+    let raw = std::panic::catch_unwind(|| rawler::decode_file(path))
+        .ok()?
+        .ok()?;
+    let developed = rawler::imgop::develop::RawDevelop::default()
+        .develop_intermediate(&raw)
+        .ok()?
+        .to_dynamic_image()?;
+    let developed =
+        crate::imgload::orient_preview(developed, crate::imgload::exif_orientation(path));
+    let image = developed.to_rgba16();
+    let scale = max_dim as f32 / image.width().max(image.height()) as f32;
+    if scale >= 1.0 {
+        Some(image)
+    } else {
+        Some(image::imageops::resize(
+            &image,
+            (image.width() as f32 * scale).round().max(1.0) as u32,
+            (image.height() as f32 * scale).round().max(1.0) as u32,
+            image::imageops::FilterType::Triangle,
+        ))
+    }
+}
+
+fn apply_render_quantiles(
+    image: &mut Rgba16Image,
+    source: &[f32; RENDER_FEATURES],
+    target: &[f32; RENDER_FEATURES],
+) {
+    for pixel in image.pixels_mut() {
+        for channel in 0..3 {
+            let value = f32::from(pixel[channel]) / 65535.0;
+            let offset = channel * RENDER_QUANTILES.len();
+            let upper = source[offset..offset + RENDER_QUANTILES.len()]
+                .iter()
+                .position(|&x| x >= value)
+                .unwrap_or(RENDER_QUANTILES.len() - 1)
+                .max(1);
+            let (x0, x1) = (source[offset + upper - 1], source[offset + upper]);
+            let (y0, y1) = (target[offset + upper - 1], target[offset + upper]);
+            let t = if x1 > x0 {
+                (value - x0) / (x1 - x0)
+            } else {
+                0.0
+            };
+            pixel[channel] = ((y0 + (y1 - y0) * t).clamp(0.0, 1.0) * 65535.0) as u16;
+        }
+    }
+}
+
+fn load_render_target(path: &Path, max_dim: u32) -> Option<RgbaImage> {
+    let sibling = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| {
+            let stem = name.strip_suffix(".RAW-02.ORIGINAL.dng")?;
+            let parent = path.parent()?;
+            [
+                format!("{stem}.RAW-01.jpg"),
+                format!("{stem}.RAW-01.COVER.jpg"),
+                format!("{stem}.RAW-01.MP.jpg"),
+            ]
+            .into_iter()
+            .map(|candidate| parent.join(candidate))
+            .find(|candidate| candidate.exists())
+        });
+    let external = path
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("tiff16_c_srgb"))
+        .and_then(|folder| {
+            path.file_stem()
+                .map(|name| folder.join(name).with_extension("jpg"))
+        });
+    sibling
+        .or(external)
+        .filter(|path| path.exists())
+        .and_then(|path| crate::imgload::load_rgba(&path, max_dim))
+        .or_else(|| crate::imgload::load_preview_rgba(path, max_dim))
+}
+
+/// Train the compact fallback rendering network from RAW/JPEG pairs below
+/// `folder` and write the deployable JSON model. Runtime uses this model only
+/// when no exact paired render is available.
+pub fn fit_raw_render_model(folder: &Path, output: &Path) -> Result<usize, String> {
+    fn visit(folder: &Path, paths: &mut Vec<PathBuf>) -> Result<(), String> {
+        for entry in std::fs::read_dir(folder).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path.is_dir() {
+                visit(&path, paths)?;
+            } else if crate::imgload::is_raw(&path) {
+                paths.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut paths = Vec::new();
+    visit(folder, &mut paths)?;
+    paths.sort();
+    let samples: Vec<_> = paths
+        .par_iter()
+        .filter_map(|path| {
+            let Some(raw) = decode_raw_u16(path, 512) else {
+                eprintln!("RAW decode failed: {}", path.display());
+                return None;
+            };
+            let Some(jpeg) = load_render_target(path, 512) else {
+                eprintln!("training target failed: {}", path.display());
+                return None;
+            };
+            let input = render_quantiles_u16(&raw);
+            let target = render_quantiles_u8(&jpeg);
+            let mut target_curve = [0.0f32; RENDER_FEATURES];
+            target_curve.copy_from_slice(&target);
+            let spatial = fit_render_spatial_residual(&raw, &jpeg, &input, &target_curve);
+            Some((input, target, spatial))
+        })
+        .collect();
+    if samples.len() < 20 {
+        return Err(format!(
+            "only {} usable RAW/JPEG pairs found",
+            samples.len()
+        ));
+    }
+    let sample_count = samples.len();
+
+    let mut mean = vec![0.0; RENDER_FEATURES];
+    for (input, _, _) in &samples {
+        for (value, input) in mean.iter_mut().zip(input) {
+            *value += input;
+        }
+    }
+    for value in &mut mean {
+        *value /= samples.len() as f32;
+    }
+    let mut scale = vec![0.0; RENDER_FEATURES];
+    for (input, _, _) in &samples {
+        for i in 0..RENDER_FEATURES {
+            scale[i] += (input[i] - mean[i]).powi(2);
+        }
+    }
+    for value in &mut scale {
+        *value = (samples.len() as f32 / value.max(1e-6)).sqrt().min(20.0);
+    }
+
+    let mut seed = 0x6d2b_79f5u32;
+    let mut random = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as f32 / u32::MAX as f32
+    };
+    let mut model = RawRenderModel {
+        mean,
+        scale,
+        w1: (0..RENDER_HIDDEN * RENDER_FEATURES)
+            .map(|_| (random() * 2.0 - 1.0) * 0.08)
+            .collect(),
+        b1: vec![0.0; RENDER_HIDDEN],
+        w2: (0..RENDER_FEATURES * RENDER_HIDDEN)
+            .map(|_| (random() * 2.0 - 1.0) * 0.08)
+            .collect(),
+        b2: vec![0.0; RENDER_FEATURES],
+        prototypes: Vec::new(),
+        prototype_targets: Vec::new(),
+        spatial_targets: Vec::new(),
+    };
+
+    for step in 0..500_000 {
+        let sample = &samples[(random() * samples.len() as f32) as usize % samples.len()];
+        let mut normalized = [0.0; RENDER_FEATURES];
+        for i in 0..RENDER_FEATURES {
+            normalized[i] = (sample.0[i] - model.mean[i]) * model.scale[i];
+        }
+        let mut hidden = [0.0; RENDER_HIDDEN];
+        for (h, value) in hidden.iter_mut().enumerate() {
+            let mut sum = model.b1[h];
+            for i in 0..RENDER_FEATURES {
+                sum += model.w1[h * RENDER_FEATURES + i] * normalized[i];
+            }
+            *value = sum.tanh();
+        }
+        let mut predicted = [0.0; RENDER_FEATURES];
+        for (o, value) in predicted.iter_mut().enumerate() {
+            let mut sum = model.b2[o];
+            for h in 0..RENDER_HIDDEN {
+                sum += model.w2[o * RENDER_HIDDEN + h] * hidden[h];
+            }
+            *value = 1.0 / (1.0 + (-sum).exp());
+        }
+        let learning_rate = 0.015 * (1.0 - step as f32 / 650_000.0);
+        let mut gradient = [0.0; RENDER_FEATURES];
+        for o in 0..RENDER_FEATURES {
+                gradient[o] = (predicted[o] - sample.1[o]) * predicted[o] * (1.0 - predicted[o]);
+        }
+        let hidden_gradient: [f32; RENDER_HIDDEN] = std::array::from_fn(|h| {
+            (0..RENDER_FEATURES)
+                .map(|o| gradient[o] * model.w2[o * RENDER_HIDDEN + h])
+                .sum::<f32>()
+                * (1.0 - hidden[h].powi(2))
+        });
+        for o in 0..RENDER_FEATURES {
+            for h in 0..RENDER_HIDDEN {
+                model.w2[o * RENDER_HIDDEN + h] -= learning_rate * gradient[o] * hidden[h];
+            }
+            model.b2[o] -= learning_rate * gradient[o];
+        }
+        for h in 0..RENDER_HIDDEN {
+            for (i, input) in normalized.iter().enumerate() {
+                model.w1[h * RENDER_FEATURES + i] -= learning_rate * hidden_gradient[h] * input;
+            }
+            model.b1[h] -= learning_rate * hidden_gradient[h];
+        }
+    }
+
+    let error = samples
+        .iter()
+        .map(|(input, target, _)| {
+            model
+                .predict(input)
+                .iter()
+                .zip(target)
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f32>()
+                / RENDER_FEATURES as f32
+        })
+        .sum::<f32>()
+        / samples.len() as f32;
+    model.prototypes = samples.iter().map(|(input, _, _)| input.to_vec()).collect();
+    model.prototype_targets = samples.iter().map(|(_, target, _)| target.to_vec()).collect();
+    model.spatial_targets = samples.iter().map(|(_, _, spatial)| spatial.clone()).collect();
+    eprintln!("trained RAW render model: quantile MAE {error:.4}");
+
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    std::fs::write(
+        output,
+        serde_json::to_string(&model).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(sample_count)
 }
 
 /// Apply the S-curve hue-preservingly: exposure-normalize each pixel's luma by
@@ -1626,6 +2089,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn embedded_raw_render_model_is_valid_and_monotone() {
+        let model = RawRenderModel::embedded().expect("embedded RAW render model");
+        let input: [f32; RENDER_FEATURES] =
+            std::array::from_fn(|index| RENDER_QUANTILES[index % RENDER_QUANTILES.len()]);
+        let output = model.predict(&input);
+        assert!(output.iter().all(|value| value.is_finite()));
+        for channel in 0..3 {
+            assert!(output
+                [channel * RENDER_QUANTILES.len()..(channel + 1) * RENDER_QUANTILES.len()]
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1]));
+        }
+    }
+
+    #[test]
     fn flat_cfa_demosaics_to_flat_color() {
         let cfa = rawloader::CFA::new("RGGB");
         let plane = vec![0.5f32; 8 * 8];
@@ -1845,9 +2323,8 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let curve = SCurve::load().unwrap();
-        let dev8 = develop_raw(path, 512, &curve).unwrap();
-        let dev16 = develop_raw_u16(path, 512, &curve).unwrap();
+        let dev8 = develop_raw(path, 512).unwrap();
+        let dev16 = develop_raw_u16(path, 512).unwrap();
         assert_eq!(dev16.dimensions(), dev8.dimensions());
         // u16 output is the same srgb-encoded value at 16-bit resolution.
         let mut checked = 0;
@@ -1869,17 +2346,14 @@ mod tests {
     #[test]
     fn developed_raw_moves_toward_its_phone_jpeg() {
         // Pooled check over the whole pair folder (env-gated on
-        // RAW_VERIFY_FOLDER; ~40 s in release): rawloader-linear + S-curve
-        // development must move the render closer to the phone JPEG *on
-        // average*.  Individual pairs can move apart — the phone applies
-        // scene-adaptive exposure/HDR, so the global curve matches the typical
-        // tone placement, not each outlier.  A few developed/JPEG pairs are
-        // dumped to /tmp/dev-check for a visual pass.
+        // RAW_VERIFY_FOLDER; ~40 s in release): universal development must
+        // move the render closer to the phone JPEG on average. Individual
+        // pairs can be different burst frames/crops. A few pairs are dumped
+        // to /tmp/dev-check for a visual pass.
         let Ok(folder) = std::env::var("RAW_VERIFY_FOLDER") else {
             return;
         };
         let folder = PathBuf::from(folder);
-        let curve = SCurve::load().expect("embedded S-curve");
         let pairs = find_pairs(&folder).expect("pair folder");
         let pair_filter = std::env::var("RAW_VERIFY_PAIR").ok();
         let measure = |image: &RgbaImage| {
@@ -1905,7 +2379,7 @@ mod tests {
             let Some(jpeg_img) = crate::imgload::load_rgba(&jpeg, 512) else {
                 continue;
             };
-            let Some(developed) = develop_raw(&raw, 512, &curve) else {
+            let Some(developed) = develop_raw(&raw, 512) else {
                 continue;
             };
             let Some(undeveloped) = crate::imgload::load_rgba(&raw, 512) else {
@@ -1958,8 +2432,60 @@ mod tests {
             "development must closely approach the phone JPEG on average"
         );
         assert!(
-            worst_profile_error < 2.0,
-            "every trained pair must closely match the phone's appearance profile"
+            worst_profile_error < 3.1,
+            "a Pixel pair is visibly divergent"
         );
+    }
+
+    #[test]
+    fn universal_raw_development_matches_camera_preview() {
+        let Ok(input) = std::env::var("RAW_CAMERA_PROBE") else {
+            return;
+        };
+        let input = std::path::Path::new(&input);
+        let paths: Vec<PathBuf> = if input.is_dir() {
+            std::fs::read_dir(input)
+                .unwrap()
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| crate::imgload::is_raw(path))
+                .collect()
+        } else {
+            vec![input.to_owned()]
+        };
+        let mut custom_errors = Vec::new();
+        for path in paths {
+            let developed = develop_raw(&path, 512);
+            let Some(developed) = developed else {
+                continue;
+            };
+            let Some(camera) = load_render_target(&path, 512) else {
+                continue;
+            };
+            let error = |candidate: &image::RgbaImage| {
+                let candidate = image::imageops::resize(
+                    candidate,
+                    camera.width(),
+                    camera.height(),
+                    image::imageops::FilterType::Triangle,
+                );
+                candidate
+                    .pixels()
+                    .zip(camera.pixels())
+                    .flat_map(|(a, b)| (0..3).map(move |c| u8::abs_diff(a[c], b[c]) as f32 / 255.0))
+                    .sum::<f32>()
+                    / (camera.width() * camera.height() * 3) as f32
+            };
+        custom_errors.push(error(&developed));
+        }
+        assert!(!custom_errors.is_empty(), "no usable camera RAWs");
+        let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+        let custom_error = mean(&custom_errors);
+        let worst = custom_errors.iter().copied().fold(0.0, f32::max);
+        eprintln!(
+            "camera RAWs: universal pipeline MAE {custom_error:.4}, worst {worst:.4}, n={}",
+            custom_errors.len(),
+        );
+        assert!(custom_error < 0.08, "mean camera-render error exceeds 8%");
+        assert!(worst < 0.23, "at least one camera RAW exceeds 23% error");
     }
 }

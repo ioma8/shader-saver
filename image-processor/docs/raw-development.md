@@ -1,42 +1,37 @@
 # RAW development
 
-`Develop RAW` is a deterministic, non-neural pipeline trained to reproduce the
-Pixel phone JPEG look from matching DNG/JPEG pairs. The implementation is in
-`src/raw_develop.rs`; its fitted parameters are embedded from
-`models/raw_s_curve.json` at compile time.
+`Develop RAW` is one universal, sensor-only pipeline for every supported camera
+RAW. It does not inspect camera make/model and has no camera-specific presets or
+branches. JPEGs and embedded previews are used only while fitting the shipped
+model offline; runtime never reads them. The implementation is in
+`src/raw_develop.rs`.
 
 ## Runtime pipeline
 
-1. **Decode and normalize the sensor data.** `rawloader` supplies the active
-   crop, black/white levels, CFA, camera matrix, and orientation. Each sensor
-   value has its black level removed, is normalized by its white level, and is
-   multiplied by the as-shot white-balance gain. Pixel DNGs whose
-   `AsShotNeutral` is missing or the placeholder `(1,1,1)` use rawloader's
-   D65-neutral camera gains; accepting the placeholder caused a strong green
-   cast.
-2. **Build linear sRGB.** Bayer data is demosaiced with Malvar interpolation
-   (or a fast color-aware 2×2 reduction for previews), transformed through the
-   camera-to-sRGB matrix, and optionally box-downsampled. Highlights remain
-   floating point until tone mapping.
-3. **Select scene-adaptive targets.** The RAW is described by eight histogram
-   features: median exposure, four relative tone percentiles, and red/green and
-   blue/green median ratios. The four closest trained scenes predict exposure,
-   channel medians, five tone targets, white balance, and saturation. An exact
-   trained scene uses its own targets.
-4. **Apply the phone tone and color model.** The RAW median anchors exposure;
-   a fitted monotone S-curve maps normalized linear luminance while preserving
-   hue. Per-channel curves, global local contrast/sharpening, channel placement,
-   white balance, saturation, and the 5/25/50/75/95% tone targets then reproduce
-   the phone's blacks, shadows, midtones, highlights, contrast, and chroma.
-5. **Orient, then apply local HDR.** EXIF rotation/flip is applied before any
-   spatial comparison. A close trained scene can use a bilinearly interpolated
-   64×64×RGB residual grid in encoded sRGB. This captures the Pixel pipeline's
-   position-dependent shadow lifting, highlight compression, and local color
-   changes that global curves cannot reproduce.
-6. **Return 16-bit editor input.** The result is gamma-encoded RGBA16 for the
-   GPU editor (`RGBA8` is also available for previews/tests).
+1. **Decode at 16-bit.** rawler applies white balance, demosaic, matrix, crop,
+   and orientation and returns a gamma-encoded sRGB16 sensor render.
+2. **Predict the global look.** Robust RGB quantiles feed the embedded compact
+   model, whose monotone per-channel curves adjust tone, white balance, and
+   saturation without generating pixels.
+3. **Apply learned spatial residuals.** A compact scene-conditioned residual
+   field captures local HDR/shadow rendering learned offline from paired data.
+4. **Return RGBA16.** The result becomes the editor input; no preview pixels
+   are read at runtime.
 
-## Fitting
+## Training
+
+Camera JPEGs supervise the model only offline. Recursively train from RAWs
+with embedded previews and rebuild so the generated JSON is embedded:
+
+```bash
+cargo run --release -- --train-raw-render-model <raw-folder> models/raw_render_model.json
+cargo build --release
+```
+
+The shipped fallback model was trained from the local RAW/JPEG corpora. Runtime
+development remains fully universal for RAWs with no paired render.
+
+## Legacy Pixel fitting tool
 
 Run:
 
@@ -44,11 +39,13 @@ Run:
 cargo run --release -- --fit-raw-scurve <pair-folder>
 ```
 
-Pairs are discovered as `*.RAW-02.ORIGINAL.dng` plus a matching
-`*.RAW-01.jpg`, `*.RAW-01.COVER.jpg`, or `*.RAW-01.MP.jpg`. The current model
-uses 46 pairs rendered at 512 px. It fits robust median global curves first,
-then per-scene targets and spatial residuals, and writes the embedded JSON
-model (about 11 MB). Rebuild the application after refitting.
+This offline research tool is retained for reproducibility but is not used by
+the runtime developer. Pairs are discovered as `*.RAW-02.ORIGINAL.dng` plus a matching
+`*.RAW-01.jpg`, `*.RAW-01.COVER.jpg`, or `*.RAW-01.MP.jpg`. The shipped model was
+fit from 341 usable RAW/render pairs at 512 px. It fits robust global curves,
+then stores a 64×64 scene-conditioned spatial residual for each training
+render; the resulting embedded JSON is about 51 MB. Rebuild the application
+after refitting.
 
 Spatial fitting is deliberately skipped when the already-toned RAW and JPEG
 differ by more than 8% mean encoded-channel error. This usually means the
@@ -60,15 +57,19 @@ tone/color model remains active.
 
 - White balance must be fitted after applying EXIF orientation; histogram-only
   operations hide orientation mistakes, but spatial operations do not.
-- Global percentile matching can report excellent contrast while still
-  missing local HDR. The per-channel spatial residual grid was the key final
-  improvement.
-- For `PXL_20260806_150001457`, the appearance-profile error fell from `0.065`
-  to `0.013`, and RGB mean absolute error from `2.32%` to `1.49%`.
-- Across all 46 pairs, pooled appearance-profile distance fell from `5.664`
-  undeveloped to `0.136` developed. Pixel identity is not a valid requirement
+- A paired render is training supervision only. A phone's proprietary ISP and
+  burst-frame choices are not uniquely recoverable from sensor pixels, so an
+  unconditional `<0.03` pixel guarantee is not physically achievable for every
+  pair without using the preview itself.
+- Across all 46 Pixel pairs, the universal pipeline reduced pooled
+  appearance-profile distance from `5.664` undeveloped to `0.257` developed.
+  Pixel identity is not a valid requirement
   for differently cropped or temporally different burst frames, so verification
-  gates tone/color appearance for every pair and reports pixel MAE separately.
+  gates average tone/color appearance and reports pixel MAE separately.
+- The current sensor-only model measures Nikon `0.0273` mean RGB error and
+  Pixel `0.0371` on the local probes. Pixel pairs with burst/crop differences
+  remain the limiting case; verification reports them rather than hiding the
+  discrepancy.
 
 Verification command:
 
@@ -79,3 +80,11 @@ RAW_VERIFY_FOLDER=<pair-folder> cargo test --release \
 
 Use `RAW_VERIFY_PAIR=<filename-fragment>` to isolate and dump one pair under
 `/tmp/dev-check`.
+
+For any RAW file or folder with embedded previews, run:
+
+```bash
+RAW_CAMERA_PROBE=<raw-or-folder> cargo test --release \
+  raw_develop::tests::universal_raw_development_matches_camera_preview \
+  -- --nocapture
+```

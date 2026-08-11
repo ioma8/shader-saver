@@ -1,5 +1,6 @@
-// Unified image loading. RAW files are always decoded from sensor data by
-// imagepipe; embedded JPEG previews are used only for browse thumbnails.
+// Unified image loading. RAW files auto-develop through the universal rawler
+// sensor pipeline and learned look; embedded JPEG previews are browse-only and
+// never become the editor's developed RAW.
 use jpgfromraw::FindJpegType;
 use std::path::Path;
 
@@ -48,7 +49,7 @@ pub fn load_preview_rgba(path: &Path, max_dim: u32) -> Option<image::RgbaImage> 
     Some(image.to_rgba8())
 }
 
-fn exif_orientation(path: &Path) -> u32 {
+pub(crate) fn exif_orientation(path: &Path) -> u32 {
     let Ok(file) = std::fs::File::open(path) else {
         return 1;
     };
@@ -62,7 +63,7 @@ fn exif_orientation(path: &Path) -> u32 {
         .unwrap_or(1)
 }
 
-fn orient_preview(image: image::DynamicImage, orientation: u32) -> image::DynamicImage {
+pub(crate) fn orient_preview(image: image::DynamicImage, orientation: u32) -> image::DynamicImage {
     match orientation {
         2 => image.fliph(),
         3 => image.rotate180(),
@@ -80,23 +81,13 @@ pub fn load_edit_rgba(path: &Path) -> Option<(image::RgbaImage, bool)> {
     load_rgba(path, max_dim).map(|image| (image, false))
 }
 
-// RAW uses a real sensor decode (demosaic, camera WB/matrix and imagepipe's
-// display curve), never the embedded camera preview. Raster images are decoded
-// normally. This is the one base image used by editing, training and export.
+// RAW uses the same universal sensor decoder and trained display rendering as
+// the Develop action. There is intentionally no camera-manufacturer branch or
+// alternate thumbnail decoder: browse, edit, export and Develop all consume
+// this one RAW path. Raster images are decoded normally.
 pub fn load_rgba(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
     if is_raw(path) {
-        let decoded =
-            imagepipe::simple_decode_8bit(path, max_dim as usize, max_dim as usize).ok()?;
-        let mut rgba = Vec::with_capacity(decoded.width * decoded.height * 4);
-        for pixel in decoded.data.chunks_exact(3) {
-            rgba.extend_from_slice(pixel);
-            rgba.push(255);
-        }
-        return image::RgbaImage::from_raw(
-            u32::try_from(decoded.width).ok()?,
-            u32::try_from(decoded.height).ok()?,
-            rgba,
-        );
+        return crate::raw_develop::develop_raw(path, max_dim);
     }
 
     let image = image::open(path).ok()?;

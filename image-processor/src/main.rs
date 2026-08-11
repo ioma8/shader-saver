@@ -230,13 +230,9 @@ fn look_reference_thumb(img: &image::RgbaImage) -> image::RgbaImage {
     image::imageops::thumbnail(img, 512, 512)
 }
 
-fn load_look_input(
-    path: &Path,
-    curve: Option<&raw_develop::SCurve>,
-    max_dim: u32,
-) -> Option<image::RgbaImage> {
+fn load_look_input(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
     if imgload::is_raw(path) {
-        raw_develop::develop_raw(path, max_dim, curve?)
+        raw_develop::develop_raw(path, max_dim)
     } else {
         imgload::load_rgba(path, max_dim)
     }
@@ -578,7 +574,6 @@ struct App {
     look_model: Arc<look_model::LookModel>,
     canon: Option<Arc<canoncgt::CanonCgt>>,
     look_examples: Vec<look_model::TrainingExample>,
-    s_curve: Option<Arc<raw_develop::SCurve>>,
     similar_tx: std::sync::mpsc::Sender<(PathBuf, Option<similar::Analysis>)>,
     similar_rx: std::sync::mpsc::Receiver<(PathBuf, Option<similar::Analysis>)>,
     // (done, total) while semantic burst analysis is running
@@ -683,7 +678,6 @@ impl App {
             look_model: Arc::new(look_model::LookModel::train_with_examples(&look_examples)),
             canon: canoncgt::CanonCgt::load().map(Arc::new),
             look_examples,
-            s_curve: raw_develop::SCurve::load().map(Arc::new),
             similar_tx,
             similar_rx,
             similar_progress: None,
@@ -890,19 +884,18 @@ impl App {
         let detector = self.face_detector.clone();
         let look_model = self.look_model.clone();
         let canon = self.canon.clone();
-        let s_curve = self.s_curve.clone();
         // Workers have no GPU context, so each renders its own preview on the CPU
         // to derive the transfer. The LUT stage is everything a look-transferred
         // state contains, so that preview matches what the GPU shows at full size.
         let work = move |path: &Path| {
             let mut state = EditState::default();
             let img = if imgload::is_raw(path) {
-                // Develop straight from the RAW file; the imagepipe render is
+                // Develop straight from the RAW file; the generic browse render is
                 // only an open preview and would stack its own tone curve.
                 state.raw_isp_enabled = true;
-                load_look_input(path, s_curve.as_deref(), 768)?
+                load_look_input(path, 768)?
             } else {
-                load_look_input(path, None, 768)?
+                load_look_input(path, 768)?
             };
             let faces = detector
                 .as_ref()
@@ -1054,19 +1047,17 @@ impl App {
 
         processor.upload_rgba(&img, &gpu.device, &gpu.queue);
         if state.raw_isp_enabled && imgload::is_raw(path) {
-            if let Some(curve) = self.s_curve.as_ref() {
-                if let Some(developed) = raw_develop::develop_raw_u16(path, 2048, curve) {
-                    if processor.replace_input_u16(
-                        developed.width(),
-                        developed.height(),
-                        developed.as_raw(),
-                        &gpu.queue,
-                    ) {
-                        // `upload_rgba` processed the temporary embedded preview.
-                        // Render the restored edits again after swapping in the
-                        // persisted RAW development input.
-                        processor.process(&gpu.device, &gpu.queue);
-                    }
+            if let Some(developed) = raw_develop::develop_raw_u16(path, 2048) {
+                if processor.replace_input_u16(
+                    developed.width(),
+                    developed.height(),
+                    developed.as_raw(),
+                    &gpu.queue,
+                ) {
+                    // `upload_rgba` processed the temporary embedded preview.
+                    // Render the restored edits again after swapping in the
+                    // persisted RAW development input.
+                    processor.process(&gpu.device, &gpu.queue);
                 }
             }
         }
@@ -1186,18 +1177,15 @@ impl App {
                         proc.apply_edit_state(&state);
                         if state.raw_isp_enabled {
                             if let Some(path) = self.current_path.as_deref() {
-                                if let Some(curve) = self.s_curve.as_ref() {
-                                    let max_dim = proc.image_size.map_or(2048, |(w, h)| w.max(h));
-                                    if let Some(developed) =
-                                        raw_develop::develop_raw_u16(path, max_dim, curve)
-                                    {
-                                        proc.replace_input_u16(
-                                            developed.width(),
-                                            developed.height(),
-                                            developed.as_raw(),
-                                            &gpu.queue,
-                                        );
-                                    }
+                                let max_dim = proc.image_size.map_or(2048, |(w, h)| w.max(h));
+                                if let Some(developed) = raw_develop::develop_raw_u16(path, max_dim)
+                                {
+                                    proc.replace_input_u16(
+                                        developed.width(),
+                                        developed.height(),
+                                        developed.as_raw(),
+                                        &gpu.queue,
+                                    );
                                 }
                             }
                         }
@@ -1252,7 +1240,7 @@ impl App {
             if self.current_path.as_deref() == Some(path.as_path()) {
                 if let (Some(gpu), Some(processor)) = (self.gpu.as_ref(), self.processor.as_mut()) {
                     // A developed RAW's input is the 16-bit develop result; the
-                    // full-res imagepipe render is 8-bit and would clobber it,
+                    // full-res browse render is 8-bit and would clobber it,
                     // so keep the developed input for those.
                     if !(processor.raw_isp_enabled && imgload::is_raw(&path)) {
                         processor.upload_rgba(&img, &gpu.device, &gpu.queue);
@@ -1390,7 +1378,6 @@ impl App {
             let enhancer_available = self.enhancer.is_some();
             let adjust_progress = self.adjust_progress;
             let look_available = self.look.is_some();
-            let s_curve_available = self.s_curve.is_some();
             let current_is_raw = current_path.as_deref().is_some_and(imgload::is_raw);
             let similar_available =
                 self.classifier.is_some() && self.rater.is_some() && self.face_detector.is_some();
@@ -2293,13 +2280,11 @@ impl App {
                             }
                             if ui
                                 .add_enabled(
-                                    processor.has_image()
-                                        && current_is_raw
-                                        && s_curve_available,
-                                    egui::Button::new("Develop RAW"),
+                                    processor.has_image() && current_is_raw,
+                                    egui::Button::new("Re-develop RAW"),
                                 )
                                 .on_hover_text(
-                                    "Develop this DNG with rawloader basics plus the phone S-curve fitted from Pixel DNG/JPEG pairs",
+                                    "RAWs are auto-developed on open; re-run the universal 16-bit development",
                                 )
                                 .clicked()
                             {
@@ -2556,7 +2541,7 @@ impl App {
                             // bottom_up layout: added after Export, so it sits above it
                             if ui.add_enabled(
                                 processor.has_image(),
-                                egui::Button::new("Reset All Edits").min_size(egui::vec2(228.0, 0.0)),
+                                egui::Button::new("Reset All Edits (keeps RAW development)").min_size(egui::vec2(228.0, 0.0)),
                             ).clicked() {
                                 processor.apply_edit_state(&EditState::default());
                                 if let Some(gpu) = self.gpu.as_ref() {
@@ -2916,7 +2901,7 @@ impl App {
                 let look = self.look.as_ref()?;
                 let proc = self.processor.as_ref()?;
                 let gpu = self.gpu.as_ref()?;
-                let target = load_look_input(path, self.s_curve.as_deref(), 768)?;
+                let target = load_look_input(path, 768)?;
                 let faces = self
                     .face_detector
                     .as_ref()
@@ -2964,12 +2949,8 @@ impl App {
             let development = self
                 .current_path
                 .as_deref()
-                .filter(|path| imgload::is_raw(path) && self.s_curve.is_some())
-                .and_then(|path| {
-                    self.s_curve
-                        .as_ref()
-                        .and_then(|curve| raw_develop::develop_raw_u16(path, max_dim, curve))
-                });
+                .filter(|path| imgload::is_raw(path))
+                .and_then(|path| raw_develop::develop_raw_u16(path, max_dim));
             if development.is_none() {
                 eprintln!(
                     "Develop RAW: could not develop {}",
@@ -2978,18 +2959,29 @@ impl App {
                         .map_or_else(|| "<none>".to_string(), |p| p.display().to_string())
                 );
             }
+            let mut applied = false;
             if let (Some(processor), Some(gpu), Some(developed)) =
                 (self.processor.as_mut(), self.gpu.as_ref(), development)
             {
                 processor.raw_isp_enabled = true;
                 processor.raw_development = None;
-                processor.replace_input_u16(
+                // Re-upload through the owning texture path. `replace_input_u16`
+                // intentionally refuses an uninitialized/stale input texture;
+                // a button action must be able to establish the RAW input.
+                processor.upload_u16(
                     developed.width(),
                     developed.height(),
                     developed.as_raw(),
+                    &gpu.device,
                     &gpu.queue,
                 );
-                needs_process = true;
+                processor.process(&gpu.device, &gpu.queue);
+                applied = true;
+            }
+            if applied {
+                self.rebind_image_textures();
+                self.flags.output_dirty = true;
+                needs_process = false;
             }
         }
         if trash_req {
@@ -3348,6 +3340,24 @@ fn spawn_folder_workers<T: Send + 'static>(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--train-raw-render-model")
+    {
+        let folder = args.get(2).map(PathBuf::from).unwrap_or_default();
+        let output = args
+            .get(3)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("models/raw_render_model.json"));
+        match raw_develop::fit_raw_render_model(&folder, &output) {
+            Ok(count) => println!("trained RAW render model from {count} camera renders"),
+            Err(error) => {
+                eprintln!("RAW render model training failed: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if args.get(1).is_some_and(|arg| arg == "--fit-raw-scurve") {
         let folder = args.get(2).map(PathBuf::from).unwrap_or_default();
         let output = args

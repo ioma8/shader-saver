@@ -15,16 +15,11 @@ images.
 - **Fast RAW opens** — RAW files open from the embedded JPEG first via
   [`jpgfromrawlib`](https://github.com/ioma8/jpgfromrawlib), then the full
   demosaic swaps in shortly after if you stay on that image
-- **RAW development** — the "Develop RAW" button re-renders the DNG with a
-  small, deterministic pipeline: rawloader decode (crop, black/white level,
-  as-shot white balance, demosaic, camera→sRGB matrix) followed by a compact
-  phone tone/color model fitted from 46 Pixel DNG/JPEG pairs
-  (`models/raw_s_curve.json`, about 11 MB). It matches new images to nearby RAW
-  histogram shapes for scene-adaptive exposure, contrast, and white balance,
-  then applies fitted chroma, local-contrast, and detail rendering. Close
-  trained scenes also receive a coarse spatial HDR correction. No neural
-  network. Refit the curve with
-  `cargo run --release -- --fit-raw-scurve <folder>`; see
+- **RAW development** — RAWs auto-develop on open through one universal,
+  sensor-only path for every supported camera. rawler's 16-bit sensor decode
+  feeds a compact learned tone/color model with spatial residuals trained
+  offline from RAW/JPEG pairs; JPEGs and embedded previews are never read at
+  runtime, and there are no camera-manufacturer branches. See
   [RAW development](docs/raw-development.md) for the complete pipeline
 - **Adjustments** — white balance (temp/tint), exposure (stops),
   brightness (Capture One-style midtone bias), contrast (logistic S-curve),
