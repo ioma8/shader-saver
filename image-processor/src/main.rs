@@ -44,6 +44,8 @@ const KEY_RATE_FOLDER: &str = "rate_folder";
 const KEY_ADJUST_FOLDER: &str = "adjust_folder";
 const KEY_SIMILAR_CULL: &str = "similar_cull";
 const CULL_HELP_KEY: &str = "browse_cull_help_visible";
+const RAW_DEFAULT_SHARPEN: f32 = 0.65;
+const RAW_DEFAULT_SHARPEN_RADIUS: f32 = 2.0;
 
 // ---- Edit persistence (SQLite, one JSON row per image path) ----
 
@@ -1034,12 +1036,28 @@ impl App {
             return;
         };
 
-        let state = self
-            .db
-            .as_ref()
-            .and_then(|db| load_edits(db, path))
-            .unwrap_or_default();
+        let saved_state = self.db.as_ref().and_then(|db| load_edits(db, path));
+        let state = saved_state.clone().unwrap_or_default();
         processor.apply_edit_state(&state);
+
+        // RAWs arrive from a sensor decode rather than a camera preview, so
+        // give them a restrained capture-sharpening starting point. Persist an
+        // initialization marker so a user who moves the slider to zero keeps
+        // that explicit choice on the next open.
+        let mut raw_sharpening_initialized = false;
+        if imgload::is_raw(path) && !processor.raw_sharpening_initialized {
+            if processor.unsharp_strength == 0.0 {
+                processor.unsharp_strength = RAW_DEFAULT_SHARPEN;
+                processor.unsharp_blur_radius = RAW_DEFAULT_SHARPEN_RADIUS;
+            }
+            processor.raw_sharpening_initialized = true;
+            raw_sharpening_initialized = true;
+        }
+        if raw_sharpening_initialized {
+            if let Some(db) = &self.db {
+                save_edits(db, path, &processor.edit_state());
+            }
+        }
 
         let Some((img, preview_quality)) = imgload::load_edit_rgba(path) else {
             return;
@@ -1168,7 +1186,14 @@ impl App {
             }
         }
         while let Ok((path, result)) = self.adjust_rx.try_recv() {
-            if let Some(state) = result {
+            if let Some(mut state) = result {
+                if imgload::is_raw(&path) && !state.raw_sharpening_initialized {
+                    if state.unsharp_strength == 0.0 {
+                        state.unsharp_strength = RAW_DEFAULT_SHARPEN;
+                        state.unsharp_blur_radius = RAW_DEFAULT_SHARPEN_RADIUS;
+                    }
+                    state.raw_sharpening_initialized = true;
+                }
                 if let Some(db) = &self.db {
                     save_edits(db, &path, &state);
                 }
@@ -2963,6 +2988,14 @@ impl App {
             if let (Some(processor), Some(gpu), Some(developed)) =
                 (self.processor.as_mut(), self.gpu.as_ref(), development)
             {
+                if !processor.raw_sharpening_initialized {
+                    if processor.unsharp_strength == 0.0 {
+                        processor.unsharp_strength = RAW_DEFAULT_SHARPEN;
+                        processor.unsharp_blur_radius = RAW_DEFAULT_SHARPEN_RADIUS;
+                    }
+                    processor.raw_sharpening_initialized = true;
+                    needs_process = true;
+                }
                 processor.raw_isp_enabled = true;
                 processor.raw_development = None;
                 // Re-upload through the owning texture path. `replace_input_u16`

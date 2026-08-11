@@ -18,6 +18,12 @@ model offline; runtime never reads them. The implementation is in
 4. **Return RGBA16.** The result becomes the editor input; no preview pixels
    are read at runtime.
 
+RAWs also receive a restrained capture-sharpening default in the editor
+(`SHARPEN = 0.65`, `SHARP RAD = 2`). It is the same GPU unsharp-mask controlled
+by the visible sliders. The initialization is persisted, so setting SHARPEN to
+zero explicitly is preserved across reopening; re-developing the RAW does not
+stack another sharpening pass.
+
 ## Training
 
 Camera JPEGs supervise the model only offline. Recursively train from RAWs

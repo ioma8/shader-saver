@@ -69,6 +69,9 @@ pub struct EditState {
     pub blur_radius: f32,
     pub unsharp_strength: f32,
     pub unsharp_blur_radius: f32,
+    /// Whether the RAW-specific sharpening default has been initialized.
+    /// This lets an explicit slider value of zero survive reopening.
+    pub raw_sharpening_initialized: bool,
     pub blacks: f32,
     pub shadows: f32,
     pub highlights: f32,
@@ -108,6 +111,7 @@ impl Default for EditState {
             blur_radius: 0.0,
             unsharp_strength: 0.0,
             unsharp_blur_radius: 2.0,
+            raw_sharpening_initialized: false,
             blacks: 0.0,
             shadows: 0.0,
             highlights: 0.0,
@@ -175,6 +179,7 @@ pub struct Processor {
     pub blur_radius: f32,
     pub unsharp_strength: f32,
     pub unsharp_blur_radius: f32,
+    pub raw_sharpening_initialized: bool,
     pub blacks: f32,
     pub shadows: f32,
     pub highlights: f32,
@@ -464,6 +469,7 @@ impl Processor {
             blur_radius: 0.0,
             unsharp_strength: 0.0,
             unsharp_blur_radius: 2.0,
+            raw_sharpening_initialized: false,
             blacks: 0.0,
             shadows: 0.0,
             highlights: 0.0,
@@ -561,6 +567,7 @@ impl Processor {
             blur_radius: self.blur_radius,
             unsharp_strength: self.unsharp_strength,
             unsharp_blur_radius: self.unsharp_blur_radius,
+            raw_sharpening_initialized: self.raw_sharpening_initialized,
             blacks: self.blacks,
             shadows: self.shadows,
             highlights: self.highlights,
@@ -593,6 +600,7 @@ impl Processor {
         self.blur_radius = s.blur_radius;
         self.unsharp_strength = s.unsharp_strength;
         self.unsharp_blur_radius = s.unsharp_blur_radius;
+        self.raw_sharpening_initialized = s.raw_sharpening_initialized;
         self.blacks = s.blacks;
         self.shadows = s.shadows;
         self.highlights = s.highlights;
