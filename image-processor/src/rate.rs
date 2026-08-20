@@ -82,13 +82,13 @@ fn stars_from_mean(mean: f32) -> u8 {
         .clamp(1.0, 5.0) as u8
 }
 
-fn stars_from_distribution(dist: &[f32]) -> u8 {
-    stars_from_mean(mean_from_distribution(dist))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stars_from_distribution(dist: &[f32]) -> u8 {
+        stars_from_mean(mean_from_distribution(dist))
+    }
 
     #[test]
     fn stars_from_distribution_uses_coco_calibration() {

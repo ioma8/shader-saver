@@ -30,11 +30,7 @@ fn combined_photo_lut(weights: [f32; 3]) -> Vec<f32> {
 
     let mut result = Vec::with_capacity(3 * GRID);
     for i in 0..GRID {
-        let input = [
-            (i % 33) as f32 / 32.0,
-            ((i / 33) % 33) as f32 / 32.0,
-            (i / (33 * 33)) as f32 / 32.0,
-        ];
+        let input = voxel_rgb(i, 33);
         let output = [sample(i, 0), sample(i, 1), sample(i, 2)];
         let input_lum = input.iter().zip(LUM).map(|(v, w)| v * w).sum::<f32>();
         let output_lum = output.iter().zip(LUM).map(|(v, w)| v * w).sum::<f32>();
@@ -167,37 +163,23 @@ pub struct Processor {
     pub histogram: [u32; 256],
 
     pub image_size: Option<(u32, u32)>,
-    pub exposure: f32,     // stops
-    pub contrast: f32,     // -100..100, 0 = neutral
-    pub saturation: f32,   // -100..100, 0 = neutral
-    pub vibrance: f32,     // -100..100, 0 = neutral
-    pub wb_temp: f32,      // -100..100, blue ↔ yellow
-    pub wb_tint: f32,      // -100..100, green ↔ magenta
-    pub levels_black: f32, // 0–255
-    pub levels_white: f32, // 0–255
-    pub levels_gamma: f32, // 0.1–10.0
-    pub blur_radius: f32,
-    pub unsharp_strength: f32,
-    pub unsharp_blur_radius: f32,
-    pub raw_sharpening_initialized: bool,
-    pub blacks: f32,
-    pub shadows: f32,
-    pub highlights: f32,
-    pub whites: f32,
-    pub brightness: f32,
-    pub vignette: f32,     // -100..100, negative darkens corners
-    pub vignette_mid: f32, // 0..100, where the falloff starts
-    // Tone curve control points, normalized [0,1]², sorted by x.
-    // Always at least the two endpoints; identity = [[0,0],[1,1]].
-    pub curve_points: Vec<[f32; 2]>,
-    pub ai_lut_enabled: bool,
-    pub ai_lut_weights: [f32; 3],
-    pub ai_lut_strength: f32,
-    pub raw_isp_enabled: bool,
-    pub raw_development: Option<Vec<f32>>,
-    pub look: Vec<LookTransfer>,
-    pub look_lut: Option<Vec<f32>>,
-    pub look_strength: f32,
+    /// All user-editable image parameters — the single source of truth.
+    /// The GPU-adjacent fields above plus this state are the whole Processor.
+    pub state: EditState,
+}
+
+impl std::ops::Deref for Processor {
+    type Target = EditState;
+
+    fn deref(&self) -> &EditState {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for Processor {
+    fn deref_mut(&mut self) -> &mut EditState {
+        &mut self.state
+    }
 }
 
 fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -317,6 +299,24 @@ fn percentile(histogram: &[u32; 256], total: f64, p: f64) -> f32 {
         }
     }
     255.0
+}
+
+// Map a buffer for CPU readback and return its bytes. Synchronous (blocks on
+// `device.poll`); all three call sites run on the UI thread where a blocking
+// readback is acceptable.
+fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Option<Vec<u8>> {
+    let slice = buffer.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |r| {
+        let _ = tx.send(r);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    if rx.recv().unwrap().is_err() {
+        return None;
+    }
+    let bytes = slice.get_mapped_range().to_vec();
+    buffer.unmap();
+    Some(bytes)
 }
 
 /// Resize 16-bit gamma-encoded RGBA through a float intermediate (used when a
@@ -457,35 +457,7 @@ impl Processor {
             histogram_staging,
             histogram: [0u32; 256],
             image_size: None,
-            exposure: 0.0,
-            contrast: 0.0,
-            saturation: 0.0,
-            vibrance: 0.0,
-            wb_temp: 0.0,
-            wb_tint: 0.0,
-            levels_black: 0.0,
-            levels_white: 255.0,
-            levels_gamma: 1.0,
-            blur_radius: 0.0,
-            unsharp_strength: 0.0,
-            unsharp_blur_radius: 2.0,
-            raw_sharpening_initialized: false,
-            blacks: 0.0,
-            shadows: 0.0,
-            highlights: 0.0,
-            whites: 0.0,
-            brightness: 0.0,
-            vignette: 0.0,
-            vignette_mid: 50.0,
-            curve_points: vec![[0.0, 0.0], [1.0, 1.0]],
-            ai_lut_enabled: false,
-            ai_lut_weights: [0.0; 3],
-            ai_lut_strength: 1.0,
-            raw_isp_enabled: false,
-            raw_development: None,
-            look: Vec::new(),
-            look_lut: None,
-            look_strength: 1.0,
+            state: EditState::default(),
         }
     }
 
@@ -553,73 +525,14 @@ impl Processor {
     }
 
     pub fn edit_state(&self) -> EditState {
-        EditState {
-            exposure: self.exposure,
-            brightness: self.brightness,
-            contrast: self.contrast,
-            saturation: self.saturation,
-            vibrance: self.vibrance,
-            wb_temp: self.wb_temp,
-            wb_tint: self.wb_tint,
-            levels_black: self.levels_black,
-            levels_white: self.levels_white,
-            levels_gamma: self.levels_gamma,
-            blur_radius: self.blur_radius,
-            unsharp_strength: self.unsharp_strength,
-            unsharp_blur_radius: self.unsharp_blur_radius,
-            raw_sharpening_initialized: self.raw_sharpening_initialized,
-            blacks: self.blacks,
-            shadows: self.shadows,
-            highlights: self.highlights,
-            whites: self.whites,
-            vignette: self.vignette,
-            vignette_mid: self.vignette_mid,
-            curve_points: self.curve_points.clone(),
-            ai_lut_enabled: self.ai_lut_enabled,
-            ai_lut_weights: self.ai_lut_weights,
-            ai_lut_strength: self.ai_lut_strength,
-            raw_isp_enabled: self.raw_isp_enabled,
-            raw_development: self.raw_development.clone(),
-            look: self.look.clone(),
-            look_lut: self.look_lut.clone(),
-            look_strength: self.look_strength,
-        }
+        self.state.clone()
     }
 
     pub fn apply_edit_state(&mut self, s: &EditState) {
-        self.exposure = s.exposure;
-        self.brightness = s.brightness;
-        self.contrast = s.contrast;
-        self.saturation = s.saturation;
-        self.vibrance = s.vibrance;
-        self.wb_temp = s.wb_temp;
-        self.wb_tint = s.wb_tint;
-        self.levels_black = s.levels_black;
-        self.levels_white = s.levels_white;
-        self.levels_gamma = s.levels_gamma;
-        self.blur_radius = s.blur_radius;
-        self.unsharp_strength = s.unsharp_strength;
-        self.unsharp_blur_radius = s.unsharp_blur_radius;
-        self.raw_sharpening_initialized = s.raw_sharpening_initialized;
-        self.blacks = s.blacks;
-        self.shadows = s.shadows;
-        self.highlights = s.highlights;
-        self.whites = s.whites;
-        self.vignette = s.vignette;
-        self.vignette_mid = s.vignette_mid;
-        self.curve_points = if s.curve_points.len() >= 2 {
-            s.curve_points.clone()
-        } else {
-            vec![[0.0, 0.0], [1.0, 1.0]]
-        };
-        self.ai_lut_enabled = s.ai_lut_enabled;
-        self.ai_lut_weights = s.ai_lut_weights;
-        self.ai_lut_strength = s.ai_lut_strength;
-        self.raw_isp_enabled = s.raw_isp_enabled;
-        self.raw_development = s.raw_development.clone();
-        self.look = s.look.clone();
-        self.look_lut = s.look_lut.clone();
-        self.look_strength = s.look_strength;
+        self.state = s.clone();
+        if self.state.curve_points.len() < 2 {
+            self.state.curve_points = vec![[0.0, 0.0], [1.0, 1.0]];
+        }
     }
 
     // Derive auto adjustments from the luminance histogram. Call with the
@@ -629,7 +542,8 @@ impl Processor {
         if total_f == 0.0 {
             return;
         }
-        let pct = |p: f64| percentile(&self.histogram, total_f, p);
+        let histogram = self.histogram;
+        let pct = |p: f64| percentile(&histogram, total_f, p);
 
         // Levels: trim the empty tails, clipping 0.1% of pixels per side
         let mut black = pct(0.001);
@@ -931,7 +845,7 @@ impl Processor {
                 self.exposure,
                 self.wb_temp,
                 self.wb_tint,
-                if photo_lut_enabled(&self.edit_state()) {
+                if photo_lut_enabled(&self.state) {
                     1.0
                 } else {
                     0.0
@@ -976,7 +890,7 @@ impl Processor {
         );
         let mut data = Vec::with_capacity(256 + 33 * 33 * 33 * 3);
         data.extend(self.curve_lut());
-        data.extend(baked_lut(&self.edit_state()).unwrap_or_else(identity_photo_lut));
+        data.extend(baked_lut(&self.state).unwrap_or_else(identity_photo_lut));
         queue.write_buffer(&self.curve_buf, 0, bytemuck::cast_slice(&data));
     }
 
@@ -1013,18 +927,9 @@ impl Processor {
         enc.copy_buffer_to_buffer(&self.histogram_buf, 0, &self.histogram_staging, 0, 1024);
         queue.submit([enc.finish()]);
 
-        let slice = self.histogram_staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        device.poll(wgpu::Maintain::Wait);
-        if rx.recv().unwrap().is_ok() {
-            let data = slice.get_mapped_range();
+        if let Some(data) = map_read(device, &self.histogram_staging) {
             self.histogram.copy_from_slice(bytemuck::cast_slice(&data));
-            drop(data);
         }
-        self.histogram_staging.unmap();
     }
 
     // mask anchors off clean signal, independent of the box-blur slider.
@@ -1158,26 +1063,12 @@ impl Processor {
         );
         queue.submit([encoder.finish()]);
 
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        device.poll(wgpu::Maintain::Wait);
-        if rx.recv().unwrap().is_err() {
-            return None;
+        let data = map_read(device, &staging)?;
+        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+        for row in 0..height {
+            let start = (row * bytes_per_row) as usize;
+            pixels.extend_from_slice(&data[start..start + (width * 4) as usize]);
         }
-
-        let pixels = {
-            let data = slice.get_mapped_range();
-            let mut out = Vec::with_capacity((width * height * 4) as usize);
-            for row in 0..height {
-                let start = (row * bytes_per_row) as usize;
-                out.extend_from_slice(&data[start..start + (width * 4) as usize]);
-            }
-            out
-        };
-        staging.unmap();
         Some(pixels)
     }
 
@@ -1217,19 +1108,12 @@ impl Processor {
         );
         queue.submit([encoder.finish()]);
 
-        let slice = staging.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        device.poll(wgpu::Maintain::Wait);
-        if rx.recv().unwrap().is_err() {
+        let Some(data) = map_read(device, &staging) else {
             return;
-        }
+        };
 
         // Half-float RGBA -> gamma-encoded u16 RGBA (values are 0..1).
         let pixels: Vec<u16> = {
-            let data = slice.get_mapped_range();
             let mut out = Vec::with_capacity((width * height * 4) as usize);
             for row in 0..height {
                 let start = (row * bytes_per_row) as usize;
@@ -1242,7 +1126,6 @@ impl Processor {
             }
             out
         };
-        staging.unmap();
 
         // File I/O on a background thread so the main thread is unblocked
         let path = path.to_owned();

@@ -76,9 +76,9 @@ pub(crate) fn orient_preview(image: image::DynamicImage, orientation: u32) -> im
     }
 }
 
-pub fn load_edit_rgba(path: &Path) -> Option<(image::RgbaImage, bool)> {
+pub fn load_edit_rgba(path: &Path) -> Option<image::RgbaImage> {
     let max_dim = if is_raw(path) { 2048 } else { 0 };
-    load_rgba(path, max_dim).map(|image| (image, false))
+    load_rgba(path, max_dim)
 }
 
 // RAW uses the same universal sensor decoder and trained display rendering as
@@ -90,7 +90,10 @@ pub fn load_rgba(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
         return crate::raw_develop::develop_raw(path, max_dim);
     }
 
+    // Apply EXIF orientation like `load_preview_rgba` does, so the grid, the
+    // editor and the AI batch paths all agree on the same upright image.
     let image = image::open(path).ok()?;
+    let image = orient_preview(image, exif_orientation(path));
     let image = if max_dim > 0 {
         image.thumbnail(max_dim, max_dim)
     } else {
