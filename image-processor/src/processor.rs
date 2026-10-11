@@ -52,6 +52,9 @@ fn combined_photo_lut(weights: [f32; 3]) -> Vec<f32> {
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 #[serde(default)]
 pub struct EditState {
+    pub camera_preset: Option<crate::camera_presets::CameraPreset>,
+    pub camera_style: u8,
+    pub camera_strength: f32,
     pub exposure: f32,
     pub brightness: f32,
     pub contrast: f32,
@@ -94,6 +97,9 @@ pub struct EditState {
 impl Default for EditState {
     fn default() -> Self {
         Self {
+            camera_preset: None,
+            camera_style: 0,
+            camera_strength: 1.0,
             exposure: 0.0,
             brightness: 0.0,
             contrast: 0.0,
@@ -1738,6 +1744,17 @@ pub fn baked_lut(state: &EditState) -> Option<Vec<f32>> {
         }
         lut = Some(ai);
     }
+    if let Some(preset) = state.camera_preset {
+        let mut camera = crate::camera_presets::lut(preset, state.camera_style);
+        let strength = state.camera_strength.clamp(0.0, 2.0);
+        if (strength - 1.0).abs() >= 1e-3 {
+            camera = blend_lut(&identity_photo_lut(), &camera, strength);
+        }
+        lut = Some(match lut {
+            Some(base) => compose_luts(&base, &camera, 33),
+            None => camera,
+        });
+    }
     if !state.look.is_empty() {
         let mut look_lut = bake_look_chain(&state.look);
         let strength = state.look_strength.clamp(0.0, 1.0);
@@ -1765,7 +1782,8 @@ pub fn baked_lut(state: &EditState) -> Option<Vec<f32>> {
 }
 
 fn photo_lut_enabled(state: &EditState) -> bool {
-    state.ai_lut_enabled
+    state.camera_preset.is_some()
+        || state.ai_lut_enabled
         || state.raw_development.is_some()
         || !state.look.is_empty()
         || state.look_lut.is_some()
@@ -1795,6 +1813,21 @@ mod tests {
         assert!(!super::photo_lut_enabled(&state));
         state.raw_development = Some(identity_photo_lut());
         assert!(super::photo_lut_enabled(&state));
+    }
+
+    #[test]
+    fn camera_preset_enables_the_gpu_photo_lut_pass() {
+        let mut state = EditState::default();
+        state.camera_preset = Some(crate::camera_presets::CameraPreset::Fxs);
+        assert!(super::photo_lut_enabled(&state));
+    }
+
+    #[test]
+    fn camera_preset_bakes_a_non_identity_lut() {
+        let mut state = EditState::default();
+        state.camera_preset = Some(crate::camera_presets::CameraPreset::Fxs);
+        let lut = super::baked_lut(&state).unwrap();
+        assert_ne!(lut, identity_photo_lut());
     }
 
     // Regression test: a histogram with mass concentrated in the top bucket

@@ -1,4 +1,5 @@
 mod canoncgt;
+mod camera_presets;
 mod classify;
 mod cull;
 mod enhance;
@@ -449,6 +450,7 @@ struct App {
     presets_dir: Option<PathBuf>,
     presets: Vec<String>,
     preset_name: String,
+    camera_category: camera_presets::CameraCategory,
     classifier: Option<Arc<classify::Classifier>>,
     enhancer: Option<Arc<enhance::Enhancer>>,
     tags: HashMap<PathBuf, Vec<String>>,
@@ -550,6 +552,7 @@ impl App {
             presets_dir,
             presets,
             preset_name: String::new(),
+            camera_category: camera_presets::CameraCategory::Popular,
             classifier: classify::Classifier::load().map(Arc::new),
             enhancer: enhance::Enhancer::load().map(Arc::new),
             tags,

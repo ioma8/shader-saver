@@ -1,0 +1,289 @@
+{
+  "grid": 17,
+  "table_size": 14739,
+  "source_size": [
+    1050,
+    1065
+  ],
+  "source_sha256": "3b417686ba648726ab6cbb68c0e865685ffd343070821fce1c6bee0ffc56dbdd",
+  "entries": [
+    {
+      "camera": "S2016",
+      "style": "2008",
+      "mode": 0,
+      "capture": "S2016-default.jpg",
+      "mae_rgb": 44.679,
+      "sha256": "cc46561c3960b829f926fb308a7e9c37b11c88ef7e515e9e2a000ddfd4c4880d"
+    },
+    {
+      "camera": "FXS",
+      "style": "FXS 1",
+      "mode": 3,
+      "capture": "FXS-FXS-1.jpg",
+      "mae_rgb": 38.409,
+      "sha256": "35064b0f5f15a250a0759868f5dc7ac29d69c99ed04ca8a0c7b71d234149e4e5"
+    },
+    {
+      "camera": "FXS",
+      "style": "FXS 2",
+      "mode": 0,
+      "capture": "FXS-FXS-2.jpg",
+      "mae_rgb": 24.166,
+      "sha256": "24756ec8422ccb7133d89a0197ea50b4ed4dfe427c3c18d08b47884ecfbc40b6"
+    },
+    {
+      "camera": "FXS",
+      "style": "FXS 3",
+      "mode": 1,
+      "capture": "FXS-FXS-3.jpg",
+      "mae_rgb": 26.233,
+      "sha256": "6f6c5da076887444322e07b0b31ba3aa9033fe7e6399a40c67d64f34974db261"
+    },
+    {
+      "camera": "FXS",
+      "style": "FXS 4",
+      "mode": 2,
+      "capture": "FXS-FXS-4.jpg",
+      "mae_rgb": 34.804,
+      "sha256": "c00a736b3f7a4f00b3c328f80208be1a15adaea7855c47ceb0a98ce21cbd3971"
+    },
+    {
+      "camera": "LOG",
+      "style": "LUT 01",
+      "mode": 0,
+      "capture": "LOG-LUT-01.jpg",
+      "mae_rgb": 19.933,
+      "sha256": "615fdc71d3d6485d12b5d8ada891bf7816787651062a0f874f02338d1907d98d"
+    },
+    {
+      "camera": "LOG",
+      "style": "LUT 02",
+      "mode": 1,
+      "capture": "LOG-LUT-02.jpg",
+      "mae_rgb": 31.058,
+      "sha256": "b70f530cd587ce81816ac3cc257cf7979dbc143fe84ac89ab261132349084f93"
+    },
+    {
+      "camera": "LOG",
+      "style": "LUT 04",
+      "mode": 2,
+      "capture": "LOG-LUT-04.jpg",
+      "mae_rgb": 22.525,
+      "sha256": "579f128c494df88d9e7562fbd44c85ba686dd699257bf33e77632e2cab185224"
+    },
+    {
+      "camera": "LOG",
+      "style": "LUT 05",
+      "mode": 3,
+      "capture": "LOG-LUT-05.jpg",
+      "mae_rgb": 19.184,
+      "sha256": "4e3335ac532f840152e6d58d52c86bfa8c247a6d1d7a648473aaf2aa50d7013c"
+    },
+    {
+      "camera": "LOG",
+      "style": "Original",
+      "mode": 4,
+      "capture": "LOG-Original.jpg",
+      "mae_rgb": 0.007,
+      "sha256": "fcdb1869cfe0e3dd6d35b2285c4b1ec11c8fc0fd9c7176e95de1159bb472bac4"
+    },
+    {
+      "camera": "LOG",
+      "style": "LUT 09",
+      "mode": 5,
+      "capture": "LOG-LUT-09.jpg",
+      "mae_rgb": 16.589,
+      "sha256": "01937fbc290c0f568eb48d45c51c80776385d2f6925056f1552d4d2fdb7b8cd0"
+    },
+    {
+      "camera": "LOG",
+      "style": "LUT 10",
+      "mode": 6,
+      "capture": "LOG-LUT-10.jpg",
+      "mae_rgb": 9.346,
+      "sha256": "2078b6187beb707e282cb61edf22ec71c0f1fe61fac7cde60c2c61753caf13bc"
+    },
+    {
+      "camera": "N4008",
+      "style": "4008N 1",
+      "mode": 0,
+      "capture": "N4008-4008N-1.jpg",
+      "mae_rgb": 26.826,
+      "sha256": "03dbcf81bc2e7930d3634e939098b8be32e452853d131490689f5e18bcb10c63"
+    },
+    {
+      "camera": "N4008",
+      "style": "4008N 2",
+      "mode": 1,
+      "capture": "N4008-4008N-2.jpg",
+      "mae_rgb": 27.518,
+      "sha256": "50d7dc1f3826193b7656c801d37afc38bc359ed01d596b13bbfb4c54c6eae7b8"
+    },
+    {
+      "camera": "N4008",
+      "style": "4008N 3",
+      "mode": 2,
+      "capture": "N4008-4008N-3.jpg",
+      "mae_rgb": 40.005,
+      "sha256": "5bc9cd28774aca33469691ff7a0596c494a748c653ad3e994231f27a6653aa98"
+    },
+    {
+      "camera": "OPS",
+      "style": "OPS 1",
+      "mode": 1,
+      "capture": "OPS-OPS-1.jpg",
+      "mae_rgb": 26.417,
+      "sha256": "7c09def37f8eec36e40af13dad6a0628102d31a6f735521676ad3765eea178fd"
+    },
+    {
+      "camera": "OPS",
+      "style": "OPS 2",
+      "mode": 0,
+      "capture": "OPS-OPS-2.jpg",
+      "mae_rgb": 35.363,
+      "sha256": "29eb419a04f23f28470f52eb9e24b175a53ddf84cbbd8cf6aec8bbb50e23b851"
+    },
+    {
+      "camera": "G7X2",
+      "style": "default",
+      "mode": 0,
+      "capture": "G7X2-default.jpg",
+      "mae_rgb": 18.751,
+      "sha256": "e2805802a057c66676320584a5098c92d041236cd3a11cb2313c2dd05e4e9290"
+    },
+    {
+      "camera": "GRX",
+      "style": "GRX 1",
+      "mode": 0,
+      "capture": "GRX-GRX-1.jpg",
+      "mae_rgb": 20.87,
+      "sha256": "e7ac1f902d79822f80e4e14576406194d6ca876bffec3cae9099a7d2aa0892fa"
+    },
+    {
+      "camera": "GRX",
+      "style": "GRX 2",
+      "mode": 1,
+      "capture": "GRX-default-retry.jpg",
+      "mae_rgb": 25.627,
+      "sha256": "264a1cea9ede384f71df45cb70a3efeae0afafc24d4a68892ce18b77ed37bc1a"
+    },
+    {
+      "camera": "CCD",
+      "style": "default, date stamp disabled",
+      "mode": 0,
+      "capture": "CCD-no-date.jpg",
+      "mae_rgb": 30.189,
+      "sha256": "c6559efd35d4dc3299eaf1388596548c27bd409de1317e28228eeee126d4ea26"
+    }
+  ],
+  "catalog_version": 1,
+  "calibration": {
+    "source_chart": "oldroll_camera_calibration_chart.jpg",
+    "source_dimensions": "1050x1065",
+    "grid": "17x17x17 patches, each 15x15 pixels",
+    "sampling": "median RGB of the center 5x5 returned pixels per patch",
+    "backend": "OldRoll preview processing, camera selected; filter none; no local adjustments/effects/frame/stickers",
+    "output": "JPEG response from /api/jobs/{id}/image",
+    "table": "oldroll_popular_camera_luts_17.rgb8",
+    "table_sha256": "5480951949f439270a37e49b1a092b01f572f8d2eb0143910c322efc2e864544",
+    "important": "CCD output was captured with dateEnabled=false. The cameraSeed is randomized per camera instance and not encoded in the color LUT."
+  },
+  "dense_overrides": {
+    "source_chart": "oldroll_camera_calibration_chart_33.png",
+    "source_sha256": "e96198a90cd50d742887a38d786f7408342e0107b964b522b3a518fccea8a533",
+    "source_dimensions": [
+      1080,
+      1080
+    ],
+    "grid": 33,
+    "layout": "35937 samples in row-major patch order across 190 columns (190 rows; last row partially filled); each RGB node uses the 33-level cube with red changing fastest.",
+    "sampling": "Median RGB of the center 3x3 pixels in each patch from the OldRoll JPEG preview.",
+    "backend": "OldRoll editor preview jobs, variant A, filter none, intensity 0.6, useUnifiedProgress false, seed 0, filterSeed 0, camera options defaults.",
+    "capture_date": "2026-10-11",
+    "output_dimensions": [
+      1080,
+      1080
+    ],
+    "table": "oldroll_popular_camera_luts_33.rgb8",
+    "table_sha256": "25299a5112c0d2bac8951a99ac9fff00575946718aeddfab7660df2454e92494",
+    "table_order": [
+      "FXS mode 3",
+      "N4008 mode 1",
+      "OPS mode 0",
+      "G7X2 mode 0",
+      "GRX mode 1"
+    ],
+    "entries": [
+      {
+        "camera": "FXS",
+        "style": "FXS 1",
+        "mode": 3,
+        "table_index": 0,
+        "capture": "oldroll_dense_camera_captures/FXS-mode-3.jpg",
+        "capture_dimensions": [
+          1080,
+          1080
+        ],
+        "camera_seed": 3096055942,
+        "sha256": "972c3d0eb2543dfbd228875f119a4942c5d0e6857d0525b368bb96cc8b2dabf8",
+        "job_id": "02b66602-ccad-49f2-adb0-e3553f60d2df"
+      },
+      {
+        "camera": "N4008",
+        "style": "4008N 2",
+        "mode": 1,
+        "table_index": 1,
+        "capture": "oldroll_dense_camera_captures/N4008-mode-1.jpg",
+        "capture_dimensions": [
+          1080,
+          1080
+        ],
+        "camera_seed": 917263653,
+        "sha256": "e0c1eb9ea31401fa60be52edfc655aa3b7f5d109339c2b09d5be9334b797bb21",
+        "job_id": "fb6cb532-0447-42bb-8d04-d0e8532132a7"
+      },
+      {
+        "camera": "OPS",
+        "style": "OPS 2",
+        "mode": 0,
+        "table_index": 2,
+        "capture": "oldroll_dense_camera_captures/OPS-mode-0.jpg",
+        "capture_dimensions": [
+          1080,
+          1080
+        ],
+        "camera_seed": 154380043,
+        "sha256": "afbacce5b622d0f2313533e7b95344c131142e0ea79e330c2672626f6d1fc332",
+        "job_id": "b10ddbf8-a0c1-4944-8605-c545643ef61b"
+      },
+      {
+        "camera": "G7X2",
+        "style": "default",
+        "mode": 0,
+        "table_index": 3,
+        "capture": "oldroll_dense_camera_captures/G7X2-mode-0.jpg",
+        "capture_dimensions": [
+          1080,
+          1080
+        ],
+        "camera_seed": 4109388594,
+        "sha256": "14141b9e01473be2c8729fd180617d7b3cba43d164dba924d987a6afc641ad2c",
+        "job_id": "50427010-5aae-48e7-81de-1caf41e20ca4"
+      },
+      {
+        "camera": "GRX",
+        "style": "GRX 2",
+        "mode": 1,
+        "table_index": 4,
+        "capture": "oldroll_dense_camera_captures/GRX-mode-1.jpg",
+        "capture_dimensions": [
+          1080,
+          1080
+        ],
+        "camera_seed": 25448468,
+        "sha256": "25ec08b8813b41e5116bf8c6f47bc7dc75dbd4d01a8d4f17c88f7d8fdc542e91",
+        "job_id": "0a293f01-ce7a-4fee-a545-7cfefab5bc72"
+      }
+    ]
+  }
+}

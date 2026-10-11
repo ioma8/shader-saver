@@ -701,6 +701,73 @@ pub(crate) fn edit(
                             .id_salt("editor-controls-scroll")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
+                        egui::CollapsingHeader::new("Camera")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                egui::ScrollArea::horizontal().show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        for category in camera_presets::CATEGORIES {
+                                            ui.selectable_value(
+                                                &mut app.camera_category,
+                                                category,
+                                                category.label(),
+                                            );
+                                        }
+                                    });
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    let selected = processor.camera_preset.is_none();
+                                    if ui.selectable_label(selected, "None").clicked() {
+                                        processor.camera_preset = None;
+                                        processor.camera_style = 0;
+                                        *needs_process = true;
+                                    }
+                                    for preset in app.camera_category.presets() {
+                                        let selected = processor.camera_preset == Some(preset);
+                                        if ui.selectable_label(selected, preset.name()).clicked() {
+                                            processor.camera_preset = Some(preset);
+                                            processor.camera_style = preset.default_style();
+                                            *needs_process = true;
+                                        }
+                                    }
+                                });
+                                if let Some(preset) = processor.camera_preset {
+                                    let styles = preset.styles();
+                                    if !styles.is_empty() {
+                                        let selected = styles
+                                            .get(processor.camera_style as usize)
+                                            .copied()
+                                            .unwrap_or(styles[0]);
+                                        egui::ComboBox::from_id_salt("camera-style")
+                                            .selected_text(selected)
+                                            .show_ui(ui, |ui| {
+                                                for (index, style) in styles.iter().enumerate() {
+                                                    if ui.selectable_label(selected == *style, *style).clicked() {
+                                                        processor.camera_style = index as u8;
+                                                        *needs_process = true;
+                                                    }
+                                                }
+                                            });
+                                        if ui.small_button("Reset style").clicked() {
+                                            processor.camera_style = preset.default_style();
+                                            *needs_process = true;
+                                        }
+                                    }
+                                    let mut strength_percent = processor.camera_strength * 100.0;
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut strength_percent, 0.0..=200.0)
+                                                .text("Strength")
+                                                .suffix("%"),
+                                        )
+                                        .changed()
+                                    {
+                                        processor.camera_strength = strength_percent / 100.0;
+                                        *needs_process = true;
+                                    }
+                                }
+                            });
+                        ui.separator();
                         const MIN_DX: f32 = 0.01;
                         const GAMMA_LOG_RANGE: f32 = 1.609_438; // ln(5): gamma handle maps 0.2..5
                         // Luminance histogram + curves editor
