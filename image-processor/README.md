@@ -11,15 +11,20 @@ images.
 - **Browse / Edit tabs** — folder thumbnail browser (background-threaded
   loading) and a full editor; click a thumbnail to edit it
 - **Formats** — PNG, JPEG, TIFF, BMP, WebP, GIF, and camera RAW
-  (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF, …) via rawloader/imagepipe
-- **Fast RAW opens** — RAW files open from the embedded JPEG first via
-  [`jpgfromrawlib`](https://github.com/ioma8/jpgfromrawlib), then the full
-  demosaic swaps in shortly after if you stay on that image
-- **RAW development** — RAWs auto-develop on open through one universal,
-  sensor-only path for every supported camera. rawler's 16-bit sensor decode
-  feeds a compact learned tone/color model with spatial residuals trained
-  offline from RAW/JPEG pairs; JPEGs and embedded previews are never read at
-  runtime, and there are no camera-manufacturer branches. See
+  (DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF, …) via rawler
+- **Fast browsing** — grid thumbnails for RAW files come from the embedded
+  JPEG preview via [`jpgfromrawlib`](https://github.com/ioma8/jpgfromrawlib),
+  so browsing stays fast. Opening a RAW for editing always develops the sensor
+  data; the preview is never used as the editor image
+- **RAW development** — RAWs auto-develop on open through one universal path
+  for every supported camera: rawler's 16-bit sensor decode, auto-levels,
+  a hue-preserving S-curve over a local-tone base, and a small learned metering
+  rule (one exposure gain and contrast offset from the frame's own statistics;
+  coefficients baked in, no model file at runtime). No camera-manufacturer
+  branch and no per-camera look. Camera JPEGs and embedded previews never feed
+  the developed image. Checked against 18 manufacturers
+  (Canon, Fuji, Nikon, Sony, Olympus, Panasonic, Pentax, Samsung, Leica,
+  Hasselblad, Phase One, …) in `datasets/raw-samples`. See
   [RAW development](docs/raw-development.md) for the complete pipeline
 - **Adjustments** — white balance (temp/tint), exposure (stops),
   brightness (Capture One-style midtone bias), contrast (logistic S-curve),

@@ -1,6 +1,7 @@
-//! Universal RAW development: rawler sensor decode plus the embedded
-//! learned rendering model. Offline fitting of those models lives in
-//! `raw_fit` (CLI-only: `--fit-raw-scurve` / `--fit-raw-render-model`).
+//! Universal RAW development: rawler sensor decode, one exposure gain, and one
+//! hue-preserving tone curve. No trained look is applied at runtime. The
+//! embedded render model is kept only for the offline fitting tools in
+//! `raw_fit` (CLI-only: `--fit-raw-scurve` / `--train-raw-render-model`).
 
 use image::RgbaImage;
 use std::path::Path;
@@ -39,6 +40,7 @@ pub(crate) struct RawRenderModel {
 }
 
 impl RawRenderModel {
+    #[cfg(test)]
     pub(crate) fn embedded() -> Option<&'static Self> {
         static MODEL: std::sync::OnceLock<Option<RawRenderModel>> = std::sync::OnceLock::new();
         MODEL
@@ -117,26 +119,6 @@ impl RawRenderModel {
         }
         output
     }
-
-    fn nearest_prototype(&self, input: &[f32; RENDER_FEATURES]) -> Option<(usize, f32)> {
-        self.prototypes
-            .iter()
-            .enumerate()
-            .filter(|(index, prototype)| {
-                prototype.len() == RENDER_FEATURES
-                    && self.prototype_targets.get(*index).is_some_and(|target| target.len() == RENDER_FEATURES)
-            })
-            .map(|(index, prototype)| {
-                let distance = prototype
-                    .iter()
-                    .zip(input)
-                    .map(|(a, b)| (a - b).powi(2))
-                    .sum::<f32>()
-                    .sqrt();
-                (index, distance)
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-    }
 }
 
 pub(crate) fn render_quantiles_u16(image: &Rgba16Image) -> [f32; RENDER_FEATURES] {
@@ -200,47 +182,256 @@ pub fn develop_raw_u16(path: &Path, max_dim: u32) -> Option<Rgba16Image> {
     develop_generic_u16(path, max_dim)
 }
 
+/// Universal develop: one exposure gain and one hue-preserving tone curve for
+/// all channels. No trained look is involved, so unseen cameras get the same
+/// well-behaved render and there is no per-channel color cast.
+/// Chroma-only denoise, applied after the metering. Lifting shadows multiplies
+/// sensor chroma noise; cameras smooth it, so we do too. Luma is untouched, and
+/// the strength grows as the pixel gets darker (where the lift, and the noise,
+/// is largest).
+const CHROMA_DENOISE: f32 = 0.85;
+
+fn chroma_denoise_u16(image: &mut Rgba16Image) {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    if width < 4 || height < 4 {
+        return;
+    }
+    let pixels: Vec<[f32; 3]> = image
+        .pixels()
+        .map(|p| std::array::from_fn(|k| f32::from(p[k]) / 65535.0))
+        .collect();
+    let luma: Vec<f32> = pixels.iter().map(|&c| luma_of(c)).collect();
+    let u: Vec<f32> = pixels.iter().zip(&luma).map(|(c, &y)| c[2] - y).collect();
+    let v: Vec<f32> = pixels.iter().zip(&luma).map(|(c, &y)| c[0] - y).collect();
+    let radius = (width.max(height) / 256).max(1);
+    let (ub, vb) = (box_blur(&u, width, height, radius), box_blur(&v, width, height, radius));
+    for (index, pixel) in image.pixels_mut().enumerate() {
+        let y = luma[index];
+        let weight = (CHROMA_DENOISE * (1.0 - y).max(0.0).powi(2)).clamp(0.0, 1.0);
+        let u = u[index] + (ub[index] - u[index]) * weight;
+        let v = v[index] + (vb[index] - v[index]) * weight;
+        let (r, b) = (y + v, y + u);
+        let g = (y - 0.2126 * r - 0.0722 * b) / 0.7152;
+        pixel[0] = (r.clamp(0.0, 1.0) * 65535.0) as u16;
+        pixel[1] = (g.clamp(0.0, 1.0) * 65535.0) as u16;
+        pixel[2] = (b.clamp(0.0, 1.0) * 65535.0) as u16;
+    }
+}
+
 fn develop_generic_u16(path: &Path, max_dim: u32) -> Option<Rgba16Image> {
     let mut image = decode_raw_u16(path, max_dim)?;
-    if let Some(model) = RawRenderModel::embedded() {
-        let source = render_quantiles_u16(&image);
-        let target = model.predict(&source);
-        apply_render_quantiles(&mut image, &source, &target);
-        apply_spatial_residual(&mut image, model, &source);
-        apply_local_render_contrast(&mut image, 0.0);
-    }
+    let raw = raw_features(&image);
+    tone_u16(&mut image);
+    meter_u16(&mut image, &raw);
+    chroma_denoise_u16(&mut image);
     Some(image)
 }
 
-fn apply_spatial_residual(image: &mut Rgba16Image, model: &RawRenderModel, source: &[f32; RENDER_FEATURES]) {
-    let Some((index, distance)) = model.nearest_prototype(source) else { return; };
-    if distance > 0.18 || model.spatial_targets.get(index).is_none() {
-        return;
+/// The whole develop look is these five numbers. Kept in a struct so the bench
+/// below can sweep them against camera JPEGs.
+#[derive(Clone, Copy)]
+pub(crate) struct ToneParams {
+    pub black: f32,
+    pub white: f32,
+    pub contrast: f32,
+    pub gamma: f32,
+    pub knee: f32,
+    /// 0 = tone on each pixel, 1 = tone on the local average and keep detail.
+    pub local: f32,
+    /// Local base radius divisor: radius = max(w, h) / radius_div.
+    pub radius_div: u32,
+}
+
+pub(crate) const TONE: ToneParams = ToneParams {
+    black: 0.005,
+    white: 0.97,
+    contrast: 0.2,
+    gamma: 0.66,
+    knee: 0.1,
+    local: 0.4,
+    radius_div: 4,
+};
+
+fn luma_of(c: [f32; 3]) -> f32 {
+    0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+}
+
+/// Soft shoulder: identity below `knee`, then an exponential roll-off that
+/// approaches 1.0 but never reaches it, so highlights do not go flat white.
+fn shoulder(y: f32, knee: f32) -> f32 {
+    if y <= knee {
+        y
+    } else {
+        knee + (1.0 - knee) * (1.0 - (-(y - knee) / (1.0 - knee)).exp())
     }
-    let residual = &model.spatial_targets[index];
-    let expected = SPATIAL_GRID * SPATIAL_GRID * 3;
-    if residual.len() != expected { return; }
-    let width = image.width().max(1) as f32;
-    let height = image.height().max(1) as f32;
-    for (x, y, pixel) in image.enumerate_pixels_mut() {
-        let gx = (x as f32 / width * SPATIAL_GRID as f32 - 0.5).clamp(0.0, (SPATIAL_GRID - 1) as f32);
-        let gy = (y as f32 / height * SPATIAL_GRID as f32 - 0.5).clamp(0.0, (SPATIAL_GRID - 1) as f32);
-        let x0 = gx.floor() as usize; let y0 = gy.floor() as usize;
-        let x1 = (x0 + 1).min(SPATIAL_GRID - 1); let y1 = (y0 + 1).min(SPATIAL_GRID - 1);
-        let tx = gx - x0 as f32; let ty = gy - y0 as f32;
-        for channel in 0..3 {
-            let at = |xx: usize, yy: usize| residual[(yy * SPATIAL_GRID + xx) * 3 + channel];
-            let value = at(x0, y0) * (1.0 - tx) * (1.0 - ty)
-                + at(x1, y0) * tx * (1.0 - ty)
-                + at(x0, y1) * (1.0 - tx) * ty
-                + at(x1, y1) * tx * ty;
-            pixel[channel] = (f32::from(pixel[channel]) + value * 65535.0).clamp(0.0, 65535.0) as u16;
+}
+
+/// S-curve on [0, 1]: a blend of identity and smoothstep. Monotone, with fixed
+/// endpoints, and `contrast` sets how much midtone contrast is added.
+fn s_curve(x: f32, contrast: f32) -> f32 {
+    let smooth = x * x * (3.0 - 2.0 * x);
+    x + contrast * (smooth - x)
+}
+
+/// Black and white points for the given parameters, from pre-sorted luminance.
+fn tone_levels(luma_sorted: &[f32], p: &ToneParams) -> (f32, f32) {
+    let at = |q: f32| luma_sorted[((luma_sorted.len() - 1) as f32 * q) as usize];
+    let low = at(p.black);
+    (low, at(p.white).max(low + 1e-4))
+}
+
+/// Tone for one pixel, expressed on its brightest channel `m`.
+fn tone_map(m: f32, p: &ToneParams) -> f32 {
+    s_curve(shoulder(m, p.knee), p.contrast).powf(p.gamma)
+}
+
+/// Blur radius for the local tone base, relative to the image.
+fn local_radius(width: usize, height: usize, p: &ToneParams) -> usize {
+    (width.max(height) / p.radius_div.max(1) as usize).max(2)
+}
+
+fn tone_u16_with(image: &mut Rgba16Image, p: &ToneParams) {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    let encoded: Vec<[f32; 3]> = image
+        .pixels()
+        .map(|pixel| std::array::from_fn(|c| f32::from(pixel[c]) / 65535.0))
+        .collect();
+    let mut luma: Vec<f32> = encoded.iter().map(|&c| luma_of(c)).collect();
+    luma.sort_unstable_by(f32::total_cmp);
+    let (low, high) = tone_levels(&luma, p);
+    let inv = 1.0 / (high - low);
+    let normalized: Vec<[f32; 3]> = encoded.iter().map(|c| c.map(|v| ((v - low) * inv).max(0.0))).collect();
+    let m: Vec<f32> = normalized.iter().map(|c| c[0].max(c[1]).max(c[2])).collect();
+    let base = if p.local > 0.0 {
+        box_blur(&m, width, height, local_radius(width, height, p))
+    } else {
+        Vec::new()
+    };
+    for (index, (pixel, c)) in image.pixels_mut().zip(&normalized).enumerate() {
+        let mm = m[index];
+        let global = if mm > 1e-5 { tone_map(mm, p) / mm } else { 1.0 };
+        let scale = if p.local > 0.0 {
+            let b = base[index].max(1e-4);
+            let local = tone_map(b, p) / b;
+            global * (1.0 - p.local) + local * p.local
+        } else {
+            global
+        };
+        for k in 0..3 {
+            pixel[k] = ((c[k] * scale).clamp(0.0, 1.0) * 65535.0) as u16;
         }
     }
 }
 
-/// Integral-image box blur (mean of a `radius`-squared window). Shared by the
-/// runtime local-contrast pass and the offline rendering fits.
+fn tone_u16(image: &mut Rgba16Image) {
+    tone_u16_with(image, &TONE)
+}
+
+// --- Learned metering ---------------------------------------------------------
+//
+// One exposure gain and one contrast offset per frame, predicted from the
+// frame's own statistics: nine from the toned frame plus five from the raw
+// decode at absolute level. The raw statistics are what carry the scene's
+// absolute brightness, which the levels otherwise normalize away. No reference
+// image, no camera branch, and no dataset at runtime: the coefficients below are
+// fitted offline by the `metering_probe` test over RAW/JPEG pairs and baked in.
+
+fn frame_luma(image: &Rgba16Image) -> Vec<f32> {
+    image
+        .pixels()
+        .map(|p| (0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2])) / 257.0)
+        .collect()
+}
+
+/// Five features from the raw decode, before our tone, at absolute level.
+fn raw_features(image: &Rgba16Image) -> [f32; 5] {
+    let luma = frame_luma(image);
+    let mut sorted = luma.clone();
+    sorted.sort_unstable_by(f32::total_cmp);
+    let at = |q: f32| sorted[((sorted.len() - 1) as f32 * q) as usize] / 255.0;
+    let mean = luma.iter().sum::<f32>() / luma.len() as f32;
+    let std = (luma.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / luma.len() as f32).sqrt();
+    [at(0.05), at(0.50), at(0.95), std / 255.0, mean / 255.0]
+}
+
+/// Fifteen features: intercept, nine from the toned frame, five raw.
+/// Keep in sync with `metering_probe`.
+fn meter_features(luma_sorted: &[f32], std: f32, skew: f32, raw: &[f32; 5]) -> [f32; 15] {
+    let at = |q: f32| luma_sorted[((luma_sorted.len() - 1) as f32 * q) as usize] / 255.0;
+    [
+        1.0,
+        at(0.02),
+        at(0.10),
+        at(0.25),
+        at(0.50),
+        at(0.75),
+        at(0.90),
+        at(0.98),
+        std / 255.0,
+        skew,
+        raw[0],
+        raw[1],
+        raw[2],
+        raw[3],
+        raw[4],
+    ]
+}
+
+/// Baked coefficients: gain (dimensionless) and offset (0..255 luma units).
+const METER_GAIN: [f32; 15] = [0.927340, 0.107458, 0.256339, 0.054291, -0.027627, 0.197642, -0.407719, -0.127172, -0.108627, -0.019321, -1.181472, -0.131208, 0.539130, 1.032186, 0.108172];
+/// Per-frame midtone curve exponent (below 1 lifts midtones, above 1 adds contrast).
+const METER_GAMMA: [f32; 15] = [1.369316, 0.597708, -0.219898, -0.590255, 0.389556, 0.367973, 0.677099, -0.906502, 0.155715, 0.039787, 0.808022, 0.112798, -0.765814, -0.141391, 0.335810];
+const METER_OFFSET: [f32; 15] = [-22.968147, -34.602035, -70.784434, -23.354040, 28.857493, 13.171703, 64.228898, -22.402481, 12.473469, 12.846639, 146.482698, 39.159393, -59.684663, -65.754446, 47.243694];
+
+/// Clamps keep a weird frame from being wrecked by an out-of-distribution fit.
+const METER_GAIN_RANGE: (f32, f32) = (0.6, 1.8);
+const METER_OFFSET_RANGE: (f32, f32) = (-60.0, 60.0);
+const METER_GAMMA_RANGE: (f32, f32) = (0.70, 1.40);
+
+fn dotn(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// The mapping a frame gets: a gamma, a gain and an offset, finished with the
+/// same soft shoulder the tone uses. The shoulder means a brightening that would
+/// otherwise clip the sky rolls off instead, so midtones can be lifted without
+/// buying it with blown highlights.
+const METER_KNEE: f32 = 0.75;
+
+fn meter_apply(y: f32, gain: f32, gamma: f32, offset: f32) -> f32 {
+    let lifted = gain * (y / 255.0).max(0.0).powf(gamma) + offset / 255.0;
+    255.0 * shoulder(lifted.max(0.0), METER_KNEE)
+}
+
+/// The metering prediction (gain, offset, gamma) for a frame. Exposed for tests.
+pub(crate) fn meter_predict(image: &Rgba16Image, raw: &[f32; 5]) -> (f32, f32, f32) {
+    let luma = frame_luma(image);
+    let mut sorted = luma.clone();
+    sorted.sort_unstable_by(f32::total_cmp);
+    let mean = luma.iter().sum::<f32>() / luma.len() as f32;
+    let std = (luma.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / luma.len() as f32).sqrt();
+    let skew = luma.iter().map(|x| ((x - mean) / std.max(1e-6)).powi(3)).sum::<f32>() / luma.len() as f32;
+    let features = meter_features(&sorted, std, skew, raw);
+    let gain = dotn(&features, &METER_GAIN).clamp(METER_GAIN_RANGE.0, METER_GAIN_RANGE.1);
+    let offset = dotn(&features, &METER_OFFSET).clamp(METER_OFFSET_RANGE.0, METER_OFFSET_RANGE.1);
+    let gamma = dotn(&features, &METER_GAMMA).clamp(METER_GAMMA_RANGE.0, METER_GAMMA_RANGE.1);
+    (gain, offset, gamma)
+}
+
+fn meter_u16(image: &mut Rgba16Image, raw: &[f32; 5]) {
+    let (gain, offset, gamma) = meter_predict(image, raw);
+    let luma = frame_luma(image);
+    for (pixel, &y) in image.pixels_mut().zip(&luma) {
+        if y < 1e-3 {
+            continue;
+        }
+        let scale = meter_apply(y, gain, gamma, offset).max(0.0) / y;
+        for k in 0..3 {
+            pixel[k] = (f32::from(pixel[k]) * scale).clamp(0.0, 65535.0) as u16;
+        }
+    }
+}
+
 pub(crate) fn box_blur(values: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
     let stride = width + 1;
     let mut integral = vec![0.0f64; (width + 1) * (height + 1)];
@@ -266,31 +457,6 @@ pub(crate) fn box_blur(values: &[f32], width: usize, height: usize, radius: usiz
         }
     }
     out
-}
-
-fn apply_local_render_contrast(image: &mut Rgba16Image, amount: f32) {
-    if amount <= 0.0 || image.width() < 8 || image.height() < 8 {
-        return;
-    }
-    let width = image.width() as usize;
-    let height = image.height() as usize;
-    let luma: Vec<f32> = image
-        .pixels()
-        .map(|p| {
-            (0.2126 * f32::from(p[0]) + 0.7152 * f32::from(p[1]) + 0.0722 * f32::from(p[2]))
-                / 65535.0
-        })
-        .collect();
-    let radius = (width.max(height) / 64).max(2);
-    let blurred = box_blur(&luma, width, height, radius);
-    for (pixel, (&value, &local)) in image.pixels_mut().zip(luma.iter().zip(&blurred)) {
-        let adjusted =
-            (value + amount * (value - local)).clamp(value * 0.7, (value * 1.4).min(1.0));
-        let scale = if value > 1e-5 { adjusted / value } else { 1.0 };
-        for channel in 0..3 {
-            pixel[channel] = (f32::from(pixel[channel]) * scale).clamp(0.0, 65535.0) as u16;
-        }
-    }
 }
 
 pub(crate) fn decode_raw_u16(path: &Path, max_dim: u32) -> Option<Rgba16Image> {
@@ -377,109 +543,18 @@ pub(crate) fn load_render_target(path: &Path, max_dim: u32) -> Option<RgbaImage>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-        #[test]
-        fn embedded_raw_render_model_is_valid_and_monotone() {
-            let model = RawRenderModel::embedded().expect("embedded RAW render model");
-            let input: [f32; RENDER_FEATURES] =
-                std::array::from_fn(|index| RENDER_QUANTILES[index % RENDER_QUANTILES.len()]);
-            let output = model.predict(&input);
-            assert!(output.iter().all(|value| value.is_finite()));
-            for channel in 0..3 {
-                assert!(output
-                    [channel * RENDER_QUANTILES.len()..(channel + 1) * RENDER_QUANTILES.len()]
-                    .windows(2)
-                    .all(|pair| pair[0] <= pair[1]));
-            }
-        }
-
-        #[test]
-        fn u16_develop_matches_8bit_develop() {
-            let path =
-                Path::new("/Users/jakubkolcar/Downloads/PXL_20260806_114652240.RAW-02.ORIGINAL.dng");
-            if !path.exists() {
-                return;
-            }
-            let dev8 = develop_raw(path, 512).unwrap();
-            let dev16 = develop_raw_u16(path, 512).unwrap();
-            assert_eq!(dev16.dimensions(), dev8.dimensions());
-            // u16 output is the same srgb-encoded value at 16-bit resolution.
-            let mut checked = 0;
-            for (pixel, px16) in dev8.pixels().zip(dev16.pixels()) {
-                for channel in 0..3 {
-                    let expected = u32::from(pixel[channel]) * 257;
-                    let actual = u32::from(px16[channel]);
-                    assert!(
-                        actual.abs_diff(expected) <= 257,
-                        "u16 develop diverges at {channel}: {actual} vs {expected}"
-                    );
-                }
-                assert_eq!(px16[3], 65535);
-                checked += 1;
-            }
-            assert!(checked > 1000);
-        }
-
-        #[test]
-        fn universal_raw_development_matches_camera_preview() {
-            let Ok(input) = std::env::var("RAW_CAMERA_PROBE") else {
-                return;
-            };
-            let input = std::path::Path::new(&input);
-            let paths: Vec<PathBuf> = if input.is_dir() {
-                std::fs::read_dir(input)
-                    .unwrap()
-                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                    .filter(|path| crate::imgload::is_raw(path))
-                    // Paired camera RAWs only: for other DNGs `load_render_target`
-                    // falls back to the low-res embedded preview, and comparing
-                    // development against that is too noisy to gate on.
-                    .filter(|path| {
-                        path.file_name()
-                            .and_then(|name| name.to_str())
-                            .is_some_and(|name| name.ends_with(".RAW-02.ORIGINAL.dng"))
-                    })
-                    .collect()
-            } else {
-                vec![input.to_owned()]
-            };
-            let mut custom_errors = Vec::new();
-            for path in paths {
-                let developed = develop_raw(&path, 512);
-                let Some(developed) = developed else {
-                    continue;
-                };
-                let Some(camera) = load_render_target(&path, 512) else {
-                    continue;
-                };
-                let error = |candidate: &image::RgbaImage| {
-                    let candidate = image::imageops::resize(
-                        candidate,
-                        camera.width(),
-                        camera.height(),
-                        image::imageops::FilterType::Triangle,
-                    );
-                    candidate
-                        .pixels()
-                        .zip(camera.pixels())
-                        .flat_map(|(a, b)| (0..3).map(move |c| u8::abs_diff(a[c], b[c]) as f32 / 255.0))
-                        .sum::<f32>()
-                        / (camera.width() * camera.height() * 3) as f32
-                };
-            custom_errors.push(error(&developed));
-            }
-            assert!(!custom_errors.is_empty(), "no usable camera RAWs");
-            let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
-            let custom_error = mean(&custom_errors);
-            let worst = custom_errors.iter().copied().fold(0.0, f32::max);
-            eprintln!(
-                "camera RAWs: universal pipeline MAE {custom_error:.4}, worst {worst:.4}, n={}",
-                custom_errors.len(),
-            );
-            assert!(custom_error < 0.08, "mean camera-render error exceeds 8%");
-            assert!(worst < 0.23, "at least one camera RAW exceeds 23% error");
-        }
-}
+mod tests;
+#[cfg(test)]
+mod dataset_tests;
+#[cfg(test)]
+mod reference_bench;
+#[cfg(test)]
+mod tune;
+#[cfg(test)]
+mod decompose;
+#[cfg(test)]
+mod profile_probe;
+#[cfg(test)]
+mod metering_probe;
+#[cfg(test)]
+mod frames_probe;

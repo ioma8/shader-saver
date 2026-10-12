@@ -9,3 +9,6 @@ DerivedData/
 stl-viewer/target/
 image-processor/target/
 image-processor/.venv-train/
+
+# Large CC0 RAW samples (raw.pixls.us); only the README is tracked
+image-processor/datasets/raw-samples/*/

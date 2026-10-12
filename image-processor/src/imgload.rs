@@ -5,9 +5,9 @@ use jpgfromraw::FindJpegType;
 use std::path::Path;
 
 pub const STD_EXTS: [&str; 8] = ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "gif"];
-pub const RAW_EXTS: [&str; 19] = [
-    "dng", "cr2", "cr3", "nef", "arw", "orf", "rw2", "raf", "pef", "srw", "mrw", "kdc", "dcr",
-    "erf", "mef", "mos", "nrw", "3fr", "x3f",
+pub const RAW_EXTS: [&str; 23] = [
+    "dng", "cr2", "cr3", "crw", "nef", "nrw", "arw", "orf", "rw2", "raf", "pef", "srw", "mrw",
+    "kdc", "dcr", "dcs", "erf", "mef", "mos", "3fr", "tfr", "iiq", "x3f",
 ];
 
 fn ext_of(path: &Path) -> Option<String> {

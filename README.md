@@ -5,8 +5,9 @@ GPU graphics experiments: two Metal projects in a Swift package, plus a Rust ima
 ## Image Processor
 
 A real-time GPU image editor (Rust, wgpu compute shaders + egui): thumbnail
-browser, RAW support (rawloader-basic development plus a phone S-curve fitted
-from Pixel DNG/JPEG pairs), levels/curves/tonal adjustments, auto-correction,
+browser, RAW support (one universal develop: sensor decode, auto-levels, a
+hue-preserving S-curve over a local-tone base, and a small baked metering rule),
+levels/curves/tonal adjustments, auto-correction,
 and SQLite-persisted edits. See [image-processor/README.md](image-processor/README.md).
 
 ## STLViewer

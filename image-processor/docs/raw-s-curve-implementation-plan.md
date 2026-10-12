@@ -1,5 +1,12 @@
 # RAW Development: rawloader basic development + phone S-curve
 
+> **Status: historical, superseded.** This plan's S-curve approach was later
+> replaced by a learned render model, which has itself been replaced by a
+> universal exposure-and-tone develop. The current pipeline is described in
+> [raw-development.md](raw-development.md). The S-curve survives only as the
+> offline `--fit-raw-scurve` tool. The file paths, line numbers, and deleted
+> modules below no longer match the code.
+
 Implementation plan. Target repo: `image-processor/` (Rust, wgpu + egui editor).
 
 ## Goal
