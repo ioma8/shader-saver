@@ -14,8 +14,10 @@
         luma: Vec<f32>,
         /// Reference pixels resized to the develop's dimensions.
         reference: Vec<u8>,
-        /// Reference luminance percentiles (5, 50, 95), in 0..255.
-        reference_percentiles: [f32; 3],
+        /// Reference luminance percentiles (5, 25, 50, 95), in 0..255. The 25th
+        /// is the subject band: a develop can match the median and still leave
+        /// faces dark, which is exactly what the local tone used to do.
+        reference_percentiles: [f32; 4],
         width: u32,
         height: u32,
     }
@@ -68,7 +70,7 @@
             .collect();
         reference_luma.sort_unstable_by(f32::total_cmp);
         let at = |q: f32| reference_luma[((reference_luma.len() - 1) as f32 * q) as usize];
-        let reference_percentiles = [at(0.05), at(0.5), at(0.95)];
+        let reference_percentiles = [at(0.05), at(0.25), at(0.5), at(0.95)];
         Some(Sample {
             encoded,
             luma,
@@ -169,8 +171,9 @@
                     255.0
                 };
                 let penalty = (at(0.05) - s.reference_percentiles[0]).abs()
-                    + (at(0.5) - s.reference_percentiles[1]).abs()
-                    + (at(0.95) - s.reference_percentiles[2]).abs();
+                    + (at(0.25) - s.reference_percentiles[1]).abs()
+                    + (at(0.5) - s.reference_percentiles[2]).abs()
+                    + (at(0.95) - s.reference_percentiles[3]).abs();
                 (sum / (s.width as f64 * s.height as f64 * 3.0), penalty as f64)
             })
             .collect();
@@ -211,7 +214,7 @@
         let contrasts = [0.2f32, 0.3, 0.45];
         let gammas = [0.55f32, 0.62, 0.66];
         let knees = [0.1f32, 0.25, 0.4, 0.55];
-        let locals = [0.3f32, 0.4, 0.5];
+        let locals = [0.0f32, 0.15, 0.3, 0.4];
         let radius_divs = [4u32, 6];
         let mut combos = Vec::new();
         for &black in &blacks {

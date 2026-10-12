@@ -8,7 +8,7 @@
         })
     }
 
-    fn tone(img: &RgbaImage) -> [f32; 4] {
+    fn tone(img: &RgbaImage) -> [f32; 5] {
         let n = (img.width() * img.height()) as f32;
         let mut v: Vec<f32> = img
             .pixels()
@@ -16,7 +16,14 @@
             .collect();
         let clip = img.pixels().filter(|p| p[0] == 255 || p[1] == 255 || p[2] == 255).count() as f32 / n;
         v.sort_unstable_by(f32::total_cmp);
-        [v[(v.len() - 1) / 20], v[v.len() / 2], v[(v.len() - 1) * 19 / 20], clip]
+        // 5th, 25th (the subject band), 50th, 95th percentiles, plus clipping.
+        [
+            v[(v.len() - 1) / 20],
+            v[(v.len() - 1) / 4],
+            v[v.len() / 2],
+            v[(v.len() - 1) * 19 / 20],
+            clip,
+        ]
     }
 
     fn mae(a: &RgbaImage, b: &RgbaImage) -> f32 {
@@ -95,8 +102,8 @@
             let (d, t) = (tone(&dev), tone(&r));
             let m = mae(&dev, &r);
             eprintln!(
-                "{label}/{name}: ref={kind} {dim} | dev p50={:.3} p95={:.3} clip={:.4} | ref p50={:.3} p95={:.3} clip={:.4} | MAE={m:.4}",
-                d[1], d[2], d[3], t[1], t[2], t[3]
+                "{label}/{name}: ref={kind} {dim} | dev p25={:.3} p50={:.3} p95={:.3} clip={:.4} | ref p25={:.3} p50={:.3} p95={:.3} clip={:.4} | MAE={m:.4}",
+                d[1], d[2], d[3], d[4], t[1], t[2], t[3], t[4]
             );
             maes.push(m);
         }

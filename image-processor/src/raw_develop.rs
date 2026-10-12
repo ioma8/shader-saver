@@ -398,8 +398,13 @@ fn dotn(a: &[f32], b: &[f32]) -> f32 {
 /// buying it with blown highlights.
 const METER_KNEE: f32 = 0.95;
 
+/// A small global brightening (in 0..255) applied with the metering. The fitted
+/// target is the camera JPEG, but its subjects read dark next to what people
+/// expect today, so the develop lands a touch above it.
+const METER_BRIGHTEN: f32 = 10.0;
+
 fn meter_apply(y: f32, gain: f32, gamma: f32, offset: f32) -> f32 {
-    let lifted = gain * (y / 255.0).max(0.0).powf(gamma) + offset / 255.0;
+    let lifted = gain * (y / 255.0).max(0.0).powf(gamma) + (offset + METER_BRIGHTEN) / 255.0;
     255.0 * shoulder(lifted.max(0.0), METER_KNEE)
 }
 

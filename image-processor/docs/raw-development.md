@@ -113,6 +113,14 @@ and brightness (dP50 −0.006 → +0.017), halving the dark frames to 16/74, at 
 cost of +1.7% more clipped pixels. The mixed group regresses (0.0990 → 0.1078);
 its references are embedded previews, so it does not drive tuning.
 
+Matching the camera exactly is not the goal, though: its subjects still read
+dark next to what people expect now, so the metering adds a small global lift
+(`METER_BRIGHTEN = 10` on the 0..255 scale). Against the JPEGs the develop now
+sits 0.057 above in the median and 0.073 above in the subject band (p25), with
+4 of 74 frames more than 0.02 dark instead of 10, for +2.9% clipped pixels and
+Sony MAE 0.0442 → 0.0607 (deliberately worse — we are no longer trying to
+equal the camera).
+
 A fitted **fixed** per-channel curve (a profile-like 3×1D LUT) was measured and
 gives no gain (Sony 0.0519 → 0.0531, Pixel 0.0787 → 0.0775 at 384 px): the levels
 already match the marginal distribution, so the residual is not a fixed global

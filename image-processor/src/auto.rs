@@ -76,7 +76,7 @@ const STAT_SIZE: u32 = 256;
 const MEDIAN_TARGET: f64 = 0.45;
 /// Always-on S-curve (the shader's curve keeps 0 and 1 fixed, so it cannot
 /// clip). This is the "punch" the tonal stages would otherwise lack.
-const BASE_CONTRAST: f64 = 18.0;
+const BASE_CONTRAST: f64 = 10.0;
 /// Inter-quartile range a stretched histogram normally reaches.
 const CONTRAST_IQR_TARGET: f64 = 0.45;
 /// How much of the gray-world white-balance correction to apply. A RAW is
