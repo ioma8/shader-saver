@@ -98,20 +98,27 @@ History, same references throughout:
 | + per-frame gamma, soft shoulder, chroma denoise | 0.0445 | 0.0777 | 0.0990 |
 | + percentile-aware tuning, softer metering shoulder (current) | **0.0442** | **0.0774** | 0.1078 |
 
-Current parameters: `black = 0.005`, `white = 0.97`, `contrast = 0.2`,
-`gamma = 0.60`, `knee = 0.1`, `local = 0.4`, `radius_div = 4`; the metering's
-own shoulder is `METER_KNEE = 0.95`.
+Current parameters: `black = 0.005`, `white = 0.97`, `contrast = 0.35`,
+`gamma = 0.70`, `knee = 0.1`, `local = 0.4`, `radius_div = 4`; the metering's
+own shoulder is `METER_KNEE = 0.80` with a small global lift
+`METER_BRIGHTEN = 8` (0..255).
 
 Minimising MAE flattens: L1 fitting regresses to the conditional median, so
 contrast and brightness both drift toward the middle. Measured against the SOOC
 JPEGs the develops were **0.037 low on highlights** and **32 of 74 frames more
 than 0.01 dark** in the median. The sweep's objective now also matches the
-reference's 5/50/95 luminance percentiles, and the metering's soft shoulder was
-relaxed (`METER_KNEE` 0.75 → 0.95) so brightening is not discarded on
-highlights. Together those match the camera on highlights (dP95 −0.037 → −0.000)
-and brightness (dP50 −0.006 → +0.017), halving the dark frames to 16/74, at the
-cost of +1.7% more clipped pixels. The mixed group regresses (0.0990 → 0.1078);
-its references are embedded previews, so it does not drive tuning.
+reference's 5/25/50/95 luminance percentiles, and there is a further lesson:
+brightening is not free. A `gamma` low enough to lift the midtones also lifts
+the blacks, and a relaxed shoulder plus a big lift clips the highlights, so the
+frame ends up bright but *flat* — the reported "way too little contrast" on
+`DSC03795` was exactly that (its p5 sat 0.067 above the JPEG's). The shape that
+works raises contrast (`contrast` 0.2 → 0.35) and pulls the shoulder back
+(`METER_KNEE` 0.95 → 0.80) while only nudging the level up
+(`METER_BRIGHTEN = 8`).
+
+The result matches the camera closely — Sony dP25 +0.024, dP50 +0.003,
+dP95 −0.017, clipping +0.6% — with the best MAE so far (Sony 0.0430, Pixel
+0.0778).
 
 Matching the camera exactly is not the goal, though: its subjects still read
 dark next to what people expect now, so the metering adds a small global lift
@@ -201,9 +208,9 @@ MAE against each camera's own render (lower is closer):
 
 | Group | n | Reference | mean MAE | median MAE |
 | --- | --- | --- | --- | --- |
-| Sony ARW (4 folders) | 74 | sibling SOOC JPG (6000×4000) | **0.0442** | 0.0442 |
-| Pixel DNG | 45 | phone JPEG preview (1280×964) | **0.0774** | 0.0741 |
-| Mixed samples | 13 | camera preview (640–8640 px) | 0.1078 | 0.0943 |
+| Sony ARW (4 folders) | 74 | sibling SOOC JPG (6000×4000) | **0.0430** | 0.0402 |
+| Pixel DNG | 45 | phone JPEG preview (1280×964) | **0.0778** | 0.0737 |
+| Mixed samples | 13 | camera preview (640–8640 px) | 0.1050 | 0.0902 |
 
 The mixed-sample MAE is the least trustworthy: its references are camera
 previews as small as 640×480, and each carries its own picture style. The Sony
