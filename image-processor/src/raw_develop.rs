@@ -246,7 +246,7 @@ pub(crate) const TONE: ToneParams = ToneParams {
     black: 0.005,
     white: 0.97,
     contrast: 0.2,
-    gamma: 0.66,
+    gamma: 0.60,
     knee: 0.1,
     local: 0.4,
     radius_div: 4,
@@ -396,7 +396,7 @@ fn dotn(a: &[f32], b: &[f32]) -> f32 {
 /// same soft shoulder the tone uses. The shoulder means a brightening that would
 /// otherwise clip the sky rolls off instead, so midtones can be lifted without
 /// buying it with blown highlights.
-const METER_KNEE: f32 = 0.75;
+const METER_KNEE: f32 = 0.95;
 
 fn meter_apply(y: f32, gain: f32, gamma: f32, offset: f32) -> f32 {
     let lifted = gain * (y / 255.0).max(0.0).powf(gamma) + offset / 255.0;

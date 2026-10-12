@@ -95,10 +95,23 @@ History, same references throughout:
 | Local base refined (`local = 0.3`, base `max/6`) | 0.0537 | 0.0844 | 0.1157 |
 | Per-frame metering, toned features only | 0.0454 | 0.0807 | 0.1021 |
 | Metering + raw-decode features, clip guard | 0.0440 | 0.0786 | 0.1008 |
-| + per-frame gamma, soft shoulder, chroma denoise (current) | **0.0445** | **0.0777** | **0.0990** |
+| + per-frame gamma, soft shoulder, chroma denoise | 0.0445 | 0.0777 | 0.0990 |
+| + percentile-aware tuning, softer metering shoulder (current) | **0.0442** | **0.0774** | 0.1078 |
 
-Current parameters: `black = 0.005`, `white = 0.97`, `contrast = 0.3`,
-`gamma = 0.68`, `knee = 0.1`, `local = 0.3`, `radius_div = 6`.
+Current parameters: `black = 0.005`, `white = 0.97`, `contrast = 0.2`,
+`gamma = 0.60`, `knee = 0.1`, `local = 0.4`, `radius_div = 4`; the metering's
+own shoulder is `METER_KNEE = 0.95`.
+
+Minimising MAE flattens: L1 fitting regresses to the conditional median, so
+contrast and brightness both drift toward the middle. Measured against the SOOC
+JPEGs the develops were **0.037 low on highlights** and **32 of 74 frames more
+than 0.01 dark** in the median. The sweep's objective now also matches the
+reference's 5/50/95 luminance percentiles, and the metering's soft shoulder was
+relaxed (`METER_KNEE` 0.75 → 0.95) so brightening is not discarded on
+highlights. Together those match the camera on highlights (dP95 −0.037 → −0.000)
+and brightness (dP50 −0.006 → +0.017), halving the dark frames to 16/74, at the
+cost of +1.7% more clipped pixels. The mixed group regresses (0.0990 → 0.1078);
+its references are embedded previews, so it does not drive tuning.
 
 A fitted **fixed** per-channel curve (a profile-like 3×1D LUT) was measured and
 gives no gain (Sony 0.0519 → 0.0531, Pixel 0.0787 → 0.0775 at 384 px): the levels
@@ -180,9 +193,9 @@ MAE against each camera's own render (lower is closer):
 
 | Group | n | Reference | mean MAE | median MAE |
 | --- | --- | --- | --- | --- |
-| Sony ARW (4 folders) | 74 | sibling SOOC JPG (6000×4000) | **0.0445** | 0.0438 |
-| Pixel DNG | 45 | phone JPEG preview (1280×964) | **0.0777** | 0.0724 |
-| Mixed samples | 13 | camera preview (640–8640 px) | 0.0990 | 0.0859 |
+| Sony ARW (4 folders) | 74 | sibling SOOC JPG (6000×4000) | **0.0442** | 0.0442 |
+| Pixel DNG | 45 | phone JPEG preview (1280×964) | **0.0774** | 0.0741 |
+| Mixed samples | 13 | camera preview (640–8640 px) | 0.1078 | 0.0943 |
 
 The mixed-sample MAE is the least trustworthy: its references are camera
 previews as small as 640×480, and each carries its own picture style. The Sony

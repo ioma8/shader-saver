@@ -14,6 +14,8 @@
         luma: Vec<f32>,
         /// Reference pixels resized to the develop's dimensions.
         reference: Vec<u8>,
+        /// Reference luminance percentiles (5, 50, 95), in 0..255.
+        reference_percentiles: [f32; 3],
         width: u32,
         height: u32,
     }
@@ -60,7 +62,21 @@
         let mut luma: Vec<f32> = encoded.iter().map(|&c| luma_of(c)).collect();
         luma.sort_unstable_by(f32::total_cmp);
         let reference = reference_bytes(path, width, height)?;
-        Some(Sample { encoded, luma, reference, width, height })
+        let mut reference_luma: Vec<f32> = reference
+            .chunks(3)
+            .map(|c| 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32)
+            .collect();
+        reference_luma.sort_unstable_by(f32::total_cmp);
+        let at = |q: f32| reference_luma[((reference_luma.len() - 1) as f32 * q) as usize];
+        let reference_percentiles = [at(0.05), at(0.5), at(0.95)];
+        Some(Sample {
+            encoded,
+            luma,
+            reference,
+            reference_percentiles,
+            width,
+            height,
+        })
     }
 
     fn load(dir: &str, keep: &dyn Fn(&Path) -> bool) -> Vec<Sample> {
@@ -85,10 +101,13 @@
         (0..=LUT_N).map(|i| tone_map(4.0 * i as f32 / LUT_N as f32, p)).collect()
     }
 
-    fn group_mae(group: &[Sample], p: &ToneParams) -> f32 {
+    /// (mean absolute error, percentile penalty) for the group, both in 0..255.
+    /// The penalty compares the toned image's 5/50/95 luminance percentiles with
+    /// the reference's, so the sweep cannot buy MAE by flattening contrast.
+    fn group_score(group: &[Sample], p: &ToneParams) -> (f32, f32) {
         let lut = lut(p);
         let step = LUT_N as f32 / 4.0;
-        let total: f64 = group
+        let scored: Vec<(f64, f64)> = group
             .par_iter()
             .map(|s| {
                 let (low, high) = tone_levels(&s.luma, p);
@@ -115,6 +134,7 @@
                     Vec::new()
                 };
                 let mut sum = 0.0f64;
+                let mut hist = [0u32; 256];
                 for (i, c) in scaled.iter().enumerate() {
                     let mm = m[i];
                     let global = if mm > 1e-5 { get(mm) / mm } else { 1.0 };
@@ -133,11 +153,32 @@
                     for k in 0..3 {
                         sum += (out[k] - s.reference[idx + k] as i32).abs() as f64;
                     }
+                    let l = 0.2126 * out[0] as f32 + 0.7152 * out[1] as f32 + 0.0722 * out[2] as f32;
+                    hist[(l as usize).min(255)] += 1;
                 }
-                sum / (s.width as f64 * s.height as f64 * 3.0)
+                let total: u32 = hist.iter().sum();
+                let at = |q: f32| {
+                    let target = (q * total as f32) as u32;
+                    let mut acc = 0u32;
+                    for (value, &count) in hist.iter().enumerate() {
+                        acc += count;
+                        if acc >= target.max(1) {
+                            return value as f32;
+                        }
+                    }
+                    255.0
+                };
+                let penalty = (at(0.05) - s.reference_percentiles[0]).abs()
+                    + (at(0.5) - s.reference_percentiles[1]).abs()
+                    + (at(0.95) - s.reference_percentiles[2]).abs();
+                (sum / (s.width as f64 * s.height as f64 * 3.0), penalty as f64)
             })
-            .sum();
-        (total / group.len() as f64) as f32
+            .collect();
+        let n = group.len() as f64;
+        (
+            (scored.iter().map(|x| x.0).sum::<f64>() / n) as f32,
+            (scored.iter().map(|x| x.1).sum::<f64>() / n) as f32,
+        )
     }
 
     #[test]
@@ -167,9 +208,9 @@
 
         let blacks = [0.005f32, 0.01];
         let whites = [0.95f32, 0.97, 0.98];
-        let contrasts = [0.2f32, 0.3];
-        let gammas = [0.62f32, 0.66, 0.70];
-        let knees = [0.05f32, 0.1, 0.2];
+        let contrasts = [0.2f32, 0.3, 0.45];
+        let gammas = [0.55f32, 0.62, 0.66];
+        let knees = [0.1f32, 0.25, 0.4, 0.55];
         let locals = [0.3f32, 0.4, 0.5];
         let radius_divs = [4u32, 6];
         let mut combos = Vec::new();
@@ -204,28 +245,40 @@
         eprintln!("scanning {} combinations", combos.len());
         let sizes: Vec<f32> = groups.iter().map(|(_, g)| g.len() as f32).collect();
         let total: f32 = sizes.iter().sum();
-        let mut results: Vec<(f32, &ToneParams, Vec<f32>)> = combos
+        // Weight of the percentile term relative to MAE, both in 0..255.
+        const PCT_WEIGHT: f32 = 0.5;
+        let mut results: Vec<(f32, f32, f32, &ToneParams)> = combos
             .par_iter()
             .map(|p| {
-                let per: Vec<f32> = groups.iter().map(|(_, g)| group_mae(g, p)).collect();
-                // Pooled over images, so a group with many frames counts more.
-                let pooled = per.iter().zip(&sizes).map(|(m, n)| m * n).sum::<f32>() / total;
-                (pooled, p, per)
+                let mut mae = 0.0;
+                let mut penalty = 0.0;
+                for ((_, g), n) in groups.iter().zip(&sizes) {
+                    let (m, q) = group_score(g, p);
+                    mae += m * n;
+                    penalty += q * n;
+                }
+                (mae / total, penalty / total, mae / total + PCT_WEIGHT * penalty / total, p)
             })
             .collect();
-        results.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for (score, p, per) in results.iter().take(10) {
-            let detail: Vec<String> = per.iter().map(|v| format!("{v:.4}")).collect();
+        results.sort_by(|a, b| a.2.total_cmp(&b.2));
+        for (mae, penalty, score, p) in results.iter().take(12) {
             eprintln!(
-                "score={score:.4} black={:.3} white={:.3} contrast={:.2} gamma={:.3} knee={:.1} local={:.2} rdiv={} per{names:?}={detail:?}",
+                "score={score:.3} mae={mae:.4} pct={penalty:.3} black={:.3} white={:.3} contrast={:.2} gamma={:.3} knee={:.2} local={:.2} rdiv={}",
                 p.black, p.white, p.contrast, p.gamma, p.knee, p.local, p.radius_div
             );
         }
-        let per: Vec<f32> = groups.iter().map(|(_, g)| group_mae(g, &TONE)).collect();
-        let pooled = per.iter().zip(&sizes).map(|(m, n)| m * n).sum::<f32>() / total;
+        let (cur_mae, cur_pct) = {
+            let mut mae = 0.0;
+            let mut penalty = 0.0;
+            for ((_, g), n) in groups.iter().zip(&sizes) {
+                let (m, q) = group_score(g, &TONE);
+                mae += m * n;
+                penalty += q * n;
+            }
+            (mae / total, penalty / total)
+        };
         eprintln!(
-            "current local={} pooled={pooled:.4} per{names:?}={:?}",
-            TONE.local,
-            per.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>()
+            "current mae={cur_mae:.4} pct={cur_pct:.3} (score {:.3})",
+            cur_mae + PCT_WEIGHT * cur_pct
         );
     }
