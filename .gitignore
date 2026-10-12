@@ -12,3 +12,10 @@ image-processor/.venv-train/
 
 # Large CC0 RAW samples (raw.pixls.us); only the README is tracked
 image-processor/datasets/raw-samples/*/
+
+# MIT-Adobe FiveK training pairs (research licensed); only weights ship
+image-processor/datasets/fivek/
+
+# Python tooling
+__pycache__/
+*.pyc

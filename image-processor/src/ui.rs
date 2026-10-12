@@ -1092,7 +1092,7 @@ pub(crate) fn edit(
                             }
                             if ui
                                 .add_enabled(processor.has_image(), egui::Button::new("Auto"))
-                                .on_hover_text("Auto levels + brightness/shadows/highlights")
+                                .on_hover_text("Auto: white balance, levels, contrast, shadows/highlights, vibrance")
                                 .clicked()
                             {
                                 ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_AUTO), true));

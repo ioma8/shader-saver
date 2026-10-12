@@ -38,8 +38,9 @@ images.
   GPU-computed luminance histogram
 - **Curves** — Photoshop-style: click the histogram to add points,
   natural cubic spline, applied as a 256-entry LUT
-- **Auto** — one-click auto levels, brightness, contrast,
-  shadows/highlights from the histogram
+- **Auto** — one-click white balance, levels, contrast,
+  shadows/highlights and vibrance chosen from the photo's own statistics
+  (`src/auto.rs`; see `docs/auto-enhance.md`)
 - **Reference look transfer** — CanonCGT canonicalizes the target's existing
   exposure/illumination and restylizes it with a finished reference's grade as
   one smooth 33³ LUT; the self-supervised checkpoint uses a 448px intermediate

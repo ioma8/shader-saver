@@ -1,3 +1,4 @@
+mod auto;
 mod canoncgt;
 mod camera_presets;
 mod classify;
@@ -453,6 +454,7 @@ struct App {
     camera_category: camera_presets::CameraCategory,
     classifier: Option<Arc<classify::Classifier>>,
     enhancer: Option<Arc<enhance::Enhancer>>,
+    auto_model: Option<Arc<auto::model::Residual>>,
     tags: HashMap<PathBuf, Vec<String>>,
     tag_edit: String,
     classify_tx: std::sync::mpsc::Sender<(usize, PathBuf, Option<Vec<String>>)>,
@@ -555,6 +557,7 @@ impl App {
             camera_category: camera_presets::CameraCategory::Popular,
             classifier: classify::Classifier::load().map(Arc::new),
             enhancer: enhance::Enhancer::load().map(Arc::new),
+            auto_model: auto::model::Residual::load().map(Arc::new),
             tags,
             tag_edit: String::new(),
             classify_tx,
@@ -1239,16 +1242,19 @@ impl App {
         // original image, derive AI or histogram-based values, then let the
         // normal needs_process path re-process and persist them.
         if requests.auto {
-            let ai_state = self
+            // Analytic Auto: choose the visible sliders from the photo's own
+            // statistics. Falls back to the histogram heuristic only if the
+            // source cannot be re-read for statistics.
+            let auto_state = self
                 .current_path
                 .as_deref()
                 .and_then(|path| imgload::load_rgba(path, 512))
-                .and_then(|img| self.enhancer.as_ref()?.suggest_edits(&img));
+                .map(|img| auto::suggest_edit_with(&img, self.auto_model.as_deref()));
             if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
                 if proc.has_image() {
                     proc.apply_edit_state(&EditState::default());
                     proc.restore_source(&gpu.queue);
-                    if let Some(state) = ai_state {
+                    if let Some(state) = auto_state {
                         proc.apply_edit_state(&state);
                     } else {
                         proc.process(&gpu.device, &gpu.queue);
