@@ -14,6 +14,7 @@ mod processor;
 mod rate;
 mod raw_develop;
 mod raw_fit;
+mod retouch;
 mod similar;
 mod tags;
 mod ui;
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui_wgpu::ScreenDescriptor;
-use processor::{EditState, LookProfile, Processor};
+use processor::{EditState, LookProfile, Processor, RetouchSpot, MAX_RETOUCH_SPOTS};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::WindowEvent;
@@ -47,6 +48,9 @@ const KEY_CLASSIFY_FOLDER: &str = "classify_folder";
 const KEY_RATE_FOLDER: &str = "rate_folder";
 const KEY_ADJUST_FOLDER: &str = "adjust_folder";
 const KEY_SIMILAR_CULL: &str = "similar_cull";
+const KEY_RETOUCH: &str = "retouch_dab";
+const KEY_RETOUCH_REMOVE: &str = "retouch_remove";
+const KEY_RETOUCH_CLEAR: &str = "retouch_clear";
 const CULL_HELP_KEY: &str = "browse_cull_help_visible";
 const RAW_DEFAULT_SHARPEN: f32 = 0.65;
 const RAW_DEFAULT_SHARPEN_RADIUS: f32 = 2.0;
@@ -480,6 +484,10 @@ struct App {
     similar_progress: Option<(usize, usize)>,
     similar_candidates: HashMap<PathBuf, similar::Analysis>,
     similar_summary: Option<(usize, usize)>,
+    // Retouch brush: whether the tool is armed, and the dab radius in image
+    // pixels (the `[` / `]` keys step it).
+    retouch_active: bool,
+    brush_radius: f32,
 }
 
 impl App {
@@ -580,6 +588,8 @@ impl App {
             similar_progress: None,
             similar_candidates: HashMap::new(),
             similar_summary: None,
+            retouch_active: false,
+            brush_radius: 40.0,
         }
     }
 }
@@ -973,6 +983,51 @@ impl App {
     // Apply one-shot UI requests that need `self` beyond the frame: file dialogs,
     // batch AI actions, look capture/teach, trash/move/copy.
     fn handle_ui_requests(&mut self, requests: ui::UiRequests, needs_process: &mut bool) {
+        // Retouch layer: place a dab, drop one, or clear them all. Placing a
+        // dab searches the image that is on screen right now for a patch to
+        // copy, then stores the offset (and the colour correction that makes it
+        // blend) so every later render repeats the gesture from the live pixels.
+        if requests.retouch_clear {
+            if let Some(proc) = self.processor.as_mut() {
+                if !proc.retouch_spots.is_empty() {
+                    proc.retouch_spots.clear();
+                    *needs_process = true;
+                }
+            }
+        }
+        if let Some(index) = requests.retouch_remove {
+            if let Some(proc) = self.processor.as_mut() {
+                if index < proc.retouch_spots.len() {
+                    proc.retouch_spots.remove(index);
+                    *needs_process = true;
+                }
+            }
+        }
+        if let Some([x, y, radius]) = requests.retouch {
+            let mut placed = false;
+            if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
+                if proc.retouch_spots.len() < MAX_RETOUCH_SPOTS {
+                    if let Some((w, h)) = proc.image_size {
+                        if let Some(pixels) = proc.output_pixels(&gpu.device, &gpu.queue) {
+                            if let Some(sample) = retouch::find_sample(&pixels, w, h, x, y, radius)
+                            {
+                                proc.retouch_spots.push(RetouchSpot {
+                                    x,
+                                    y,
+                                    radius,
+                                    source: sample.source,
+                                    bias: sample.bias,
+                                });
+                                placed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if placed {
+                *needs_process = true;
+            }
+        }
         // Capture measures the reference as it is actually rendered on screen,
         // whatever produced that rendering — AI adjustment, hand-set sliders or
         // both. Reading the sliders instead would miss the AI LUT entirely,

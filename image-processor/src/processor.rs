@@ -47,6 +47,54 @@ fn combined_photo_lut(weights: [f32; 3]) -> Vec<f32> {
     result
 }
 
+/// Most spots one image can carry. Each is a fixed slot in a uniform buffer,
+/// so this is a hard cap rather than a growing allocation.
+pub const MAX_RETOUCH_SPOTS: usize = 64;
+
+/// Uniform buffer that carries the dab list to the shader: a four-float header
+/// (count + padding) followed by eight floats per spot.
+fn retouch_buffer_bytes() -> u64 {
+    ((4 + MAX_RETOUCH_SPOTS * 8) * std::mem::size_of::<f32>()) as u64
+}
+
+/// Pack the dab list into the shader's uniform layout: a four-float header
+/// (count plus padding) then two `vec4`s per spot. A free function so the
+/// layout the shader reads can be asserted without a GPU.
+fn pack_retouch_spots(spots: &[RetouchSpot]) -> Vec<f32> {
+    let mut data = vec![0f32; 4 + MAX_RETOUCH_SPOTS * 8];
+    let count = spots.len().min(MAX_RETOUCH_SPOTS);
+    data[0] = count as f32;
+    for (slot, spot) in spots[..count].iter().enumerate() {
+        let o = 4 + slot * 8;
+        // vec4 A = (x, y, radius, bias.r), vec4 B = (dx, dy, bias.g, bias.b)
+        data[o] = spot.x;
+        data[o + 1] = spot.y;
+        data[o + 2] = spot.radius;
+        data[o + 3] = spot.bias[0];
+        data[o + 4] = spot.source[0];
+        data[o + 5] = spot.source[1];
+        data[o + 6] = spot.bias[1];
+        data[o + 7] = spot.bias[2];
+    }
+    data
+}
+
+/// One healing-brush dab. Stored resolution-independently so a spot means the
+/// same thing whichever render resolution the image is reopened at: the centre
+/// is a fraction of width/height, `radius` a fraction of the shorter side, and
+/// `source` the offset (also fractions) to the patch that replaces this one.
+/// `bias` is the additive colour correction that makes the sampled patch match
+/// the surrounding pixels (the "healing" part of a healing brush), measured
+/// from the rendered image when the spot was placed.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RetouchSpot {
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub source: [f32; 2],
+    pub bias: [f32; 3],
+}
+
 // Everything that defines an image's edit, serialized to SQLite as JSON.
 // serde(default) keeps old DB rows loadable when new fields are added.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -92,6 +140,8 @@ pub struct EditState {
     // Reference-conditioned canonicalize/restylize transform.
     pub look_lut: Option<Vec<f32>>,
     pub look_strength: f32,
+    // Healing-brush layer: removable dabs composited after the edit chain.
+    pub retouch_spots: Vec<RetouchSpot>,
 }
 
 impl Default for EditState {
@@ -129,6 +179,7 @@ impl Default for EditState {
             look: Vec::new(),
             look_lut: None,
             look_strength: 1.0,
+            retouch_spots: Vec::new(),
         }
     }
 }
@@ -140,6 +191,8 @@ pub struct Processor {
     blur_h_pipeline: wgpu::ComputePipeline,
     blur_v_pipeline: wgpu::ComputePipeline,
     compute_bgl: wgpu::BindGroupLayout,
+    retouch_pipeline: wgpu::ComputePipeline,
+    retouch_bgl: wgpu::BindGroupLayout,
     display_pipeline: wgpu::ComputePipeline,
     display_bgl: wgpu::BindGroupLayout,
     // True when the device supports 16-bit integer input textures; false falls
@@ -149,18 +202,20 @@ pub struct Processor {
     input_tex: Option<wgpu::Texture>,
     source_tex: Option<wgpu::Texture>,
     source_image: Option<image::RgbaImage>,
-    tex1: Option<wgpu::Texture>,        // contrast output
-    tex2: Option<wgpu::Texture>,        // tonal output
-    tex3: Option<wgpu::Texture>,        // sharpen output
-    tex4: Option<wgpu::Texture>,        // blur_h output
-    output_tex: Option<wgpu::Texture>,  // blur_v output (final, half-float)
-    display_tex: Option<wgpu::Texture>, // 8-bit sRGB copy for the UI
+    tex1: Option<wgpu::Texture>,            // contrast output
+    tex2: Option<wgpu::Texture>,            // tonal output
+    tex3: Option<wgpu::Texture>,            // sharpen output
+    tex4: Option<wgpu::Texture>,            // blur_h output
+    pre_retouch_tex: Option<wgpu::Texture>, // blur_v output, before the retouch layer
+    output_tex: Option<wgpu::Texture>,      // retouch output (final, half-float)
+    display_tex: Option<wgpu::Texture>,     // 8-bit sRGB copy for the UI
 
     contrast_buf: wgpu::Buffer,
     tonal_buf: wgpu::Buffer,
     blur_buf: wgpu::Buffer,
     sharpen_buf: wgpu::Buffer,
     curve_buf: wgpu::Buffer,
+    retouch_buf: wgpu::Buffer,
 
     histogram_bgl: wgpu::BindGroupLayout,
     histogram_pipeline: wgpu::ComputePipeline,
@@ -227,6 +282,46 @@ fn create_compute_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 visibility: wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+// Retouch layer: the edit chain's result in, the same result with the healing
+// dabs composited on top out, and the dab list as a uniform.
+fn create_retouch_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
@@ -380,6 +475,21 @@ impl Processor {
 
         let histogram_bgl = create_histogram_bgl(device);
         let display_bgl = create_display_bgl(device);
+        let retouch_bgl = create_retouch_bgl(device);
+        let retouch_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[&retouch_bgl],
+                    push_constant_ranges: &[],
+                }),
+            ),
+            module: &shader,
+            entry_point: "retouch_pass",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
         let display_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
             layout: Some(
@@ -433,6 +543,8 @@ impl Processor {
             blur_h_pipeline: make_pipeline("blur_h_pass"),
             blur_v_pipeline: make_pipeline("blur_v_pass"),
             compute_bgl,
+            retouch_pipeline,
+            retouch_bgl,
             display_pipeline,
             display_bgl,
             input_u16: device
@@ -445,12 +557,14 @@ impl Processor {
             tex2: None,
             tex3: None,
             tex4: None,
+            pre_retouch_tex: None,
             output_tex: None,
             display_tex: None,
             contrast_buf: make_buf(48),
             tonal_buf: make_buf(48),
             blur_buf: make_buf(48),
             sharpen_buf: make_buf(48),
+            retouch_buf: make_buf(retouch_buffer_bytes()),
             curve_buf: device.create_buffer(&wgpu::BufferDescriptor {
                 label: None,
                 size: ((256 + 33 * 33 * 33 * 3) * 4) as u64,
@@ -724,6 +838,7 @@ impl Processor {
         self.tex2 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex3 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex4 = Some(make_intermediate(wgpu::TextureUsages::empty()));
+        self.pre_retouch_tex = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.output_tex = Some(make_intermediate(wgpu::TextureUsages::COPY_SRC));
         self.display_tex = Some(device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -938,14 +1053,30 @@ impl Processor {
         }
     }
 
+    // Write the retouch dab list into the uniform the shader reads.
+    fn write_retouch(&self, queue: &wgpu::Queue) {
+        let data = pack_retouch_spots(&self.retouch_spots);
+        queue.write_buffer(&self.retouch_buf, 0, bytemuck::cast_slice(&data));
+    }
+
     // mask anchors off clean signal, independent of the box-blur slider.
     pub fn process(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let (Some(input), Some(t1), Some(t2), Some(t3), Some(t4), Some(output), Some(display)) = (
+        let (
+            Some(input),
+            Some(t1),
+            Some(t2),
+            Some(t3),
+            Some(t4),
+            Some(pre),
+            Some(output),
+            Some(display),
+        ) = (
             self.input_tex.as_ref(),
             self.tex1.as_ref(),
             self.tex2.as_ref(),
             self.tex3.as_ref(),
             self.tex4.as_ref(),
+            self.pre_retouch_tex.as_ref(),
             self.output_tex.as_ref(),
             self.display_tex.as_ref(),
         ) else {
@@ -953,12 +1084,14 @@ impl Processor {
         };
 
         self.write_uniforms(queue);
+        self.write_retouch(queue);
 
         let iv = input.create_view(&wgpu::TextureViewDescriptor::default());
         let t1v = t1.create_view(&wgpu::TextureViewDescriptor::default());
         let t2v = t2.create_view(&wgpu::TextureViewDescriptor::default());
         let t3v = t3.create_view(&wgpu::TextureViewDescriptor::default());
         let t4v = t4.create_view(&wgpu::TextureViewDescriptor::default());
+        let pv = pre.create_view(&wgpu::TextureViewDescriptor::default());
         let ov = output.create_view(&wgpu::TextureViewDescriptor::default());
         let dv = display.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -994,7 +1127,25 @@ impl Processor {
         let tonal_bg = make_bg(&t1v, &t2v, &self.tonal_buf);
         let sharpen_bg = make_bg(&t2v, &t3v, &self.sharpen_buf);
         let blur_h_bg = make_bg(&t3v, &t4v, &self.blur_buf);
-        let blur_vert_bg = make_bg(&t4v, &ov, &self.blur_buf);
+        let blur_vert_bg = make_bg(&t4v, &pv, &self.blur_buf);
+        let retouch_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.retouch_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&pv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&ov),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.retouch_buf.as_entire_binding(),
+                },
+            ],
+        });
         let display_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.display_bgl,
@@ -1025,6 +1176,7 @@ impl Processor {
         dispatch(&self.sharpen_pipeline, &sharpen_bg);
         dispatch(&self.blur_h_pipeline, &blur_h_bg);
         dispatch(&self.blur_v_pipeline, &blur_vert_bg);
+        dispatch(&self.retouch_pipeline, &retouch_bg);
         dispatch(&self.display_pipeline, &display_bg);
         queue.submit([encoder.finish()]);
 
@@ -1793,7 +1945,130 @@ fn photo_lut_enabled(state: &EditState) -> bool {
 mod tests {
     use super::{
         combined_photo_lut, identity_photo_lut, percentile, photo_luts, EditState, LookProfile,
+        Processor, RetouchSpot, MAX_RETOUCH_SPOTS,
     };
+
+    // The shader reads the dab list as `vec4 a / vec4 b` per spot after a
+    // four-float header; this pins the packing those declarations decode.
+    #[test]
+    fn retouch_uniform_layout_matches_the_shader() {
+        let spot = RetouchSpot {
+            x: 0.25,
+            y: 0.5,
+            radius: 0.125,
+            source: [0.01, -0.02],
+            bias: [0.1, 0.2, 0.3],
+        };
+        let packed = super::pack_retouch_spots(std::slice::from_ref(&spot));
+        assert_eq!(packed.len() as u64 * 4, super::retouch_buffer_bytes());
+        assert_eq!(packed[0], 1.0);
+        // a = (x, y, radius, bias.r), b = (dx, dy, bias.g, bias.b)
+        assert_eq!(
+            &packed[4..12],
+            &[0.25, 0.5, 0.125, 0.1, 0.01, -0.02, 0.2, 0.3]
+        );
+        assert!(packed[12..].iter().all(|v| *v == 0.0));
+    }
+
+    // Integration test for the retouch pass: a dab must copy its source over
+    // the dab, honour the colour correction, leave the rest alone, and vanish
+    // when the spot is removed. Needs a GPU; skips quietly without one.
+    #[test]
+    fn retouch_layer_applies_and_reverses_a_dab() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let Some(adapter) = pollster::block_on(
+            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+        ) else {
+            eprintln!("no GPU adapter; skipping the retouch render test");
+            return;
+        };
+        let Ok((device, queue)) = pollster::block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor::default(), None),
+        ) else {
+            eprintln!("no GPU device; skipping the retouch render test");
+            return;
+        };
+
+        // 64x64, dark grey with a bright 13x13 patch at (14..=26, 14..=26).
+        let (w, h) = (64u32, 64u32);
+        let img = image::RgbaImage::from_fn(w, h, |x, y| {
+            let bright = (14..=26).contains(&x) && (14..=26).contains(&y);
+            let v = if bright { 230u8 } else { 40 };
+            image::Rgba([v, v, v, 255])
+        });
+        let mut proc = Processor::new(&device);
+        proc.upload_rgba(&img, &device, &queue);
+
+        let at = |px: &[u8], x: u32, y: u32| px[(y * w + x) as usize * 4];
+        let before = proc.output_pixels(&device, &queue).unwrap();
+        assert!(at(&before, 20, 20) > 200, "the bright patch should be present first");
+
+        // Dab over the patch, sourcing 32 px to the right (dark grey) with a
+        // +0.2 correction: 40/255 + 0.2 lands near 91.
+        proc.retouch_spots.push(RetouchSpot {
+            x: 20.0 / 64.0,
+            y: 20.0 / 64.0,
+            radius: 8.0 / 64.0,
+            source: [0.5, 0.0],
+            bias: [0.2, 0.2, 0.2],
+        });
+        proc.process(&device, &queue);
+        let after = proc.output_pixels(&device, &queue).unwrap();
+        let healed = at(&after, 20, 20);
+        assert!(
+            (80..=100).contains(&healed),
+            "dab centre should be the corrected source, got {healed}"
+        );
+        // Well outside the dab nothing may change.
+        assert_eq!(at(&after, 2, 2), at(&before, 2, 2), "outside the dab changed");
+        // The feather softens the rim rather than stepping.
+        let rim = at(&after, 20, 25);
+        assert!(
+            healed < rim && rim < at(&before, 20, 25),
+            "the rim should sit between the dab and the original: {healed} {rim}"
+        );
+
+        // Removing the dab restores the original pixels exactly.
+        proc.retouch_spots.clear();
+        proc.process(&device, &queue);
+        let restored = proc.output_pixels(&device, &queue).unwrap();
+        assert_eq!(restored, before, "clearing the dab should restore the render");
+    }
+
+    // Edits saved before the retouch layer existed must still load, and a dab
+    // must survive the SQLite JSON round trip unchanged.
+    #[test]
+    fn retouch_layer_round_trips_and_old_rows_still_load() {
+        let legacy: EditState = serde_json::from_str("{}").expect("a legacy row should load");
+        assert!(legacy.retouch_spots.is_empty());
+
+        let mut state = EditState::default();
+        state.retouch_spots.push(RetouchSpot {
+            x: 0.4,
+            y: 0.6,
+            radius: 0.05,
+            source: [-0.02, 0.03],
+            bias: [0.01, -0.02, 0.0],
+        });
+        let json = serde_json::to_string(&state).unwrap();
+        let back: EditState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.retouch_spots, state.retouch_spots);
+    }
+
+    #[test]
+    fn retouch_packing_caps_the_slot_count() {        let spots = vec![
+            RetouchSpot {
+                x: 0.0,
+                y: 0.0,
+                radius: 0.05,
+                source: [0.0, 0.0],
+                bias: [0.0; 3],
+            };
+            MAX_RETOUCH_SPOTS + 5
+        ];
+        let packed = super::pack_retouch_spots(&spots);
+        assert_eq!(packed[0], MAX_RETOUCH_SPOTS as f32);
+    }
 
     #[test]
     fn embedded_photo_luts_are_readable() {

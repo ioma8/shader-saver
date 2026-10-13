@@ -267,3 +267,68 @@ fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     textureStore(output_tex, vec2<i32>(gid.xy), vec4<f32>(rgb, c.a));
 }
+
+// Healing-brush layer. Each dab copies a patch of the same image -- chosen on
+// the CPU from the rendered pixels -- over its centre and feathers the join.
+// It runs after every other edit, so a retouch composes with later slider
+// changes and can be removed again without touching the source.
+struct Spot {
+    // centre.xy (0..1 of width/height), radius (fraction of the short side),
+    // additive colour correction's red channel.
+    a: vec4<f32>,
+    // source offset.xy (0..1 of width/height), colour correction's green/blue.
+    b: vec4<f32>,
+};
+
+struct RetouchParams {
+    count: f32,
+    _p0: f32,
+    _p1: f32,
+    _p2: f32,
+    spots: array<Spot, 64>,
+};
+
+@group(0) @binding(0) var retouch_in: texture_2d<f32>;
+@group(0) @binding(1) var retouch_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var<uniform> retouch: RetouchParams;
+
+// Bilinear tap from the read-only input, clamped at the edges.
+fn retouch_load(p: vec2<f32>, dims: vec2<f32>) -> vec4<f32> {
+    let f = clamp(p, vec2<f32>(0.0), dims - vec2<f32>(1.0));
+    let i0 = vec2<i32>(floor(f));
+    let last = vec2<i32>(dims) - vec2<i32>(1, 1);
+    let i1 = min(i0 + vec2<i32>(1, 1), last);
+    let t = fract(f);
+    let c00 = textureLoad(retouch_in, vec2<i32>(i0.x, i0.y), 0);
+    let c10 = textureLoad(retouch_in, vec2<i32>(i1.x, i0.y), 0);
+    let c01 = textureLoad(retouch_in, vec2<i32>(i0.x, i1.y), 0);
+    let c11 = textureLoad(retouch_in, i1, 0);
+    return mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+}
+
+@compute @workgroup_size(8, 8)
+fn retouch_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(retouch_in);
+    if gid.x >= dims.x || gid.y >= dims.y { return; }
+    var out = textureLoad(retouch_in, vec2<i32>(gid.xy), 0);
+    let count = u32(retouch.count);
+    if count > 0u {
+        let dimsf = vec2<f32>(f32(dims.x), f32(dims.y));
+        let short = min(dimsf.x, dimsf.y);
+        let q = vec2<f32>(f32(gid.x) + 0.5, f32(gid.y) + 0.5);
+        for (var i = 0u; i < count; i = i + 1u) {
+            let spot = retouch.spots[i];
+            let centre = spot.a.xy * dimsf;
+            let radius = max(spot.a.z * short, 1.0);
+            let d = distance(q, centre);
+            if d >= radius { continue; }
+            // Full strength in the middle, smoothly to nothing at the rim.
+            let w = smoothstep(1.0, 0.0, d / radius);
+            let sampled = retouch_load(q + spot.b.xy * dimsf, dimsf);
+            let bias = vec3<f32>(spot.a.w, spot.b.z, spot.b.w);
+            let healed = clamp(sampled.rgb + bias, vec3<f32>(0.0), vec3<f32>(1.0));
+            out = mix(out, vec4<f32>(healed, sampled.a), w);
+        }
+    }
+    textureStore(retouch_out, vec2<i32>(gid.xy), out);
+}

@@ -23,6 +23,11 @@ pub(crate) struct UiRequests {
     pub adjust_folder: bool,
     pub look_folder: bool,
     pub similar_cull: bool,
+    /// A dab to place: `[x, y, radius]`, all normalised to the image.
+    pub retouch: Option<[f32; 3]>,
+    /// Index of the dab to remove.
+    pub retouch_remove: Option<usize>,
+    pub retouch_clear: bool,
 }
 
 fn take<T: 'static + Default>(ctx: &egui::Context, key: &str) -> Option<T> {
@@ -47,6 +52,9 @@ pub(crate) fn take_requests(ctx: &egui::Context) -> UiRequests {
         adjust_folder: take::<bool>(ctx, KEY_ADJUST_FOLDER).is_some(),
         look_folder: take::<bool>(ctx, KEY_LOOK_FOLDER).is_some(),
         similar_cull: take::<bool>(ctx, KEY_SIMILAR_CULL).is_some(),
+        retouch: take(ctx, KEY_RETOUCH),
+        retouch_remove: take(ctx, KEY_RETOUCH_REMOVE),
+        retouch_clear: take::<bool>(ctx, KEY_RETOUCH_CLEAR).is_some(),
     }
 }
 
@@ -655,6 +663,124 @@ pub(crate) fn browse(
 
 // ---- Edit view -------------------------------------------------------------
 
+/// The retouch tool's on-screen layer: a marker ring for every dab, the brush
+/// cursor under the pointer, and the clicks that place or delete a dab.
+///
+/// Markers only exist while the tool is armed -- the dabs themselves live in
+/// the edit state, applied on the GPU, and stay once the tool is put away.
+#[allow(clippy::too_many_arguments)]
+fn paint_retouch(
+    ui: &egui::Ui,
+    panel_rect: egui::Rect,
+    img_rect: egui::Rect,
+    img_scale: f32,
+    brush_radius: f32,
+    response: &egui::Response,
+    ctx: &egui::Context,
+    spots: &[processor::RetouchSpot],
+) {
+    let painter = ui.painter().with_clip_rect(panel_rect);
+    let short = img_rect.width().min(img_rect.height());
+    // Normalised image coordinates -> screen. x and y are fractions of the
+    // width/height, while a dab's radius is a fraction of the shorter side.
+    let to_screen = |x: f32, y: f32| {
+        egui::pos2(
+            img_rect.min.x + x * img_rect.width(),
+            img_rect.min.y + y * img_rect.height(),
+        )
+    };
+    let brush_screen = (brush_radius * img_scale).max(2.0);
+    let pointer = response.hover_pos();
+
+    for spot in spots {
+        let c = to_screen(spot.x, spot.y);
+        let r = (spot.radius * short).max(3.0);
+        let hot = pointer.is_some_and(|p| (p - c).length() <= r.max(6.0));
+        painter.circle_filled(c, r, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24));
+        painter.add(egui::Shape::circle_stroke(
+            c,
+            r,
+            if hot {
+                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 132, 120))
+            } else {
+                egui::Stroke::new(1.0_f32, egui::Color32::WHITE)
+            },
+        ));
+        // A dark companion ring keeps the marker readable over bright pixels.
+        painter.add(egui::Shape::circle_stroke(
+            c,
+            r + 1.0,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120)),
+        ));
+    }
+
+    let Some(hover) = pointer.filter(|p| img_rect.contains(*p)) else {
+        return;
+    };
+
+    // Brush cursor: a white ring with a dark companion and a small crosshair.
+    let dark = egui::Stroke::new(2.0_f32, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+    let light = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+    painter.add(egui::Shape::circle_stroke(hover, brush_screen + 1.0, dark));
+    painter.add(egui::Shape::circle_stroke(hover, brush_screen, light));
+    painter.line_segment([hover - egui::vec2(4.0, 0.0), hover + egui::vec2(4.0, 0.0)], light);
+    painter.line_segment([hover - egui::vec2(0.0, 4.0), hover + egui::vec2(0.0, 4.0)], light);
+
+    // Left click heals the spot under the cursor.
+    if response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos().filter(|p| img_rect.contains(*p)) {
+            let (iw, ih) = (img_rect.width() / img_scale, img_rect.height() / img_scale);
+            let px = egui::vec2(
+                (pos.x - img_rect.min.x) / img_scale,
+                (pos.y - img_rect.min.y) / img_scale,
+            );
+            if px.x >= 0.0 && px.y >= 0.0 && px.x < iw && px.y < ih && iw > 1.0 && ih > 1.0 {
+                let radius = (brush_radius / iw.min(ih)).clamp(0.0015, 0.25);
+                ctx.data_mut(|d| {
+                    d.insert_temp(
+                        egui::Id::new(KEY_RETOUCH),
+                        [px.x / iw, px.y / ih, radius],
+                    );
+                });
+            }
+        }
+    }
+
+    // Right click a dab to delete it; when several overlap the nearest wins.
+    if response.secondary_clicked() {
+        if let Some(pos) = response.interact_pointer_pos().or(pointer) {
+            let mut hit: Option<(f32, usize)> = None;
+            for (index, spot) in spots.iter().enumerate() {
+                let c = to_screen(spot.x, spot.y);
+                let r = (spot.radius * short).max(6.0);
+                let d = (pos - c).length();
+                if d <= r && hit.is_none_or(|(best, _)| d < best) {
+                    hit = Some((d, index));
+                }
+            }
+            if let Some((_, index)) = hit {
+                ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_RETOUCH_REMOVE), index));
+            }
+        }
+    }
+}
+
+/// Brush-size step for one key event: -1 for `[`, +1 for `]`, 0 otherwise.
+///
+/// Matched on the **physical** key rather than the character it types: on the
+/// Czech layout `[` and `]` sit under `ú` and `)`, so a character match would
+/// miss them. The physical key is the same on every layout.
+fn brush_size_step(key: &egui::Key, physical_key: &Option<egui::Key>) -> i32 {
+    let is = |wanted: egui::Key| *key == wanted || *physical_key == Some(wanted);
+    if is(egui::Key::OpenBracket) {
+        -1
+    } else if is(egui::Key::CloseBracket) {
+        1
+    } else {
+        0
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn edit(
     ctx: &egui::Context,
@@ -682,6 +808,8 @@ pub(crate) fn edit(
     let current_is_raw = current_path.as_deref().is_some_and(imgload::is_raw);
     let tags_map = &mut app.tags;
     let tag_edit = &mut app.tag_edit;
+    let retouch_active = &mut app.retouch_active;
+    let brush_radius = &mut app.brush_radius;
     let thumbs = &app.thumbs;
     let view = &app.view;
     let image_tex_id = app.image_tex_id;
@@ -701,6 +829,48 @@ pub(crate) fn edit(
                             .id_salt("editor-controls-scroll")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let resp = ui
+                                .selectable_label(*retouch_active, "🩹 Retouch")
+                                .on_hover_text(
+                                    "Healing brush: click the photo to heal a spot.\n\
+                                     [ and ] change the size · right-click a dab to delete it",
+                                );
+                            if resp.clicked() {
+                                *retouch_active = !*retouch_active;
+                            }
+                            if *retouch_active {
+                                ui.label(
+                                    egui::RichText::new(format!("⌀ {:.0} px", *brush_radius * 2.0))
+                                        .small()
+                                        .color(egui::Color32::from_gray(150)),
+                                );
+                            }
+                        });
+                        if *retouch_active {
+                            ui.label(
+                                egui::RichText::new("Click to heal · [ / ] size")
+                                    .small()
+                                    .color(egui::Color32::from_gray(130)),
+                            );
+                        }
+                        let spots = processor.retouch_spots.len();
+                        if spots > 0 {
+                            if spots >= processor::MAX_RETOUCH_SPOTS {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Retouch limit reached ({})",
+                                        processor::MAX_RETOUCH_SPOTS
+                                    ))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(220, 170, 90)),
+                                );
+                            }
+                            if ui.button(format!("Clear {spots} retouch(es)")).clicked() {
+                                ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_RETOUCH_CLEAR), true));
+                            }
+                        }
+                        ui.separator();
                         egui::CollapsingHeader::new("Camera")
                             .default_open(true)
                             .show(ui, |ui| {
@@ -1472,10 +1642,40 @@ pub(crate) fn edit(
                         // and won't reach the threshold, so they don't flash the original.
                         let held_long_enough = preview_hold_start
                             .is_some_and(|t| now - t > 0.3);
-                        let show_original = ctx.input(|i| i.key_down(egui::Key::Space))
-                            || held_long_enough;
+                        // The retouch tool owns the click, so holding the button to
+                        // peek at the original would fight it.
+                        let show_original = (ctx.input(|i| i.key_down(egui::Key::Space))
+                            || held_long_enough)
+                            && !*retouch_active;
                         let show_reference = ctx.input(|i| i.key_down(egui::Key::R))
                             && reference_tex_id.is_some();
+
+                        // `[` and `]` resize the brush (see `brush_size_step`
+                        // for the layout handling).
+                        if *retouch_active {
+                            let step: i32 = ctx.input(|i| {
+                                i.events
+                                    .iter()
+                                    .map(|event| match event {
+                                        egui::Event::Key {
+                                            key,
+                                            physical_key,
+                                            pressed: true,
+                                            ..
+                                        } => brush_size_step(key, physical_key),
+                                        _ => 0,
+                                    })
+                                    .sum()
+                            });
+                            let min_dim =
+                                processor.image_size.map_or(2048.0, |(w, h)| w.min(h) as f32);
+                            if step < 0 {
+                                *brush_radius = (*brush_radius * 0.8).max(2.0);
+                            } else if step > 0 {
+                                *brush_radius = (*brush_radius * 1.25).min((min_dim * 0.25).max(8.0));
+                            }
+                        }
+
                         let tex_id = if show_reference {
                             reference_tex_id
                         } else if show_original {
@@ -1529,7 +1729,7 @@ pub(crate) fn edit(
                                     );
 
                                 // Double-click: toggle fit ↔ 100%
-                                if response.double_clicked() {
+                                if response.double_clicked() && !*retouch_active {
                                     if *zoom_fit {
                                         let cursor = response.hover_pos()
                                             .unwrap_or(panel_rect.center());
@@ -1543,6 +1743,21 @@ pub(crate) fn edit(
                                     } else {
                                         *zoom_fit = true;
                                     }
+                                }
+
+                                // Retouch layer: draw the dab markers and the brush
+                                // cursor, and turn clicks into dabs.
+                                if *retouch_active && !show_original && !show_reference {
+                                    paint_retouch(
+                                        ui,
+                                        panel_rect,
+                                        img_rect,
+                                        img_scale,
+                                        *brush_radius,
+                                        &response,
+                                        ctx,
+                                        &processor.retouch_spots,
+                                    );
                                 }
 
                                 // Scroll: zoom at cursor
@@ -1571,4 +1786,139 @@ pub(crate) fn edit(
                             );
                         }
                     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{brush_size_step, paint_retouch, take_requests, UiRequests};
+
+    #[test]
+    fn bracket_keys_resize_the_brush_on_any_layout() {
+        assert_eq!(brush_size_step(&egui::Key::OpenBracket, &None), -1);
+        assert_eq!(brush_size_step(&egui::Key::CloseBracket, &None), 1);
+        // Czech layout: the physical bracket keys type `ú` and `)`, so the
+        // logical key is not a bracket at all and only the physical one matches.
+        assert_eq!(
+            brush_size_step(&egui::Key::A, &Some(egui::Key::OpenBracket)),
+            -1
+        );
+        assert_eq!(
+            brush_size_step(&egui::Key::A, &Some(egui::Key::CloseBracket)),
+            1
+        );
+        // Unrelated keys, and a bracket press on some other physical key, do nothing.
+        assert_eq!(brush_size_step(&egui::Key::A, &None), 0);
+        assert_eq!(
+            brush_size_step(&egui::Key::OpenBracket, &Some(egui::Key::A)),
+            -1
+        );
+    }
+}
+
+// Drives one headless egui frame with the retouch layer over a fixed image
+// rectangle and returns the requests it produced. The image rect is placed
+// inside the panel so a click maps to a known image pixel.
+#[cfg(test)]
+fn retouch_frame(
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    spots: &[crate::processor::RetouchSpot],
+) -> UiRequests {
+    let img_rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(400.0, 300.0));
+    let input = egui::RawInput {
+        events,
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(800.0, 600.0),
+        )),
+        ..Default::default()
+    };
+    let _ = ctx.run(input, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let response = ui.interact(
+                ui.max_rect(),
+                ui.id().with("img_area"),
+                egui::Sense::click_and_drag(),
+            );
+            paint_retouch(
+                ui,
+                ui.max_rect(),
+                img_rect,
+                1.0,
+                40.0,
+                &response,
+                ctx,
+                spots,
+            );
+        });
+    });
+    take_requests(ctx)
+}
+
+#[cfg(test)]
+mod pointer_tests {
+    use super::retouch_frame;
+    use crate::processor::RetouchSpot;
+
+    fn button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn clicking_the_photo_queues_a_dab_where_the_pointer_is() {
+        let ctx = egui::Context::default();
+        // Hover, press, release: egui only reports a click once the button
+        // comes back up on the same widget.
+        retouch_frame(&ctx, vec![egui::Event::PointerMoved(egui::pos2(300.0, 200.0))], &[]);
+        retouch_frame(
+            &ctx,
+            vec![egui::Event::PointerMoved(egui::pos2(300.0, 200.0)), button(egui::pos2(300.0, 200.0), egui::PointerButton::Primary, true)],
+            &[],
+        );
+        let requests = retouch_frame(
+            &ctx,
+            vec![button(egui::pos2(300.0, 200.0), egui::PointerButton::Primary, false)],
+            &[],
+        );
+        // Image rect is 400x300 at (100, 50): (300, 200) is its exact centre,
+        // and the 40 px brush is 40 / 300 of the shorter side.
+        let dab = requests.retouch.expect("a dab should have been queued");
+        assert!((dab[0] - 0.5).abs() < 1e-4, "x = {}", dab[0]);
+        assert!((dab[1] - 0.5).abs() < 1e-4, "y = {}", dab[1]);
+        assert!((dab[2] - 40.0 / 300.0).abs() < 1e-6, "radius = {}", dab[2]);
+    }
+
+    #[test]
+    fn right_clicking_a_dab_queues_its_removal() {
+        let ctx = egui::Context::default();
+        let spots = vec![RetouchSpot {
+            x: 0.5,
+            y: 0.5,
+            radius: 0.1,
+            source: [0.2, 0.0],
+            bias: [0.0; 3],
+        }];
+        // Centre of the first dab: (100, 50) + (0.5, 0.5) * (400, 300).
+        let at = egui::pos2(300.0, 200.0);
+        retouch_frame(&ctx, vec![egui::Event::PointerMoved(at)], &spots);
+        retouch_frame(&ctx, vec![egui::Event::PointerMoved(at), button(at, egui::PointerButton::Secondary, true)], &spots);
+        let requests = retouch_frame(&ctx, vec![button(at, egui::PointerButton::Secondary, false)], &spots);
+        assert_eq!(requests.retouch_remove, Some(0));
+        assert!(requests.retouch.is_none(), "a right click must not place a dab");
+    }
+
+    #[test]
+    fn a_click_outside_the_photo_does_nothing() {
+        let ctx = egui::Context::default();
+        let far = egui::pos2(700.0, 550.0);
+        retouch_frame(&ctx, vec![egui::Event::PointerMoved(far)], &[]);
+        retouch_frame(&ctx, vec![egui::Event::PointerMoved(far), button(far, egui::PointerButton::Primary, true)], &[]);
+        let requests = retouch_frame(&ctx, vec![button(far, egui::PointerButton::Primary, false)], &[]);
+        assert!(requests.retouch.is_none());
+    }
 }
