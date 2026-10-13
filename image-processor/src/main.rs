@@ -639,6 +639,11 @@ struct App {
     retouch_status: Option<(String, f64)>,
     // Two-step guard on "clear every dab".
     retouch_confirm_clear: bool,
+    // Crop tool: whether it is armed, which aspect preset it locks to, and the
+    // drag in flight.
+    crop_active: bool,
+    crop_aspect: usize,
+    crop_drag: Option<ui::CropDrag>,
     // The UI state as it was last written to the database, so a change made
     // anywhere can be detected in one comparison.
     saved_ui: SavedUi,
@@ -747,6 +752,9 @@ impl App {
             brush_radius: 40.0,
             retouch_status: None,
             retouch_confirm_clear: false,
+            crop_active: false,
+            crop_aspect: 0,
+            crop_drag: None,
             saved_ui,
         }
     }
@@ -1149,6 +1157,7 @@ impl App {
         self.flags.zoom_fit = self.saved_ui.zoom_fit;
         self.retouch_status = None;
         self.retouch_confirm_clear = false;
+        self.crop_drag = None;
         self.view = View::Edit;
         self.current_path = Some(path.to_owned());
         self.selected = Some(path.to_owned());

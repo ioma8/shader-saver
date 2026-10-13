@@ -196,6 +196,11 @@ pub struct EditState {
     pub look_strength: f32,
     // Healing-brush layer: removable dabs composited after the edit chain.
     pub retouch_spots: Vec<RetouchSpot>,
+    /// Non-destructive crop, as `(x, y, w, h)` fractions of the input image.
+    /// The full frame `[0, 0, 1, 1]` means no crop. Snapped to whole pixels
+    /// whenever it is set, so the exported pixels are exactly the ones the
+    /// panel showed -- see `crop_px`.
+    pub crop: [f32; 4],
 }
 
 impl Default for EditState {
@@ -234,8 +239,74 @@ impl Default for EditState {
             look_lut: None,
             look_strength: 1.0,
             retouch_spots: Vec::new(),
+            crop: FULL_CROP,
         }
     }
+}
+
+/// No crop.
+pub const FULL_CROP: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// Take the crop out of a full-frame RGBA buffer, row by row. Split out of
+/// `export` so the pixels that reach a file can be checked without writing one.
+fn crop_pixels(pixels: &[u16], width: u32, crop: (u32, u32, u32, u32)) -> Vec<u16> {
+    let (x, y, w, h) = crop;
+    let mut out = Vec::with_capacity((w * h * 4) as usize);
+    for row in 0..h {
+        let start = (((y + row) * width + x) * 4) as usize;
+        let end = start + (w * 4) as usize;
+        if end > pixels.len() {
+            break;
+        }
+        out.extend_from_slice(&pixels[start..end]);
+    }
+    out
+}
+
+/// The crop as whole pixels `(x, y, w, h)` inside an image of `input` pixels.
+///
+/// Rounding to whole pixels is what makes a crop exact: the display draws this
+/// rect with no resampling and the exporter copies the same pixels, so what
+/// gets written out is what the panel showed.
+pub fn crop_px(crop: [f32; 4], input: (u32, u32)) -> (u32, u32, u32, u32) {
+    let (wf, hf) = (input.0 as f32, input.1 as f32);
+    let x0 = (crop[0] * wf).round().clamp(0.0, wf - 1.0);
+    let y0 = (crop[1] * hf).round().clamp(0.0, hf - 1.0);
+    let x1 = ((crop[0] + crop[2]) * wf).round().clamp(x0 + 1.0, wf);
+    let y1 = ((crop[1] + crop[3]) * hf).round().clamp(y0 + 1.0, hf);
+    (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32)
+}
+
+/// The crop covering the whole frame?
+pub fn is_full_crop(crop: [f32; 4], input: (u32, u32)) -> bool {
+    let (_, _, w, h) = crop_px(crop, input);
+    w == input.0 && h == input.1
+}
+
+/// The stored form of a whole-pixel crop rect given in pixels: rounded,
+/// clamped to the image, and back to fractions.
+pub fn crop_from_px(rect: (f32, f32, f32, f32), input: (u32, u32)) -> [f32; 4] {
+    let (wf, hf) = (input.0 as f32, input.1 as f32);
+    let x0 = rect.0.round().clamp(0.0, wf - 1.0);
+    let y0 = rect.1.round().clamp(0.0, hf - 1.0);
+    let x1 = rect.2.round().clamp(x0 + 1.0, wf);
+    let y1 = rect.3.round().clamp(y0 + 1.0, hf);
+    crop_fractions(
+        (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32),
+        input,
+    )
+}
+
+/// Fractions of the input image for a whole-pixel rect, so the stored crop and
+/// the pixel rect always agree.
+pub fn crop_fractions(px: (u32, u32, u32, u32), input: (u32, u32)) -> [f32; 4] {
+    let (wf, hf) = (input.0 as f32, input.1 as f32);
+    [
+        px.0 as f32 / wf,
+        px.1 as f32 / hf,
+        px.2 as f32 / wf,
+        px.3 as f32 / hf,
+    ]
 }
 
 pub struct Processor {
@@ -275,6 +346,8 @@ pub struct Processor {
     histogram_pipeline: wgpu::ComputePipeline,
     histogram_buf: wgpu::Buffer,
     histogram_staging: wgpu::Buffer,
+    /// Origin and size of the region the histogram measures (the crop).
+    histogram_window: wgpu::Buffer,
     pub histogram: [u32; 256],
 
     pub image_size: Option<(u32, u32)>,
@@ -438,6 +511,16 @@ fn create_histogram_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     })
 }
@@ -589,6 +672,12 @@ impl Processor {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let histogram_window = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Self {
             contrast_pipeline: make_pipeline("contrast_pass"),
@@ -629,6 +718,7 @@ impl Processor {
             histogram_pipeline,
             histogram_buf,
             histogram_staging,
+            histogram_window,
             histogram: [0u32; 256],
             image_size: None,
             state: EditState::default(),
@@ -1077,10 +1167,15 @@ impl Processor {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         hist_view: &wgpu::TextureView,
-        w: u32,
-        h: u32,
+        window: (u32, u32, u32, u32),
     ) {
+        let (x, y, w, h) = window;
         queue.write_buffer(&self.histogram_buf, 0, &[0u8; 1024]);
+        queue.write_buffer(
+            &self.histogram_window,
+            0,
+            bytemuck::cast_slice(&[x, y, w, h]),
+        );
         let hist_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.histogram_bgl,
@@ -1092,6 +1187,10 @@ impl Processor {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: self.histogram_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.histogram_window.as_entire_binding(),
                 },
             ],
         });
@@ -1250,7 +1349,8 @@ impl Processor {
         queue.submit([encoder.finish()]);
 
         // Separate submission: display write must be visible before histogram reads.
-        self.read_histogram(device, queue, &dv, w, h);
+        // The histogram describes the crop, not the whole sensor frame.
+        self.read_histogram(device, queue, &dv, crop_px(self.crop, (w, h)));
     }
 
     /// The pixels the retouch pass will sample from -- the image after every
@@ -1437,9 +1537,15 @@ impl Processor {
 
         // File I/O on a background thread so the main thread is unblocked
         let path = path.to_owned();
+        // Only the crop is written out; otherwise the file would not match what
+        // the panel shows. The rect is the same whole-pixel one used there, so
+        // no resampling is involved.
+        let crop = crop_px(self.crop, (width, height));
+        let (cw, ch) = (crop.2, crop.3);
         std::thread::spawn(move || {
+            let cropped = crop_pixels(&pixels, width, crop);
             if let Some(img) =
-                image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(width, height, pixels)
+                image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(cw, ch, cropped)
             {
                 img.save(path).ok();
             }
@@ -2100,6 +2206,53 @@ mod tests {
 
     // The shader reads the dab list as `vec4 a / vec4 b` per spot after a
     // four-float header; this pins the packing those declarations decode.
+    // The crop has to survive the round trip through whole pixels, or the panel
+    // and the export would drift apart by a pixel at a time.
+    #[test]
+    fn crop_pixel_rects_are_stable_and_clamped() {
+        let input = (6000u32, 4000u32);
+        assert!(super::is_full_crop(super::FULL_CROP, input));
+        assert_eq!(super::crop_px(super::FULL_CROP, input), (0, 0, 6000, 4000));
+
+        // An arbitrary rect, and then its own fractions again: idempotent.
+        let crop = super::crop_from_px((1500.2, 900.7, 4500.4, 3300.1), input);
+        let px = super::crop_px(crop, input);
+        assert_eq!(px, (1500, 901, 3000, 2399));
+        assert_eq!(super::crop_px(super::crop_from_px(
+            (px.0 as f32, px.1 as f32, (px.0 + px.2) as f32, (px.1 + px.3) as f32),
+            input,
+        ), input), px);
+        assert!(!super::is_full_crop(crop, input));
+
+        // Silly rects come back inside the image at a usable size.
+        let (x, y, w, h) = super::crop_px(super::crop_from_px((-50.0, -50.0, 10.0, 10.0), input), input);
+        assert!(x + w <= input.0 && y + h <= input.1);
+        assert!(w >= 1 && h >= 1);
+        let (_, _, w, h) = super::crop_px(super::crop_from_px((0.0, 0.0, 99999.0, 99999.0), input), input);
+        assert_eq!((w, h), input);
+    }
+
+    // What reaches the file is exactly the crop rect, pixel for pixel.
+    #[test]
+    fn exporting_takes_exactly_the_crop() {
+        // 4x3 image, each pixel tagged with its index in red.
+        let (w, h) = (4u32, 3u32);
+        let mut pixels = vec![0u16; (w * h * 4) as usize];
+        for i in 0..(w * h) as usize {
+            pixels[i * 4] = (i * 100) as u16;
+        }
+        let (x, y, cw, ch) = super::crop_px([0.25, 0.0, 0.5, 2.0 / 3.0], (w, h));
+        assert_eq!((x, y, cw, ch), (1, 0, 2, 2));
+        let cropped = super::crop_pixels(&pixels, w, (x, y, cw, ch));
+        assert_eq!(cropped.len(), (cw * ch * 4) as usize);
+        assert_eq!(
+            cropped.iter().step_by(4).copied().collect::<Vec<_>>(),
+            vec![100, 200, 500, 600]
+        );
+        // The whole frame is a straight copy.
+        assert_eq!(super::crop_pixels(&pixels, w, (0, 0, w, h)), pixels);
+    }
+
     #[test]
     fn retouch_uniform_layout_matches_the_shader() {
         let spot = RetouchSpot {

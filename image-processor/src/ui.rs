@@ -698,13 +698,297 @@ fn step_brush(min_dim: f32, radius: f32, steps: i32) -> f32 {
     brush_radius_px(min_dim, r)
 }
 
-/// Where the retouch overlay draws for one frame: the panel it is clipped to,
-/// the image's rectangle on screen, the display scale, and the brush size.
-struct RetouchView {
+/// Crop aspect presets, by index. 0 is free-form, 1 is the image's own aspect;
+/// the rest are fixed ratios.
+const CROP_ASPECTS: [&str; 8] = ["Free", "Original", "1:1", "4:5", "5:4", "3:2", "2:3", "16:9"];
+
+/// The width/height ratio a preset locks to, if any.
+fn aspect_ratio(index: usize, input: (f32, f32)) -> Option<f32> {
+    match index {
+        0 => None,
+        1 => Some(input.0 / input.1),
+        2 => Some(1.0),
+        3 => Some(4.0 / 5.0),
+        4 => Some(5.0 / 4.0),
+        5 => Some(3.0 / 2.0),
+        6 => Some(2.0 / 3.0),
+        _ => Some(16.0 / 9.0),
+    }
+}
+
+/// Smallest crop, in image pixels: below this the handles overlap and the
+/// result is useless.
+const MIN_CROP_PX: f32 = 16.0;
+
+/// A crop rectangle as `(x0, y0, x1, y1)` in image pixels.
+type CropPx = (f32, f32, f32, f32);
+
+/// Reshape a crop to a fixed width/height ratio about its centre, shrinking it
+/// if the image cannot hold that shape at the current size.
+fn crop_with_aspect(rect: CropPx, input: (f32, f32), ratio: f32) -> CropPx {
+    let (cx, cy) = ((rect.0 + rect.2) * 0.5, (rect.1 + rect.3) * 0.5);
+    let (mut w, mut h) = (rect.2 - rect.0, rect.3 - rect.1);
+    if w / h > ratio {
+        w = h * ratio;
+    } else {
+        h = w / ratio;
+    }
+    crop_inside((cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5), input)
+}
+
+/// Shrink and slide a crop until it sits inside the image at a usable size,
+/// keeping its centre where it can.
+fn crop_inside(rect: CropPx, input: (f32, f32)) -> CropPx {
+    let w = (rect.2 - rect.0).clamp(MIN_CROP_PX.min(input.0), input.0);
+    let h = (rect.3 - rect.1).clamp(MIN_CROP_PX.min(input.1), input.1);
+    let cx = ((rect.0 + rect.2) * 0.5).clamp(w * 0.5, input.0 - w * 0.5);
+    let cy = ((rect.1 + rect.3) * 0.5).clamp(h * 0.5, input.1 - h * 0.5);
+    (cx - w * 0.5, cy - h * 0.5, cx + w * 0.5, cy + h * 0.5)
+}
+
+/// Where a drag leaves the crop. `sides` names the edges the pointer drags
+/// (bit 0 left, 1 right, 2 top, 3 bottom; zero moves the whole rectangle).
+/// With an aspect lock the rectangle is reshaped about its centre, the
+/// dominant finger axis deciding which way; it never crosses over itself, drops
+/// below [`MIN_CROP_PX`], or leaves the image.
+fn drag_crop(
+    rect: CropPx,
+    input: (f32, f32),
+    sides: u8,
+    delta: egui::Vec2,
+    aspect: Option<f32>,
+) -> CropPx {
+    const LEFT: u8 = 1;
+    const RIGHT: u8 = 2;
+    const TOP: u8 = 4;
+    const BOTTOM: u8 = 8;
+    let (mut x0, mut y0, mut x1, mut y1) = rect;
+    if sides == 0 {
+        return crop_inside(
+            (x0 + delta.x, y0 + delta.y, x1 + delta.x, y1 + delta.y),
+            input,
+        );
+    }
+    let min_w = MIN_CROP_PX.min(input.0);
+    let min_h = MIN_CROP_PX.min(input.1);
+    if sides & LEFT != 0 {
+        x0 = (x0 + delta.x).min(x1 - min_w);
+    }
+    if sides & RIGHT != 0 {
+        x1 = (x1 + delta.x).max(x0 + min_w);
+    }
+    if sides & TOP != 0 {
+        y0 = (y0 + delta.y).min(y1 - min_h);
+    }
+    if sides & BOTTOM != 0 {
+        y1 = (y1 + delta.y).max(y0 + min_h);
+    }
+    if let Some(ratio) = aspect {
+        let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        let (mut w, mut h) = (x1 - x0, y1 - y0);
+        let horizontal = sides & (LEFT | RIGHT) != 0;
+        let vertical = sides & (TOP | BOTTOM) != 0;
+        let width_drives = if horizontal && vertical {
+            delta.x.abs() / w.max(1.0) >= delta.y.abs() / h.max(1.0)
+        } else {
+            horizontal
+        };
+        if width_drives {
+            h = w / ratio;
+        } else {
+            w = h * ratio;
+        }
+        x0 = cx - w * 0.5;
+        x1 = cx + w * 0.5;
+        y0 = cy - h * 0.5;
+        y1 = cy + h * 0.5;
+    }
+    crop_inside((x0, y0, x1, y1), input)
+}
+
+/// Maps between image coordinates (fractions of the input image) and the
+/// screen, through whatever crop the panel is showing. Everything that has to
+/// place something on the image goes through here, so a crop carries the
+/// retouch markers with the pixels instead of leaving them behind.
+#[derive(Clone, Copy)]
+struct ImageView {
+    /// Screen rectangle the displayed image occupies.
+    rect: egui::Rect,
+    /// Which part of the input image it shows, as `(x, y, w, h)` fractions.
+    uv: [f32; 4],
+    /// Input image size, in pixels.
+    input: (f32, f32),
+}
+
+impl ImageView {
+    fn to_screen(&self, x: f32, y: f32) -> egui::Pos2 {
+        egui::pos2(
+            self.rect.min.x + (x - self.uv[0]) / self.uv[2] * self.rect.width(),
+            self.rect.min.y + (y - self.uv[1]) / self.uv[3] * self.rect.height(),
+        )
+    }
+
+    fn to_input(&self, p: egui::Pos2) -> [f32; 2] {
+        [
+            self.uv[0] + (p.x - self.rect.min.x) / self.rect.width() * self.uv[2],
+            self.uv[1] + (p.y - self.rect.min.y) / self.rect.height() * self.uv[3],
+        ]
+    }
+
+    /// Screen length of one input-image pixel. The fit preserves the aspect, so
+    /// the two axes agree; x is used for both.
+    fn px_scale(&self) -> f32 {
+        self.rect.width() / (self.uv[2] * self.input.0)
+    }
+}
+
+/// What the pointer is doing to the crop rectangle.
+#[derive(Clone, Copy)]
+pub(crate) struct CropDrag {
+    /// Edges the pointer drags: bit 0 left, 1 right, 2 top, 3 bottom. Zero
+    /// moves the whole rectangle.
+    pub(crate) sides: u8,
+}
+
+/// Which edges of the crop a pointer near `p` grabs: bit 0 left, 1 right,
+/// 2 top, 3 bottom, zero to move the whole rectangle. `None` when the pointer is
+/// away from the rectangle, so a drag elsewhere leaves it alone.
+fn crop_handle(rect: egui::Rect, p: egui::Pos2, reach: f32) -> Option<u8> {
+    if p.x < rect.left() - reach
+        || p.x > rect.right() + reach
+        || p.y < rect.top() - reach
+        || p.y > rect.bottom() + reach
+    {
+        return None;
+    }
+    let mut sides = 0u8;
+    if (p.x - rect.left()).abs() <= reach {
+        sides |= 1;
+    }
+    if (p.x - rect.right()).abs() <= reach {
+        sides |= 2;
+    }
+    if (p.y - rect.top()).abs() <= reach {
+        sides |= 4;
+    }
+    if (p.y - rect.bottom()).abs() <= reach {
+        sides |= 8;
+    }
+    Some(sides)
+}
+
+/// The crop tool's layer: the rectangle with everything outside it dimmed, its
+/// handles, and the drag that resizes it. It is drawn against the *whole*
+/// frame, which is what you crop against. Returns the new crop when the drag
+/// moved it.
+#[allow(clippy::too_many_arguments)]
+fn paint_crop_tool(
+    ui: &egui::Ui,
     panel: egui::Rect,
-    image: egui::Rect,
-    scale: f32,
-    brush_radius: f32,
+    view: &ImageView,
+    crop: CropPx,
+    input: (f32, f32),
+    aspect: Option<f32>,
+    drag: &mut Option<CropDrag>,
+    response: &egui::Response,
+    ctx: &egui::Context,
+) -> Option<CropPx> {
+    let painter = ui.painter().with_clip_rect(panel);
+    let rect = egui::Rect::from_min_max(
+        view.to_screen(crop.0 / input.0, crop.1 / input.1),
+        view.to_screen(crop.2 / input.0, crop.3 / input.1),
+    );
+
+    // Everything outside the crop goes dark.
+    let dim = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 140);
+    for band in [
+        egui::Rect::from_min_max(panel.min, egui::pos2(panel.right(), rect.top())),
+        egui::Rect::from_min_max(egui::pos2(panel.left(), rect.bottom()), panel.max),
+        egui::Rect::from_min_max(
+            egui::pos2(panel.left(), rect.top()),
+            egui::pos2(rect.left(), rect.bottom()),
+        ),
+        egui::Rect::from_min_max(
+            egui::pos2(rect.right(), rect.top()),
+            egui::pos2(panel.right(), rect.bottom()),
+        ),
+    ] {
+        painter.rect_filled(band, 0.0, dim);
+    }
+
+    // Rule of thirds, so the crop is easy to place.
+    let guide = egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60));
+    for i in 1..3 {
+        let t = i as f32 / 3.0;
+        let x = rect.left() + rect.width() * t;
+        let y = rect.top() + rect.height() * t;
+        painter.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())], guide);
+        painter.line_segment([egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)], guide);
+    }
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(
+            if drag.is_some() { 2.0_f32 } else { 1.0_f32 },
+            egui::Color32::WHITE,
+        ),
+    );
+    let handle = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220);
+    for (hx, hy) in [
+        (rect.left(), rect.top()),
+        (rect.center().x, rect.top()),
+        (rect.right(), rect.top()),
+        (rect.left(), rect.center().y),
+        (rect.right(), rect.center().y),
+        (rect.left(), rect.bottom()),
+        (rect.center().x, rect.bottom()),
+        (rect.right(), rect.bottom()),
+    ] {
+        painter.rect_filled(
+            egui::Rect::from_center_size(egui::pos2(hx, hy), egui::vec2(7.0, 7.0)),
+            1.0,
+            handle,
+        );
+    }
+
+    // Grab reach shrinks with the rectangle, so a small crop can still be moved
+    // rather than being all handle.
+    let reach = 10.0_f32.min(rect.width() / 3.0).min(rect.height() / 3.0).max(2.0);
+    let grabbed = response.hover_pos().and_then(|p| crop_handle(rect, p, reach));
+    if drag.is_none() {
+        if let Some(sides) = grabbed {
+            let horizontal = sides & (1 | 2) != 0;
+            let vertical = sides & (4 | 8) != 0;
+            ctx.set_cursor_icon(match (horizontal, vertical) {
+                (true, true) => egui::CursorIcon::ResizeNwSe,
+                (true, false) => egui::CursorIcon::ResizeHorizontal,
+                (false, true) => egui::CursorIcon::ResizeVertical,
+                (false, false) => egui::CursorIcon::Move,
+            });
+        }
+    }
+
+    if response.drag_started() {
+        *drag = grabbed.map(|sides| CropDrag { sides });
+    }
+    let mut moved = None;
+    if response.dragged() {
+        if let Some(state) = *drag {
+            // The pointer delta is in screen points; the crop lives in pixels.
+            let scale = view.px_scale().max(1e-6);
+            moved = Some(drag_crop(
+                crop,
+                input,
+                state.sides,
+                response.drag_delta() / scale,
+                aspect,
+            ));
+        }
+    }
+    if response.drag_stopped() {
+        *drag = None;
+    }
+    moved
 }
 
 /// The retouch tool's on-screen layer: a marker ring for every dab, the brush
@@ -712,31 +996,27 @@ struct RetouchView {
 ///
 /// Markers only exist while the tool is armed -- the dabs themselves live in
 /// the edit state, applied on the GPU, and stay once the tool is put away.
+/// Everything is placed through the [`ImageView`], so a crop carries the
+/// markers with the pixels.
 fn paint_retouch(
     ui: &egui::Ui,
-    view: &RetouchView,
+    panel: egui::Rect,
+    view: &ImageView,
+    brush_radius: f32,
     response: &egui::Response,
     ctx: &egui::Context,
     spots: &[processor::RetouchSpot],
 ) {
-    let RetouchView {
-        panel,
-        image,
-        scale,
-        brush_radius,
-    } = *view;
     let painter = ui.painter().with_clip_rect(panel);
-    let short = image.width().min(image.height());
-    // Normalised image coordinates -> screen. x and y are fractions of the
-    // width/height, while a dab's radius is a fraction of the shorter side.
-    let to_screen = |x: f32, y: f32| {
-        egui::pos2(
-            image.min.x + x * image.width(),
-            image.min.y + y * image.height(),
+    // A dab's radius is a fraction of the input image's shorter side.
+    let short = view.input.0.min(view.input.1);
+    let ring = |spot: &processor::RetouchSpot| {
+        (
+            view.to_screen(spot.x, spot.y),
+            (spot.radius * short * view.px_scale()).max(3.0),
         )
     };
-    let ring = |spot: &processor::RetouchSpot| (to_screen(spot.x, spot.y), (spot.radius * short).max(3.0));
-    let brush_screen = (brush_radius * scale).max(2.0);
+    let brush_screen = (brush_radius * view.px_scale()).max(2.0);
     let pointer = response.hover_pos();
 
     // The dab a click acts on is the last one drawn there -- the one on top,
@@ -773,7 +1053,7 @@ fn paint_retouch(
         ));
     }
 
-    let Some(hover) = pointer.filter(|p| image.contains(*p)) else {
+    let Some(hover) = pointer.filter(|p| view.rect.contains(*p)) else {
         return;
     };
 
@@ -785,18 +1065,15 @@ fn paint_retouch(
     painter.line_segment([hover - egui::vec2(4.0, 0.0), hover + egui::vec2(4.0, 0.0)], light);
     painter.line_segment([hover - egui::vec2(0.0, 4.0), hover + egui::vec2(0.0, 4.0)], light);
 
-    // Left click heals the spot under the cursor.
+    // Left click heals the spot under the cursor. The click arrives in the
+    // displayed (possibly cropped) frame and is stored against the whole image.
     if response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos().filter(|p| image.contains(*p)) {
-            let (iw, ih) = (image.width() / scale, image.height() / scale);
-            let px = egui::vec2(
-                (pos.x - image.min.x) / scale,
-                (pos.y - image.min.y) / scale,
-            );
-            if px.x >= 0.0 && px.y >= 0.0 && px.x < iw && px.y < ih && iw > 1.0 && ih > 1.0 {
-                let radius = brush_radius_px(iw.min(ih), brush_radius) / iw.min(ih);
+        if let Some(pos) = response.interact_pointer_pos().filter(|p| view.rect.contains(*p)) {
+            let [x, y] = view.to_input(pos);
+            if (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y) {
+                let radius = (brush_radius / short).clamp(0.0015, 0.25);
                 ctx.data_mut(|d| {
-                    d.insert_temp(egui::Id::new(KEY_RETOUCH), [px.x / iw, px.y / ih, radius]);
+                    d.insert_temp(egui::Id::new(KEY_RETOUCH), [x, y, radius]);
                 });
             }
         }
@@ -857,6 +1134,9 @@ pub(crate) fn edit(
     let brush_radius = &mut app.brush_radius;
     let retouch_status = &mut app.retouch_status;
     let retouch_confirm_clear = &mut app.retouch_confirm_clear;
+    let crop_active = &mut app.crop_active;
+    let crop_aspect = &mut app.crop_aspect;
+    let crop_drag = &mut app.crop_drag;
     let thumbs = &app.thumbs;
     let view = &app.view;
     let image_tex_id = app.image_tex_id;
@@ -886,6 +1166,8 @@ pub(crate) fn edit(
                             if resp.clicked() {
                                 *retouch_active = !*retouch_active;
                                 *retouch_confirm_clear = false;
+                                // One tool owns the pointer at a time.
+                                *crop_active = false;
                             }
                             if *retouch_active {
                                 ui.label(
@@ -949,6 +1231,65 @@ pub(crate) fn edit(
                                         *retouch_confirm_clear = false;
                                     }
                                 });
+                            }
+                        }
+                        let crop_input = processor.image_size.unwrap_or((1, 1));
+                        let crop_ratio = aspect_ratio(*crop_aspect, (crop_input.0 as f32, crop_input.1 as f32));
+                        ui.horizontal(|ui| {
+                            let resp = ui
+                                .selectable_label(*crop_active, "⛶ Crop")
+                                .on_hover_text(
+                                    "Crop the frame: drag the corners or edges, or inside \
+                                     to move it. Non-destructive.",
+                                );
+                            if resp.clicked() {
+                                *crop_active = !*crop_active;
+                                // One tool owns the pointer at a time, and a
+                                // crop is placed against the whole frame.
+                                *retouch_active = false;
+                                if *crop_active {
+                                    *zoom_fit = true;
+                                }
+                            }
+                            let (_, _, cw, ch) = processor::crop_px(processor.crop, crop_input);
+                            if !processor::is_full_crop(processor.crop, crop_input) {
+                                ui.label(
+                                    egui::RichText::new(format!("{cw}×{ch}"))
+                                        .small()
+                                        .color(egui::Color32::from_gray(150)),
+                                );
+                            }
+                        });
+                        if *crop_active {
+                            let mut preset = None;
+                            ui.horizontal_wrapped(|ui| {
+                                for (index, label) in CROP_ASPECTS.iter().enumerate() {
+                                    if ui
+                                        .selectable_value(crop_aspect, index, *label)
+                                        .changed()
+                                    {
+                                        preset = Some(index);
+                                    }
+                                }
+                            });
+                            // Locking a ratio reshapes the crop straight away,
+                            // so the setting is visible without touching a handle.
+                            if let (Some(index), Some(ratio)) = (preset, crop_ratio) {
+                                let (x, y, w, h) = processor::crop_px(processor.crop, crop_input);
+                                let rect = (x as f32, y as f32, (x + w) as f32, (y + h) as f32);
+                                let reshaped = crop_with_aspect(
+                                    rect,
+                                    (crop_input.0 as f32, crop_input.1 as f32),
+                                    ratio,
+                                );
+                                processor.crop =
+                                    processor::crop_from_px(reshaped, crop_input);
+                                *needs_process = true;
+                                let _ = index;
+                            }
+                            if ui.button("Reset crop").clicked() {
+                                processor.crop = processor::FULL_CROP;
+                                *needs_process = true;
                             }
                         }
                         ui.separator();
@@ -1772,11 +2113,25 @@ pub(crate) fn edit(
                             if let Some((iw, ih)) = display_size {
                                 let iw = iw as f32;
                                 let ih = ih as f32;
-                                let fit_scale = (panel_size.x / iw).min(panel_size.y / ih);
+                                // What the panel shows: the crop -- unless the
+                                // crop tool is open, or an original/reference
+                                // is being held, either of which shows the whole
+                                // frame. The image texture is always the whole
+                                // frame, so showing a crop is just a uv window
+                                // onto it, with no resampling.
+                                let whole_frame = *crop_active || show_original || show_reference;
+                                let uv = if whole_frame || show_reference {
+                                    [0.0, 0.0, 1.0, 1.0]
+                                } else {
+                                    let px = processor::crop_px(processor.crop, (iw as u32, ih as u32));
+                                    processor::crop_fractions(px, (iw as u32, ih as u32))
+                                };
+                                let (vw, vh) = (uv[2] * iw, uv[3] * ih);
+                                let fit_scale = (panel_size.x / vw).min(panel_size.y / vh);
 
                                 let (img_offset, img_scale) = if *zoom_fit {
-                                    let fw = iw * fit_scale;
-                                    let fh = ih * fit_scale;
+                                    let fw = vw * fit_scale;
+                                    let fh = vh * fit_scale;
                                     (egui::vec2(
                                         (panel_size.x - fw) / 2.0,
                                         (panel_size.y - fh) / 2.0,
@@ -1789,21 +2144,26 @@ pub(crate) fn edit(
                                 // swipe. egui reports the swipe in "how the
                                 // content should move" units -- the same as a
                                 // drag delta -- so both just add to the offset
-                                // and the image follows the fingers.
-                                let delta = pan_delta(
-                                    *zoom_fit,
-                                    is_dragging.then(|| response.drag_delta()),
-                                    if response.hovered() {
-                                        ctx.input(|i| i.smooth_scroll_delta)
-                                    } else {
-                                        egui::Vec2::ZERO
-                                    },
-                                );
+                                // and the image follows the fingers. The crop
+                                // tool owns the pointer, so nothing moves then.
+                                let delta = if *crop_active {
+                                    egui::Vec2::ZERO
+                                } else {
+                                    pan_delta(
+                                        *zoom_fit,
+                                        is_dragging.then(|| response.drag_delta()),
+                                        if response.hovered() {
+                                            ctx.input(|i| i.smooth_scroll_delta)
+                                        } else {
+                                            egui::Vec2::ZERO
+                                        },
+                                    )
+                                };
                                 *zoom_offset += delta;
 
                                 let img_rect = egui::Rect::from_min_size(
                                     panel_rect.min + img_offset,
-                                    egui::vec2(iw * img_scale, ih * img_scale),
+                                    egui::vec2(vw * img_scale, vh * img_scale),
                                 );
 
                                 ui.painter()
@@ -1812,14 +2172,20 @@ pub(crate) fn edit(
                                         tid,
                                         img_rect,
                                         egui::Rect::from_min_max(
-                                            egui::pos2(0.0, 0.0),
-                                            egui::pos2(1.0, 1.0),
+                                            egui::pos2(uv[0], uv[1]),
+                                            egui::pos2(uv[0] + uv[2], uv[1] + uv[3]),
                                         ),
                                         egui::Color32::WHITE,
                                     );
 
+                                let view = ImageView {
+                                    rect: img_rect,
+                                    uv,
+                                    input: (iw, ih),
+                                };
+
                                 // Double-click: toggle fit ↔ 100%
-                                if response.double_clicked() && !*retouch_active {
+                                if response.double_clicked() && !*retouch_active && !*crop_active {
                                     if *zoom_fit {
                                         let cursor = response.hover_pos()
                                             .unwrap_or(panel_rect.center());
@@ -1835,17 +2201,51 @@ pub(crate) fn edit(
                                     }
                                 }
 
+                                // Crop tool: the rectangle, its handles, and the
+                                // drag that resizes it.
+                                if *crop_active && !show_original && !show_reference {
+                                    let input_px = (iw.max(1.0), ih.max(1.0));
+                                    let crop_px = {
+                                        let (x, y, w, h) = processor::crop_px(
+                                            processor.crop,
+                                            (iw as u32, ih as u32),
+                                        );
+                                        (x as f32, y as f32, (x + w) as f32, (y + h) as f32)
+                                    };
+                                    let ratio = aspect_ratio(*crop_aspect, input_px);
+                                    if let Some(moved) = paint_crop_tool(
+                                        ui,
+                                        panel_rect,
+                                        &view,
+                                        crop_px,
+                                        input_px,
+                                        ratio,
+                                        crop_drag,
+                                        &response,
+                                        ctx,
+                                    ) {
+                                        let snapped = (
+                                            moved.0.round(),
+                                            moved.1.round(),
+                                            moved.2.round(),
+                                            moved.3.round(),
+                                        );
+                                        processor.crop = processor::crop_from_px(
+                                            snapped,
+                                            (iw as u32, ih as u32),
+                                        );
+                                        *needs_process = true;
+                                    }
+                                }
+
                                 // Retouch layer: draw the dab markers and the brush
                                 // cursor, and turn clicks into dabs.
                                 if *retouch_active && !show_original && !show_reference {
                                     paint_retouch(
                                         ui,
-                                        &RetouchView {
-                                            panel: panel_rect,
-                                            image: img_rect,
-                                            scale: img_scale,
-                                            brush_radius: *brush_radius,
-                                        },
+                                        panel_rect,
+                                        &view,
+                                        *brush_radius,
                                         &response,
                                         ctx,
                                         &processor.retouch_spots,
@@ -1889,7 +2289,89 @@ pub(crate) fn edit(
 
 #[cfg(test)]
 mod tests {
-    use super::{brush_radius_px, brush_size_step, pan_delta, step_brush, zoom_about};
+    use super::{
+        brush_radius_px, brush_size_step, crop_handle, crop_inside, crop_with_aspect, drag_crop,
+        pan_delta, step_brush, zoom_about, ImageView, MIN_CROP_PX,
+    };
+
+    // Cropping is all whole-pixel arithmetic in image space; these pin the
+    // rules the panel depends on: nothing escapes the image, nothing collapses,
+    // and a locked ratio really is locked.
+    #[test]
+    fn a_crop_drag_stays_inside_the_image_and_keeps_its_minimum() {
+        let input = (1000.0, 800.0);
+        let rect = (100.0, 100.0, 500.0, 400.0);
+        // Dragging the left edge way past the right one must not invert it.
+        let dragged = drag_crop(rect, input, 1, egui::vec2(900.0, 0.0), None);
+        assert!(dragged.2 - dragged.0 >= MIN_CROP_PX, "{dragged:?}");
+        // ...nor may it leave the image.
+        assert!(dragged.0 >= 0.0 && dragged.2 <= input.0);
+        // Moving slides the rectangle, and the clamp brings it back.
+        let moved = drag_crop(rect, input, 0, egui::vec2(-400.0, -400.0), None);
+        assert!(moved.0 >= 0.0 && moved.1 >= 0.0);
+        assert!((moved.2 - moved.0) - 400.0 < 1e-3);
+        assert!((moved.3 - moved.1) - 300.0 < 1e-3);
+        // A rect bigger than the image is cut down to it.
+        let huge = crop_inside((-500.0, -500.0, 5000.0, 5000.0), input);
+        assert_eq!((huge.0, huge.1, huge.2, huge.3), (0.0, 0.0, 1000.0, 800.0));
+    }
+
+    #[test]
+    fn a_locked_ratio_is_kept_while_dragging() {
+        let input = (1000.0, 800.0);
+        let rect = (100.0, 100.0, 500.0, 400.0);
+        for sides in [1u8, 2, 4, 8, 1 | 4, 2 | 8] {
+            let moved = drag_crop(rect, input, sides, egui::vec2(37.0, -21.0), Some(1.0));
+            let (w, h) = (moved.2 - moved.0, moved.3 - moved.1);
+            assert!(
+                (w - h).abs() < 0.5,
+                "sides {sides} left a {w}x{h} rect, not square"
+            );
+        }
+        // Locking a ratio from the presets reshapes about the centre.
+        let squared = crop_with_aspect(rect, input, 2.0);
+        let (w, h) = (squared.2 - squared.0, squared.3 - squared.1);
+        assert!((w / h - 2.0).abs() < 1e-3, "{w}x{h}");
+        assert!(((squared.0 + squared.2) * 0.5 - 300.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn crop_handles_pick_the_edge_the_pointer_is_on() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 100.0), egui::vec2(200.0, 150.0));
+        let reach = 10.0;
+        assert_eq!(crop_handle(rect, egui::pos2(100.0, 175.0), reach), Some(1)); // left
+        assert_eq!(crop_handle(rect, egui::pos2(300.0, 175.0), reach), Some(2)); // right
+        assert_eq!(crop_handle(rect, egui::pos2(200.0, 100.0), reach), Some(4)); // top
+        assert_eq!(crop_handle(rect, egui::pos2(200.0, 250.0), reach), Some(8)); // bottom
+        assert_eq!(crop_handle(rect, egui::pos2(100.0, 100.0), reach), Some(1 | 4)); // corner
+        assert_eq!(crop_handle(rect, egui::pos2(200.0, 175.0), reach), Some(0)); // move
+        assert_eq!(crop_handle(rect, egui::pos2(500.0, 500.0), reach), None); // elsewhere
+    }
+
+    // Markers are stored against the whole image, so with a crop on they have
+    // to be placed through it -- and clicking must invert that exactly.
+    #[test]
+    fn the_image_view_maps_through_a_crop_both_ways() {
+        let view = ImageView {
+            rect: egui::Rect::from_min_size(egui::pos2(50.0, 20.0), egui::vec2(400.0, 300.0)),
+            uv: [0.25, 0.5, 0.5, 0.25],
+            input: (4000.0, 2000.0),
+        };
+        // The crop's own corner is the view's corner.
+        let corner = view.to_screen(0.25, 0.5);
+        assert!((corner - egui::pos2(50.0, 20.0)).length() < 1e-3, "{corner:?}");
+        // And the round trip returns where it started.
+        for p in [
+            egui::pos2(50.0, 20.0),
+            egui::pos2(250.0, 170.0),
+            egui::pos2(450.0, 320.0),
+        ] {
+            let [x, y] = view.to_input(p);
+            assert!((view.to_screen(x, y) - p).length() < 1e-2, "{p:?}");
+        }
+        // One screen pixel is one input pixel times the display scale.
+        assert!((view.px_scale() - 400.0 / (0.5 * 4000.0)).abs() < 1e-4);
+    }
 
     // A two-finger swipe and a drag both pan the image in the direction of the
     // gesture (egui's scroll delta already means "how the content should
@@ -1987,12 +2469,13 @@ fn retouch_frame(
             );
             paint_retouch(
                 ui,
-                &RetouchView {
-                    panel: ui.max_rect(),
-                    image: img_rect,
-                    scale: 1.0,
-                    brush_radius: 40.0,
+                ui.max_rect(),
+                &ImageView {
+                    rect: img_rect,
+                    uv: [0.0, 0.0, 1.0, 1.0],
+                    input: (400.0, 300.0),
                 },
+                40.0,
                 &response,
                 ctx,
                 spots,
