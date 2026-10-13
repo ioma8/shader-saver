@@ -269,16 +269,28 @@ fn tonal_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // Healing-brush layer. Each dab copies a patch of the same image -- chosen on
-// the CPU from the rendered pixels -- over its centre and feathers the join.
-// It runs after every other edit, so a retouch composes with later slider
-// changes and can be removed again without touching the source.
+// the CPU from the pixels this pass itself reads -- over its centre and blends
+// it in through a radial weight. It runs after every other edit, so a retouch
+// composes with later slider changes and can be removed again without touching
+// the source.
+//
+// A dab samples `retouch_in`, never the result of another dab, so dabs are
+// independent of each other and of their order -- see docs/retouch.md.
 struct Spot {
     // centre.xy (0..1 of width/height), radius (fraction of the short side),
-    // additive colour correction's red channel.
+    // colour gain's red channel.
     a: vec4<f32>,
-    // source offset.xy (0..1 of width/height), colour correction's green/blue.
+    // source offset.xy (0..1 of width/height), gain's green/blue channels.
     b: vec4<f32>,
+    // Additive part of the correction (r, g, b); the fourth lane is unused.
+    c: vec4<f32>,
 };
+
+// Fraction of a dab's radius that is replaced at full strength; from there the
+// weight falls smoothly to nothing at the rim. Without this plateau the blend
+// is already at half strength halfway out, so a spot that fits inside the
+// drawn ring never fully goes away.
+const RETOUCH_INNER: f32 = 0.45;
 
 struct RetouchParams {
     count: f32,
@@ -322,11 +334,13 @@ fn retouch_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
             let radius = max(spot.a.z * short, 1.0);
             let d = distance(q, centre);
             if d >= radius { continue; }
-            // Full strength in the middle, smoothly to nothing at the rim.
-            let w = smoothstep(1.0, 0.0, d / radius);
+            // Full strength inside the plateau, smoothly to nothing at the rim.
+            // Edges are ordered low < high: the reverse order is undefined in
+            // both the Metal and the GLSL std.450 smoothstep.
+            let w = 1.0 - smoothstep(RETOUCH_INNER * radius, radius, d);
             let sampled = retouch_load(q + spot.b.xy * dimsf, dimsf);
-            let bias = vec3<f32>(spot.a.w, spot.b.z, spot.b.w);
-            let healed = clamp(sampled.rgb + bias, vec3<f32>(0.0), vec3<f32>(1.0));
+            let gain = vec3<f32>(spot.a.w, spot.b.z, spot.b.w);
+            let healed = clamp(sampled.rgb * gain + spot.c.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
             out = mix(out, vec4<f32>(healed, sampled.a), w);
         }
     }

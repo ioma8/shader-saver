@@ -488,6 +488,11 @@ struct App {
     // pixels (the `[` / `]` keys step it).
     retouch_active: bool,
     brush_radius: f32,
+    // A short-lived note for the panel ("no source found…"), with the time it
+    // was raised so it can expire.
+    retouch_status: Option<(String, f64)>,
+    // Two-step guard on "clear every dab".
+    retouch_confirm_clear: bool,
 }
 
 impl App {
@@ -590,6 +595,8 @@ impl App {
             similar_summary: None,
             retouch_active: false,
             brush_radius: 40.0,
+            retouch_status: None,
+            retouch_confirm_clear: false,
         }
     }
 }
@@ -968,6 +975,8 @@ impl App {
 
         self.flags.output_dirty = true;
         self.flags.zoom_fit = true;
+        self.retouch_status = None;
+        self.retouch_confirm_clear = false;
         self.view = View::Edit;
         self.current_path = Some(path.to_owned());
         self.selected = Some(path.to_owned());
@@ -1005,25 +1014,49 @@ impl App {
         }
         if let Some([x, y, radius]) = requests.retouch {
             let mut placed = false;
+            let mut note = None;
             if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
-                if proc.retouch_spots.len() < MAX_RETOUCH_SPOTS {
-                    if let Some((w, h)) = proc.image_size {
-                        if let Some(pixels) = proc.output_pixels(&gpu.device, &gpu.queue) {
-                            if let Some(sample) = retouch::find_sample(&pixels, w, h, x, y, radius)
-                            {
-                                proc.retouch_spots.push(RetouchSpot {
-                                    x,
-                                    y,
-                                    radius,
-                                    source: sample.source,
-                                    bias: sample.bias,
-                                });
-                                placed = true;
-                            }
+                if proc.retouch_spots.len() >= MAX_RETOUCH_SPOTS {
+                    note = Some(format!("Retouch layer is full ({MAX_RETOUCH_SPOTS} dabs)"));
+                } else if let Some((w, h)) = proc.image_size {
+                    // Only the region the dab can reach is read back; that view
+                    // covers every source the search will consider, so cropping
+                    // loses nothing.
+                    let (rx, ry, rw, rh) = retouch::search_rect(x, y, radius, w, h);
+                    let r = retouch::radius_px(radius, w, h);
+                    let centre = [x * w as f32, y * h as f32];
+                    let sample = proc
+                        .retouch_source_pixels(rx, ry, rw, rh, &gpu.device, &gpu.queue)
+                        .and_then(|pixels| {
+                            let view = retouch::View {
+                                pixels: &pixels,
+                                dims: (rw, rh),
+                                origin: (rx as f32, ry as f32),
+                                full: (w as f32, h as f32),
+                            };
+                            retouch::find_sample(&view, centre, r)
+                        });
+                    match sample {
+                        Some(sample) => {
+                            let (fw, fh) = (w as f32, h as f32);
+                            proc.retouch_spots.push(RetouchSpot {
+                                x,
+                                y,
+                                radius,
+                                source: [sample.offset[0] / fw, sample.offset[1] / fh],
+                                gain: sample.gain,
+                                bias: sample.bias,
+                            });
+                            placed = true;
                         }
+                        // Never fail silently: a click that did nothing used to
+                        // read as the tool being broken.
+                        None => note = Some("No source found — try a smaller brush".to_owned()),
                     }
                 }
             }
+            self.retouch_confirm_clear = false;
+            self.retouch_status = note.map(|msg| (msg, self.egui_ctx.input(|i| i.time)));
             if placed {
                 *needs_process = true;
             }

@@ -2,9 +2,15 @@
 
 A healing brush for spots, dust and small intrusions. The tool lives in the
 right panel (`⚕ Retouch`): arm it, click the spot you want gone, and it picks a
-patch of the same image to put in its place -- feathered and tone-matched, so
-the join does not show. It is deliberately close to Photoshop's *spot healing
+patch of the same image to put in its place -- blended and tone-matched, so the
+join does not show. It is deliberately close to Photoshop's *spot healing
 brush*: you never pick the source yourself.
+
+It is a spot tool, not an object remover: make the brush **bigger than the
+blemish**, so the blemish sits inside the plateau below and the ring around it
+is clean background. A blemish that reaches into the ring -- a long wire
+crossing the whole frame, say -- has nothing clean for the search to match, and
+a blemish larger than the brush cannot be taken out at all.
 
 The whole layer is removable. Dabs are stored in the edit state next to the
 sliders, not painted into the pixels, so later adjustments still apply to them
@@ -18,7 +24,7 @@ and they can be undone individually.
 | Click the photo | Heal that spot. The dab's ring becomes a marker. |
 | `[` / `]` | Shrink / grow the brush. The cursor ring resizes under the pointer. |
 | Right-click a marker | Delete that dab, restoring the original pixels. |
-| `Clear N retouch(es)` | Delete every dab on this image. |
+| `Clear N retouch(es)` | Delete every dab on this image (two clicks: it cannot be undone). |
 | Click `⚕ Retouch` again | Put the tool away. Dabs stay; markers and the cursor go. |
 | Reset All Edits | Clears the dabs along with every other edit. |
 
@@ -28,28 +34,42 @@ render byte-for-byte (asserted by the GPU test below).
 
 ## Where the source patch comes from
 
-When you click, the app reads the pixels **as rendered on screen** -- so the
-colour the search sees is the colour you clicked, whatever sliders produced it
--- and searches a ring of candidate patches around the spot (`src/retouch.rs`):
+When you click, the app reads back the pixels the shader will sample -- the
+image with every edit applied but *before* the retouch layer -- cropped to the
+region the dab can reach, and searches a ring of candidate patches around the
+spot (`src/retouch.rs`). Reading the finished display instead would let the
+search score candidates against pixels the render never uses.
 
-- candidates sit on four distances (`2.2`, `3`, `4.2`, `6` brush radii) around
-  the target, at 32 angles, so the direction is free;
-- each is scored by the sum-of-squared-differences between the target patch and
-  the candidate over a lattice of samples inside the dab, with a mild pull
-  towards nearby sources so the result stays related to its surroundings;
-- candidates that would overlap the target are rejected, or a dab would copy
-  the very thing it is meant to remove;
-- the winner's **mean colour difference** to the target is recorded as the
-  dab's `bias`.
+Candidates sit on four distances (`2.2`, `3`, `4.2`, `6` brush radii) around the
+target, at 32 angles, so the direction is free. Each is scored on two things:
 
-That bias is the "healing" half of a healing brush: a patch lifted from a
-slightly darker or cooler area is shifted onto the target's tone before it is
-blended, so a mismatched source still disappears. The search therefore prefers
-a same-tone neighbour (small bias) but copes when one is not available.
+- **Does its ring match?** Only the outer band is compared -- the plateau is
+  replaced outright, so scoring it would reward a source that looks like the
+  blemish. Point the brush at a dust spot and the whole-dab version pastes a
+  second dust spot; matching the ring instead picks the clean sky around it.
+  A mild pull towards nearby sources keeps the replacement related to its
+  surroundings, and candidates that would overlap the target are rejected.
+- **Would pasting it drop something the surroundings do not have?** The band is
+  not scored, so the interior has to be checked separately -- whatever sits
+  there is about to be copied onto the photo. A source whose interior holds
+  something the surroundings do not is rejected, with the tolerance set by how
+  much the surroundings themselves vary, so texture is not penalised but an
+  anomaly on a smooth background is.
 
-The result is stored as an offset, not as copied pixels. Every later render
-repeats the gesture from the *current* pixels, so a dab that heals an area
-composes with a later exposure or contrast change instead of going stale.
+The winner gets an **affine colour correction** (`gain`, then `bias`) fitted
+over its ring. Fitting a gain as well as an offset is the "healing" half: a
+patch lifted from a darker area is scaled onto the target's tone, and because
+the gain multiplies the source, a later exposure change scales both together
+and the dab stays put -- a bare additive offset would be left behind. A source
+patch flat enough that there is nothing to fit against falls back to the offset
+alone.
+
+The result is stored as an offset plus that correction, not as copied pixels.
+Every later render repeats the gesture from the *current* pixels.
+
+Dabs never sample each other: each one copies its source out of the image
+underneath the layer, not out of another dab's result. Two dabs therefore
+compose in any order, and overlapping them cannot bring a blemish back.
 
 ## How it renders
 
@@ -80,6 +100,8 @@ dabs. Because dabs are a layer rather than pixels:
 
 - right-clicking or `Clear` removes them exactly, leaving the render byte-for-
   byte what it was before (asserted by the GPU test below);
+- a loaded list is clamped and any unusable dab dropped, so a hand-edited or
+  corrupt database cannot NaN the image;
 - Reset All Edits drops them with the rest of the edit;
 - nothing is destructive, so the tool can be used freely.
 
@@ -90,14 +112,26 @@ The keys are matched on their **physical** position (`KeyCode::BracketLeft` /
 sit under `ú` and `)`, so a character match would miss; the physical key is the
 same on every layout.
 
+A click that places nothing says so, briefly, in the panel -- a brush with no
+room to resolve a source is clamped before it gets there, but a degenerate case
+should never look like the tool is broken.
+
 ## Tests
 
-- `src/retouch.rs` covers the source search: it never sources from the dab it
-  replaces, it prefers a same-tone neighbour, and the recorded bias lands the
-  copied patch on the target's mean.
-- `processor::tests::retouch_layer_applies_and_reverses_a_dab` renders a real
-  dab on the GPU and checks the centre takes the corrected source, pixels
-  outside are untouched, the rim is feathered between the two, and clearing the
-  dab restores the render exactly. It skips when no GPU adapter is available.
+- `src/retouch.rs` covers the search: it never sources from the dab it
+  replaces, it prefers a same-tone neighbour, a dust spot is not healed from
+  another dust spot, the affine correction lands the copied patch on the ring
+  it has to blend into, a brush nearly as large as the frame still resolves a
+  source, and a cropped view agrees with the whole image.
+- `processor::tests::retouch_layer_applies_and_reverses_a_dab` renders real
+  dabs on the GPU and checks the centre takes the corrected source at full
+  strength out to the plateau, pixels outside are untouched, the rim eases off
+  between the two, a second dab is not confused with the first, and clearing
+  them restores the render exactly. It skips when no GPU adapter is available.
 - `processor::tests::retouch_uniform_layout_matches_the_shader` pins the
-  uniform packing against the buffer size the shader declares.
+  uniform packing (three `vec4`s per dab) against the buffer size the shader
+  declares; `a_corrupt_dab_list_is_pulled_back_into_range` covers sanitising.
+- `ui::marker_tests` checks that every dab is marked and that a right-click
+  deletes the dab drawn on top; `ui::pointer_tests` covers the click-to-dab and
+  right-click plumbing; `ui::tests` covers the layout-independent `[` / `]`
+  handling and the brush size clamps.

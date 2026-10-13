@@ -52,29 +52,61 @@ fn combined_photo_lut(weights: [f32; 3]) -> Vec<f32> {
 pub const MAX_RETOUCH_SPOTS: usize = 64;
 
 /// Uniform buffer that carries the dab list to the shader: a four-float header
-/// (count + padding) followed by eight floats per spot.
+/// (count + padding) followed by twelve floats per spot (three `vec4`s).
 fn retouch_buffer_bytes() -> u64 {
-    ((4 + MAX_RETOUCH_SPOTS * 8) * std::mem::size_of::<f32>()) as u64
+    ((4 + MAX_RETOUCH_SPOTS * 12) * std::mem::size_of::<f32>()) as u64
+}
+
+/// Pull a loaded dab list back into the range the shader can be trusted with.
+///
+/// Nothing the tool produces is ever out of range, but the list travels through
+/// a JSON column that a person (or an older build) can write anything into, and
+/// a single NaN would NaN every pixel the pass touches -- a blank image with no
+/// obvious cause. Out-of-range values are clamped and unusable dabs dropped.
+fn sanitize_retouch_spots(spots: &mut Vec<RetouchSpot>) {
+    spots.retain(|s| {
+        s.x.is_finite()
+            && s.y.is_finite()
+            && s.radius.is_finite()
+            && s.source.iter().all(|v| v.is_finite())
+            && s.gain.iter().all(|v| v.is_finite())
+            && s.bias.iter().all(|v| v.is_finite())
+    });
+    for spot in spots.iter_mut() {
+        spot.x = spot.x.clamp(0.0, 1.0);
+        spot.y = spot.y.clamp(0.0, 1.0);
+        spot.radius = spot.radius.clamp(0.0005, 0.5);
+        spot.source[0] = spot.source[0].clamp(-1.0, 1.0);
+        spot.source[1] = spot.source[1].clamp(-1.0, 1.0);
+        spot.gain = spot.gain.map(|g| g.clamp(0.25, 4.0));
+        spot.bias = spot.bias.map(|b| b.clamp(-1.0, 1.0));
+    }
+    spots.truncate(MAX_RETOUCH_SPOTS);
 }
 
 /// Pack the dab list into the shader's uniform layout: a four-float header
-/// (count plus padding) then two `vec4`s per spot. A free function so the
+/// (count plus padding) then three `vec4`s per spot. A free function so the
 /// layout the shader reads can be asserted without a GPU.
 fn pack_retouch_spots(spots: &[RetouchSpot]) -> Vec<f32> {
-    let mut data = vec![0f32; 4 + MAX_RETOUCH_SPOTS * 8];
+    let mut data = vec![0f32; 4 + MAX_RETOUCH_SPOTS * 12];
     let count = spots.len().min(MAX_RETOUCH_SPOTS);
     data[0] = count as f32;
     for (slot, spot) in spots[..count].iter().enumerate() {
-        let o = 4 + slot * 8;
-        // vec4 A = (x, y, radius, bias.r), vec4 B = (dx, dy, bias.g, bias.b)
+        let o = 4 + slot * 12;
+        // a = (x, y, radius, gain.r), b = (dx, dy, gain.g, gain.b),
+        // c = (bias.r, bias.g, bias.b, unused)
         data[o] = spot.x;
         data[o + 1] = spot.y;
         data[o + 2] = spot.radius;
-        data[o + 3] = spot.bias[0];
+        data[o + 3] = spot.gain[0];
         data[o + 4] = spot.source[0];
         data[o + 5] = spot.source[1];
-        data[o + 6] = spot.bias[1];
-        data[o + 7] = spot.bias[2];
+        data[o + 6] = spot.gain[1];
+        data[o + 7] = spot.gain[2];
+        data[o + 8] = spot.bias[0];
+        data[o + 9] = spot.bias[1];
+        data[o + 10] = spot.bias[2];
+        data[o + 11] = 0.0;
     }
     data
 }
@@ -83,16 +115,38 @@ fn pack_retouch_spots(spots: &[RetouchSpot]) -> Vec<f32> {
 /// same thing whichever render resolution the image is reopened at: the centre
 /// is a fraction of width/height, `radius` a fraction of the shorter side, and
 /// `source` the offset (also fractions) to the patch that replaces this one.
-/// `bias` is the additive colour correction that makes the sampled patch match
-/// the surrounding pixels (the "healing" part of a healing brush), measured
-/// from the rendered image when the spot was placed.
+///
+/// `gain`/`bias` are the affine colour correction that makes the sampled patch
+/// match the pixels around the dab -- the "healing" half of a healing brush --
+/// fitted from the *rim* of the two patches when the spot was placed. The gain
+/// carries most of it, so a later exposure change (which scales the source
+/// patch) still lands near the target; a bare additive offset would go stale.
+///
+/// `serde(default)` matters: dabs written before `gain` existed must keep
+/// loading, or the whole edit state for that image would be discarded.
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct RetouchSpot {
     pub x: f32,
     pub y: f32,
     pub radius: f32,
     pub source: [f32; 2],
+    pub gain: [f32; 3],
     pub bias: [f32; 3],
+}
+
+impl Default for RetouchSpot {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            radius: 0.05,
+            source: [0.0; 2],
+            // Identity correction: an old dab keeps its former meaning.
+            gain: [1.0; 3],
+            bias: [0.0; 3],
+        }
+    }
 }
 
 // Everything that defines an image's edit, serialized to SQLite as JSON.
@@ -653,6 +707,7 @@ impl Processor {
         if self.state.curve_points.len() < 2 {
             self.state.curve_points = vec![[0.0, 0.0], [1.0, 1.0]];
         }
+        sanitize_retouch_spots(&mut self.state.retouch_spots);
     }
 
     // Derive auto adjustments from the luminance histogram. Call with the
@@ -838,7 +893,9 @@ impl Processor {
         self.tex2 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex3 = Some(make_intermediate(wgpu::TextureUsages::empty()));
         self.tex4 = Some(make_intermediate(wgpu::TextureUsages::empty()));
-        self.pre_retouch_tex = Some(make_intermediate(wgpu::TextureUsages::empty()));
+        // COPY_SRC: the dab search reads this texture back (it is the image the
+        // retouch pass samples, so the search must see the same pixels).
+        self.pre_retouch_tex = Some(make_intermediate(wgpu::TextureUsages::COPY_SRC));
         self.output_tex = Some(make_intermediate(wgpu::TextureUsages::COPY_SRC));
         self.display_tex = Some(device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -1053,8 +1110,14 @@ impl Processor {
         }
     }
 
-    // Write the retouch dab list into the uniform the shader reads.
+    // Write the retouch dab list into the uniform the shader reads. With no
+    // dabs the pass is skipped entirely (see `process`), so only the count has
+    // to be reset -- no per-frame allocation.
     fn write_retouch(&self, queue: &wgpu::Queue) {
+        if self.retouch_spots.is_empty() {
+            queue.write_buffer(&self.retouch_buf, 0, bytemuck::cast_slice(&[0f32]));
+            return;
+        }
         let data = pack_retouch_spots(&self.retouch_spots);
         queue.write_buffer(&self.retouch_buf, 0, bytemuck::cast_slice(&data));
     }
@@ -1128,6 +1191,9 @@ impl Processor {
         let sharpen_bg = make_bg(&t2v, &t3v, &self.sharpen_buf);
         let blur_h_bg = make_bg(&t3v, &t4v, &self.blur_buf);
         let blur_vert_bg = make_bg(&t4v, &pv, &self.blur_buf);
+        // With no dabs there is nothing to composite, so the display reads the
+        // pre-retouch texture directly and the pass is skipped.
+        let retouching = !self.retouch_spots.is_empty();
         let retouch_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.retouch_bgl,
@@ -1146,13 +1212,14 @@ impl Processor {
                 },
             ],
         });
+        let display_src = if retouching { &ov } else { &pv };
         let display_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.display_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&ov),
+                    resource: wgpu::BindingResource::TextureView(display_src),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1176,12 +1243,86 @@ impl Processor {
         dispatch(&self.sharpen_pipeline, &sharpen_bg);
         dispatch(&self.blur_h_pipeline, &blur_h_bg);
         dispatch(&self.blur_v_pipeline, &blur_vert_bg);
-        dispatch(&self.retouch_pipeline, &retouch_bg);
+        if retouching {
+            dispatch(&self.retouch_pipeline, &retouch_bg);
+        }
         dispatch(&self.display_pipeline, &display_bg);
         queue.submit([encoder.finish()]);
 
         // Separate submission: display write must be visible before histogram reads.
         self.read_histogram(device, queue, &dv, w, h);
+    }
+
+    /// The pixels the retouch pass will sample from -- the image after every
+    /// edit but *before* the retouch layer -- cropped to `[x, y, w, h)`.
+    ///
+    /// The dab search must read exactly this: reading the finished display
+    /// instead would let it score candidates against pixels the render never
+    /// samples (a dab drawn over an earlier one, for instance).
+    ///
+    /// Only the region a dab can reach is copied: the dab itself plus the
+    /// farthest source the search looks at, which keeps a click on a 24 MP
+    /// frame from reading the whole image back.
+    pub fn retouch_source_pixels(
+        &self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Option<Vec<u8>> {
+        let (tex, (full_w, full_h)) = (self.pre_retouch_tex.as_ref()?, self.image_size?);
+        if w == 0 || h == 0 || x + w > full_w || y + h > full_h {
+            return None;
+        }
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let bytes_per_row = (w * 8).div_ceil(align) * align;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: u64::from(bytes_per_row * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+
+        let data = map_read(device, &staging)?;
+        // Half-float RGBA -> 8-bit RGBA. The search works on rendered values
+        // (0..1), which is what this texture holds; 8 bits is plenty for a
+        // coarse patch match.
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            let start = (row * bytes_per_row) as usize;
+            let row_bytes = &data[start..start + (w * 8) as usize];
+            for channel in row_bytes.chunks_exact(2) {
+                let bits = u16::from_le_bytes([channel[0], channel[1]]);
+                let value = f16::from_bits(bits).to_f32().clamp(0.0, 1.0);
+                pixels.push((value * 255.0).round() as u8);
+            }
+        }
+        Some(pixels)
     }
 
     // Read the rendered output back to CPU RGBA8 bytes, synchronously. Used
@@ -1230,10 +1371,19 @@ impl Processor {
         Some(pixels)
     }
 
+    /// The texture holding the finished image: the retouch output when there
+    /// are dabs, the pre-retouch result when that pass is skipped.
+    fn final_tex(&self) -> Option<&wgpu::Texture> {
+        if self.retouch_spots.is_empty() {
+            self.pre_retouch_tex.as_ref()
+        } else {
+            self.output_tex.as_ref()
+        }
+    }
+
     // Export the half-float result as a 16-bit sRGB PNG (gamma-encoded u16).
     pub fn export(&self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let (Some(output), Some((width, height))) = (self.output_tex.as_ref(), self.image_size)
-        else {
+        let (Some(output), Some((width, height))) = (self.final_tex(), self.image_size) else {
             return;
         };
 
@@ -1957,17 +2107,26 @@ mod tests {
             y: 0.5,
             radius: 0.125,
             source: [0.01, -0.02],
+            gain: [1.1, 1.2, 1.3],
             bias: [0.1, 0.2, 0.3],
         };
         let packed = super::pack_retouch_spots(std::slice::from_ref(&spot));
         assert_eq!(packed.len() as u64 * 4, super::retouch_buffer_bytes());
         assert_eq!(packed[0], 1.0);
-        // a = (x, y, radius, bias.r), b = (dx, dy, bias.g, bias.b)
+        // a = (x, y, radius, gain.r), b = (dx, dy, gain.g, gain.b),
+        // c = (bias.r, bias.g, bias.b, unused)
         assert_eq!(
-            &packed[4..12],
-            &[0.25, 0.5, 0.125, 0.1, 0.01, -0.02, 0.2, 0.3]
+            &packed[4..16],
+            &[
+                0.25, 0.5, 0.125, 1.1, // a
+                0.01, -0.02, 1.2, 1.3, // b
+                0.1, 0.2, 0.3, 0.0, // c
+            ]
         );
-        assert!(packed[12..].iter().all(|v| *v == 0.0));
+        // Slot 1 starts 12 floats in, on a 16-byte boundary -- the stride the
+        // WGSL `array<Spot, 64>` has to agree with.
+        assert_eq!(packed.len(), 4 + super::MAX_RETOUCH_SPOTS * 12);
+        assert!(packed[16..].iter().all(|v| *v == 0.0));
     }
 
     // Integration test for the retouch pass: a dab must copy its source over
@@ -2003,36 +2162,67 @@ mod tests {
         let before = proc.output_pixels(&device, &queue).unwrap();
         assert!(at(&before, 20, 20) > 200, "the bright patch should be present first");
 
-        // Dab over the patch, sourcing 32 px to the right (dark grey) with a
-        // +0.2 correction: 40/255 + 0.2 lands near 91.
+        // Dab over the patch, sourcing 32 px to the right (dark grey, 40/255)
+        // with a +0.2 correction: 40/255 + 0.2 lands on 91.
         proc.retouch_spots.push(RetouchSpot {
             x: 20.0 / 64.0,
             y: 20.0 / 64.0,
             radius: 8.0 / 64.0,
             source: [0.5, 0.0],
+            gain: [1.0; 3],
             bias: [0.2, 0.2, 0.2],
         });
         proc.process(&device, &queue);
         let after = proc.output_pixels(&device, &queue).unwrap();
         let healed = at(&after, 20, 20);
+        // Inside the plateau the replacement is total, so the dab centre is
+        // exactly the corrected source. (Before the plateau existed this came
+        // out at 94: the blend was already easing off halfway across.)
         assert!(
-            (80..=100).contains(&healed),
-            "dab centre should be the corrected source, got {healed}"
+            (89..=93).contains(&healed),
+            "dab centre should be fully replaced by the corrected source, got {healed}"
+        );
+        // (20, 23) is 3.5 px out of 8 -- still inside the plateau, so it must
+        // read the same as the centre rather than feathering from it.
+        assert_eq!(
+            at(&after, 20, 23),
+            healed,
+            "the plateau should replace at full strength, not feather from the centre"
         );
         // Well outside the dab nothing may change.
         assert_eq!(at(&after, 2, 2), at(&before, 2, 2), "outside the dab changed");
-        // The feather softens the rim rather than stepping.
-        let rim = at(&after, 20, 25);
+        // Past the plateau the blend eases off rather than stepping.
+        let rim = at(&after, 20, 26);
         assert!(
-            healed < rim && rim < at(&before, 20, 25),
+            healed < rim && rim < at(&before, 20, 26),
             "the rim should sit between the dab and the original: {healed} {rim}"
         );
 
-        // Removing the dab restores the original pixels exactly.
+        // Add a second dab so the uniform's array stride is exercised: a wrong
+        // stride would have this one read the first one's fields. It sources
+        // 30 px to the left, onto the bright patch.
+        proc.retouch_spots.push(RetouchSpot {
+            x: 44.0 / 64.0,
+            y: 20.0 / 64.0,
+            radius: 6.0 / 64.0,
+            source: [-30.0 / 64.0, 0.0],
+            gain: [1.0; 3],
+            bias: [0.0; 3],
+        });
+        proc.process(&device, &queue);
+        let two = proc.output_pixels(&device, &queue).unwrap();
+        assert!(
+            at(&two, 44, 20) > 200,
+            "the second dab should have copied the bright patch, got {}",
+            at(&two, 44, 20)
+        );
+        assert_eq!(at(&two, 20, 20), healed, "the first dab should be unaffected");
+
+        // Removing both restores the original pixels exactly.
         proc.retouch_spots.clear();
         proc.process(&device, &queue);
         let restored = proc.output_pixels(&device, &queue).unwrap();
-        assert_eq!(restored, before, "clearing the dab should restore the render");
+        assert_eq!(restored, before, "clearing the dabs should restore the render");
     }
 
     // Edits saved before the retouch layer existed must still load, and a dab
@@ -2048,20 +2238,70 @@ mod tests {
             y: 0.6,
             radius: 0.05,
             source: [-0.02, 0.03],
+            gain: [1.05, 0.95, 1.0],
             bias: [0.01, -0.02, 0.0],
         });
         let json = serde_json::to_string(&state).unwrap();
         let back: EditState = serde_json::from_str(&json).unwrap();
         assert_eq!(back.retouch_spots, state.retouch_spots);
+
+        // A dab saved before `gain` existed must still load (and keep its old,
+        // offset-only meaning) rather than taking the whole edit with it.
+        let older = r#"{"retouch_spots":[{"x":0.4,"y":0.6,"radius":0.05,
+            "source":[-0.02,0.03],"bias":[0.01,-0.02,0.0]}]}"#;
+        let parsed: EditState = serde_json::from_str(older).expect("an older dab should load");
+        assert_eq!(parsed.retouch_spots.len(), 1);
+        assert_eq!(parsed.retouch_spots[0].gain, [1.0; 3]);
+        assert_eq!(parsed.retouch_spots[0].bias, [0.01, -0.02, 0.0]);
+    }
+
+    // The dab list travels through a JSON column anyone can edit, and a single
+    // NaN would NaN every pixel the pass touches.
+    #[test]
+    fn a_corrupt_dab_list_is_pulled_back_into_range() {
+        let mut spots = vec![
+            RetouchSpot {
+                x: f32::NAN,
+                y: 0.5,
+                radius: 0.05,
+                source: [0.0, 0.0],
+                gain: [1.0; 3],
+                bias: [0.0; 3],
+            },
+            RetouchSpot {
+                x: 4.0,
+                y: -2.0,
+                radius: 9.0,
+                source: [50.0, -50.0],
+                gain: [8.0, 0.0, 1.0],
+                bias: [4.0, -4.0, 0.0],
+            },
+        ];
+        // Plus more dabs than the uniform can carry.
+        for _ in 0..MAX_RETOUCH_SPOTS + 4 {
+            spots.push(RetouchSpot::default());
+        }
+        super::sanitize_retouch_spots(&mut spots);
+        assert_eq!(spots.len(), MAX_RETOUCH_SPOTS);
+        for spot in &spots {
+            assert!(spot.x.is_finite() && spot.y.is_finite() && spot.radius.is_finite());
+            assert!((0.0..=1.0).contains(&spot.x) && (0.0..=1.0).contains(&spot.y));
+            assert!((0.0005..=0.5).contains(&spot.radius));
+            assert!(spot.source.iter().all(|v| (-1.0..=1.0).contains(v)));
+            assert!(spot.gain.iter().all(|v| (0.25..=4.0).contains(v)));
+            assert!(spot.bias.iter().all(|v| (-1.0..=1.0).contains(v)));
+        }
     }
 
     #[test]
-    fn retouch_packing_caps_the_slot_count() {        let spots = vec![
+    fn retouch_packing_caps_the_slot_count() {
+        let spots = vec![
             RetouchSpot {
                 x: 0.0,
                 y: 0.0,
                 radius: 0.05,
                 source: [0.0, 0.0],
+                gain: [1.0; 3],
                 bias: [0.0; 3],
             };
             MAX_RETOUCH_SPOTS + 5

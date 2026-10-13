@@ -52,11 +52,11 @@ images.
   Reset All Edits reverts to defaults
 - **Retouch brush** — a healing brush in the right panel; click the photo to
   heal a spot and the tool finds a matching patch of the same image to copy
-  over it, feathered and colour-corrected so the join disappears. `[` / `]`
-  resize the brush (the physical keys, so the Czech `ú` / `)` layout works),
-  right-click a dab to delete it. Dabs are a separate, removable layer in the
-  edit state, so they compose with later slider changes and survive reopening.
-  See [Retouch brush](docs/retouch.md)
+  over it, blended and colour-corrected so the join disappears. Make the brush
+  bigger than the blemish. `[` / `]` resize it (the physical keys, so the Czech
+  `ú` / `)` layout works), right-click a dab to delete it. Dabs are a separate,
+  removable layer in the edit state, so they compose with later slider changes
+  and survive reopening. See [Retouch brush](docs/retouch.md)
 - **Culling** — 1–5 star ratings, pick/reject flags (P/X), color labels
   (6–9), saved in SQLite independently of edits; badges in the grid and
   filmstrip
