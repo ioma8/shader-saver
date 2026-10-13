@@ -58,6 +58,14 @@ const UI_ZOOM_FIT_KEY: &str = "ui_zoom_fit";
 const UI_FILTER_KEY: &str = "ui_browse_filter";
 const UI_SORT_KEY: &str = "ui_browse_sort";
 const UI_MIN_RATING_KEY: &str = "ui_min_rating";
+const KEY_UNDO: &str = "undo_edit";
+const KEY_REDO: &str = "redo_edit";
+// Undo history: how many steps an image keeps, how many images are remembered,
+// and how long a burst of changes (a slider drag, one change per frame) counts
+// as a single step.
+const HISTORY_STEPS: usize = 24;
+const HISTORY_IMAGES: usize = 8;
+const HISTORY_MERGE_SECS: f64 = 0.3;
 const UI_WINDOW_W_KEY: &str = "ui_window_width";
 const UI_WINDOW_H_KEY: &str = "ui_window_height";
 const DEFAULT_WINDOW: (f32, f32) = (1600.0, 1000.0);
@@ -313,6 +321,104 @@ fn load_f32_pref(conn: &rusqlite::Connection, key: &str, default: f32) -> f32 {
 
 fn save_f32_pref(conn: &rusqlite::Connection, key: &str, value: f32) {
     save_pref(conn, key, &value.to_string());
+}
+
+/// One image's undo history. The entry at `at` is the state on screen, entries
+/// behind it are older, and entries ahead of it are the redo branch.
+///
+/// A burst of changes -- a slider drag arrives as one change per frame -- keeps
+/// replacing the entry it started, instead of filling the stack with
+/// intermediate values. Stacks hold whole edit states, which is cheap until a
+/// look transform puts a 33-cubed LUT in one; hence the step cap.
+#[derive(Default)]
+struct ImageHistory {
+    states: Vec<EditState>,
+    at: usize,
+    last_push: f64,
+}
+
+impl ImageHistory {
+    /// Start over from `state`, as when an image is opened.
+    fn reset(&mut self, state: EditState) {
+        self.states = vec![state];
+        self.at = 0;
+        self.last_push = 0.0;
+    }
+
+    /// Record `state` as the new current one.
+    fn commit(&mut self, state: EditState, now: f64) {
+        if self.states.is_empty() {
+            self.reset(state);
+            return;
+        }
+        // Only ever merge into an entry that has something behind it: `states[0]`
+        // is the state the image was opened with and must stay reachable.
+        if now - self.last_push < HISTORY_MERGE_SECS && self.at > 0 {
+            self.states[self.at] = state;
+        } else {
+            self.states.truncate(self.at + 1);
+            self.states.push(state);
+            self.at = self.states.len() - 1;
+            if self.states.len() > HISTORY_STEPS {
+                self.states.remove(0);
+                self.at -= 1;
+            }
+        }
+        self.last_push = now;
+    }
+
+    /// The state to go back to, if there is one.
+    fn undo(&mut self) -> Option<EditState> {
+        if self.at == 0 {
+            return None;
+        }
+        self.at -= 1;
+        // Any edit after this starts a fresh step rather than merging backwards.
+        self.last_push = 0.0;
+        Some(self.states[self.at].clone())
+    }
+
+    fn redo(&mut self) -> Option<EditState> {
+        if self.at + 1 >= self.states.len() {
+            return None;
+        }
+        self.at += 1;
+        self.last_push = 0.0;
+        Some(self.states[self.at].clone())
+    }
+}
+
+/// Per-image undo histories, capped in both directions.
+#[derive(Default)]
+struct Histories {
+    images: HashMap<PathBuf, ImageHistory>,
+    order: std::collections::VecDeque<PathBuf>,
+}
+
+impl Histories {
+    fn entry(&mut self, path: &Path) -> &mut ImageHistory {
+        if !self.images.contains_key(path) {
+            if self.images.len() >= HISTORY_IMAGES {
+                // Evict the least recently added image that is not this one.
+                while let Some(oldest) = self.order.pop_front() {
+                    if oldest.as_path() != path && self.images.remove(&oldest).is_some() {
+                        break;
+                    }
+                }
+            }
+            self.order.push_back(path.to_path_buf());
+            self.images.insert(path.to_path_buf(), ImageHistory::default());
+        }
+        self.images.get_mut(path).expect("just inserted")
+    }
+
+    fn commit(&mut self, path: &Path, state: EditState, now: f64) {
+        self.entry(path).commit(state, now);
+    }
+
+    fn reset(&mut self, path: &Path, state: EditState) {
+        self.entry(path).reset(state);
+    }
 }
 
 /// The bits of UI state that survive a restart, gathered into one value so a
@@ -647,6 +753,8 @@ struct App {
     // The UI state as it was last written to the database, so a change made
     // anywhere can be detected in one comparison.
     saved_ui: SavedUi,
+    // Per-image undo/redo.
+    history: Histories,
 }
 
 impl App {
@@ -756,6 +864,7 @@ impl App {
             crop_aspect: 0,
             crop_drag: None,
             saved_ui,
+            history: Histories::default(),
         }
     }
 }
@@ -987,6 +1096,69 @@ impl App {
         spawn_folder_workers(paths, work, self.adjust_tx.clone());
     }
 
+    /// Record the state on screen as an undo step. Called wherever an edit is
+    /// persisted, so anything that can change an image can be undone.
+    fn commit_history(&mut self, path: &Path, state: EditState) {
+        let now = self.egui_ctx.input(|i| i.time);
+        self.history.commit(path, state, now);
+    }
+
+    /// Forget the past for this image and start from `state` -- a fresh open,
+    /// or an edit that should not be undoable.
+    fn reset_history(&mut self, path: &Path, state: EditState) {
+        self.history.reset(path, state);
+    }
+
+    /// Step one place through the open image's history.
+    fn step_history(&mut self, forward: bool) -> bool {
+        let Some(path) = self.current_path.clone() else {
+            return false;
+        };
+        let state = {
+            let history = self.history.entry(&path);
+            if forward {
+                history.redo()
+            } else {
+                history.undo()
+            }
+        };
+        let Some(state) = state else {
+            return false;
+        };
+        self.load_edit_state(&path, state);
+        true
+    }
+
+    /// Put `state` into the processor and redraw, mirroring what opening an
+    /// image does -- including re-developing a RAW when the state calls for it,
+    /// since that is part of the state and not just a slider.
+    fn load_edit_state(&mut self, path: &Path, state: EditState) {
+        let raw = imgload::is_raw(path);
+        let Some(gpu) = self.gpu.as_ref() else {
+            return;
+        };
+        let Some(proc) = self.processor.as_mut() else {
+            return;
+        };
+        proc.apply_edit_state(&state);
+        if state.raw_isp_enabled && raw {
+            let max_dim = proc.image_size.map_or(2048, |(w, h)| w.max(h));
+            if let Some(developed) = raw_develop::develop_raw_u16(path, max_dim) {
+                proc.replace_input_u16(
+                    developed.width(),
+                    developed.height(),
+                    developed.as_raw(),
+                    &gpu.queue,
+                );
+            }
+        }
+        proc.process(&gpu.device, &gpu.queue);
+        if let Some(db) = &self.db {
+            save_edits(db, path, &proc.edit_state());
+        }
+        self.flags.output_dirty = true;
+    }
+
     fn apply_cull_action(&mut self, path: &Path, action: cull::CullAction) {
         let mut meta = self.meta.get(path).copied().unwrap_or_default();
         cull::apply_action(&mut meta, action);
@@ -1152,6 +1324,11 @@ impl App {
             .map(|t| t.join(", "))
             .unwrap_or_default();
 
+        // Start this image's undo history from the state it opened at, after
+        // the RAW sharpening seeding -- undoing that is not a thing.
+        if let Some(proc) = self.processor.as_ref() {
+            self.reset_history(path, proc.edit_state());
+        }
         self.flags.output_dirty = true;
         // Whatever zoom mode was last used, not always fit.
         self.flags.zoom_fit = self.saved_ui.zoom_fit;
@@ -1173,6 +1350,13 @@ impl App {
     // Apply one-shot UI requests that need `self` beyond the frame: file dialogs,
     // batch AI actions, look capture/teach, trash/move/copy.
     fn handle_ui_requests(&mut self, requests: ui::UiRequests, needs_process: &mut bool) {
+        // Undo/redo run outside the egui frame, where re-rendering is safe.
+        if requests.undo {
+            self.step_history(false);
+        }
+        if requests.redo {
+            self.step_history(true);
+        }
         // Retouch layer: place a dab, drop one, or clear them all. Placing a
         // dab searches the image that is on screen right now for a patch to
         // copy, then stores the offset (and the colour correction that makes it
@@ -1619,6 +1803,7 @@ impl App {
                 if let Some(db) = &self.db {
                     save_edits(db, &path, &state);
                 }
+                self.commit_history(&path, state.clone());
                 if self.current_path.as_deref() == Some(path.as_path()) {
                     if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
                         proc.apply_edit_state(&state);
@@ -1758,6 +1943,24 @@ impl App {
                         });
                 }
                 if !ctx.wants_keyboard_input() {
+                    // Undo/redo. `command` is Cmd on macOS and Ctrl elsewhere,
+                    // so both the platform conventions work; Ctrl+Y redoes for
+                    // the Windows habit.
+                    let (undo, redo) = ctx.input(|i| {
+                        let chord = |key: egui::Key| {
+                            (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(key)
+                        };
+                        (
+                            chord(egui::Key::Z) && !i.modifiers.shift,
+                            (chord(egui::Key::Z) && i.modifiers.shift) || chord(egui::Key::Y),
+                        )
+                    });
+                    if undo {
+                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_UNDO), true));
+                    }
+                    if redo {
+                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_REDO), true));
+                    }
                     let (left, right, up, down, enter, space) = ctx.input(|i| {
                         (
                             i.key_pressed(egui::Key::ArrowLeft),
@@ -1887,10 +2090,15 @@ impl App {
             if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
                 proc.process(&gpu.device, &gpu.queue);
             }
-            if let (Some(db), Some(path), Some(proc)) =
-                (&self.db, &self.current_path, &self.processor)
+            let state = self.processor.as_ref().map(Processor::edit_state);
+            if let (Some(db), Some(path), Some(state)) =
+                (&self.db, &self.current_path, state.as_ref())
             {
-                save_edits(db, path, &proc.edit_state());
+                save_edits(db, path, state);
+            }
+            let path = self.current_path.clone();
+            if let (Some(path), Some(state)) = (path, state) {
+                self.commit_history(&path, state);
             }
             self.flags.output_dirty = true;
         }
@@ -2129,11 +2337,12 @@ fn main() {
 mod tests {
     use super::{
         load_bool_pref, load_edits, load_look, look_reference_thumb, move_file, save_bool_pref,
+        Histories, ImageHistory, HISTORY_IMAGES, HISTORY_STEPS,
         save_edits, save_f32_pref, save_look, save_pref, saved_window, BrowseFilter, BrowseSort,
         CapturedLook, SavedUi, DEFAULT_WINDOW, UI_FILTER_KEY, UI_MIN_RATING_KEY, UI_WINDOW_H_KEY,
         UI_WINDOW_W_KEY,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use crate::processor::{EditState, LookProfile};
 
     #[test]
@@ -2292,6 +2501,94 @@ mod tests {
         for sort in [BrowseSort::Name, BrowseSort::Date, BrowseSort::CaptureTime] {
             assert_eq!(BrowseSort::from_key(sort.key()), sort);
         }
+    }
+
+    fn state_with_exposure(exposure: f32) -> EditState {
+        let mut state = EditState::default();
+        state.exposure = exposure;
+        state
+    }
+
+    #[test]
+    fn undo_history_walks_back_and_forth() {
+        let mut history = ImageHistory::default();
+        history.reset(state_with_exposure(0.0));
+        // Distinct edits, spaced out beyond the merge window.
+        for (i, exposure) in [1.0f32, 2.0, 3.0].iter().enumerate() {
+            history.commit(state_with_exposure(*exposure), 10.0 + i as f64);
+        }
+        assert_eq!(history.undo().unwrap().exposure, 2.0);
+        assert_eq!(history.undo().unwrap().exposure, 1.0);
+        assert_eq!(history.undo().unwrap().exposure, 0.0);
+        assert!(history.undo().is_none(), "nothing before the opened state");
+        assert_eq!(history.redo().unwrap().exposure, 1.0);
+        assert_eq!(history.redo().unwrap().exposure, 2.0);
+        assert_eq!(history.redo().unwrap().exposure, 3.0);
+        assert!(history.redo().is_none());
+    }
+
+    // A slider drag arrives as one change per frame; that is one undo step, not
+    // sixty, and the state it started from has to stay reachable.
+    #[test]
+    fn a_burst_of_changes_is_a_single_step() {
+        let mut history = ImageHistory::default();
+        history.reset(state_with_exposure(0.0));
+        for step in 1..=60 {
+            history.commit(state_with_exposure(step as f32 * 0.1), 5.0 + step as f64 * 0.01);
+        }
+        assert_eq!(history.states.len(), 2, "the drag should be one step");
+        assert_eq!(history.undo().unwrap().exposure, 0.0);
+        // Editing after an undo starts a fresh step instead of merging into the
+        // one that was just stepped back to.
+        history.commit(state_with_exposure(9.0), 5.7);
+        assert_eq!(history.states.len(), 2);
+        assert_eq!(history.undo().unwrap().exposure, 0.0);
+    }
+
+    #[test]
+    fn a_new_edit_drops_the_redo_branch() {
+        let mut history = ImageHistory::default();
+        history.reset(state_with_exposure(0.0));
+        history.commit(state_with_exposure(1.0), 10.0);
+        history.commit(state_with_exposure(2.0), 11.0);
+        assert_eq!(history.undo().unwrap().exposure, 1.0);
+        history.commit(state_with_exposure(5.0), 12.0);
+        assert!(history.redo().is_none(), "the old branch is gone");
+        assert_eq!(history.undo().unwrap().exposure, 1.0);
+    }
+
+    #[test]
+    fn the_history_is_capped_and_keeps_the_newest_steps() {
+        let mut history = ImageHistory::default();
+        history.reset(state_with_exposure(0.0));
+        for step in 1..=HISTORY_STEPS * 3 {
+            history.commit(state_with_exposure(step as f32), step as f64);
+        }
+        assert_eq!(history.states.len(), HISTORY_STEPS);
+        assert_eq!(history.at, HISTORY_STEPS - 1);
+        let mut steps = 0;
+        while history.undo().is_some() {
+            steps += 1;
+        }
+        assert_eq!(steps, HISTORY_STEPS - 1);
+    }
+
+    #[test]
+    fn each_image_gets_its_own_history() {
+        let mut histories = Histories::default();
+        let a = Path::new("/tmp/a.jpg");
+        let b = Path::new("/tmp/b.jpg");
+        histories.reset(a, state_with_exposure(0.0));
+        histories.commit(a, state_with_exposure(1.0), 10.0);
+        histories.reset(b, state_with_exposure(7.0));
+        assert_eq!(histories.entry(a).undo().unwrap().exposure, 0.0);
+        assert!(histories.entry(b).undo().is_none());
+        // Only a bounded number of images are remembered.
+        for i in 0..HISTORY_IMAGES * 2 {
+            let other = PathBuf::from(format!("/tmp/o{i}.jpg"));
+            histories.entry(&other);
+        }
+        assert!(histories.images.len() <= HISTORY_IMAGES);
     }
 
     #[test]

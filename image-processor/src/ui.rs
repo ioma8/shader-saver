@@ -23,6 +23,8 @@ pub(crate) struct UiRequests {
     pub adjust_folder: bool,
     pub look_folder: bool,
     pub similar_cull: bool,
+    pub undo: bool,
+    pub redo: bool,
     /// A dab to place: `[x, y, radius]`, all normalised to the image.
     pub retouch: Option<[f32; 3]>,
     /// Index of the dab to remove.
@@ -52,6 +54,8 @@ pub(crate) fn take_requests(ctx: &egui::Context) -> UiRequests {
         adjust_folder: take::<bool>(ctx, KEY_ADJUST_FOLDER).is_some(),
         look_folder: take::<bool>(ctx, KEY_LOOK_FOLDER).is_some(),
         similar_cull: take::<bool>(ctx, KEY_SIMILAR_CULL).is_some(),
+        undo: take::<bool>(ctx, KEY_UNDO).is_some(),
+        redo: take::<bool>(ctx, KEY_REDO).is_some(),
         retouch: take(ctx, KEY_RETOUCH),
         retouch_remove: take(ctx, KEY_RETOUCH_REMOVE),
         retouch_clear: take::<bool>(ctx, KEY_RETOUCH_CLEAR).is_some(),
@@ -2291,8 +2295,27 @@ pub(crate) fn edit(
 mod tests {
     use super::{
         brush_radius_px, brush_size_step, crop_handle, crop_inside, crop_with_aspect, drag_crop,
-        pan_delta, step_brush, zoom_about, ImageView, MIN_CROP_PX,
+        pan_delta, step_brush, take_requests, zoom_about, ImageView, KEY_REDO, KEY_UNDO,
+        MIN_CROP_PX,
     };
+
+    // The key handler sets a temp flag and the frame's requests pick it up;
+    // this pins that the two names match.
+    #[test]
+    fn undo_and_redo_requests_are_picked_up() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_UNDO), true));
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_REDO), true));
+        });
+        let requests = take_requests(&ctx);
+        assert!(requests.undo);
+        assert!(requests.redo);
+        // And an ordinary frame asks for neither.
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let quiet = take_requests(&ctx);
+        assert!(!quiet.undo && !quiet.redo);
+    }
 
     // Cropping is all whole-pixel arithmetic in image space; these pin the
     // rules the panel depends on: nothing escapes the image, nothing collapses,

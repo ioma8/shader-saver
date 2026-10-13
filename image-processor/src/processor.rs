@@ -151,7 +151,7 @@ impl Default for RetouchSpot {
 
 // Everything that defines an image's edit, serialized to SQLite as JSON.
 // serde(default) keeps old DB rows loadable when new fields are added.
-#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct EditState {
     pub camera_preset: Option<crate::camera_presets::CameraPreset>,
@@ -2002,7 +2002,7 @@ impl LookProfile {
 }
 
 // The constrained, display-safe transform predicted by the look model.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LookTransfer {
     pub(crate) tone_delta: [f32; LOOK_ANCHORS.len()],
     pub(crate) cast_delta: [[f32; 2]; 3],
