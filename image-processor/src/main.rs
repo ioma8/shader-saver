@@ -74,6 +74,7 @@ const HISTORY_MERGE_SECS: f64 = 0.3;
 const UI_PRINT_ORIENTATION_KEY: &str = "ui_print_orientation";
 const UI_PRINT_QUALITY_KEY: &str = "ui_print_quality";
 const UI_PRINT_FIT_KEY: &str = "ui_print_fit";
+const UI_PRINT_TYPE_KEY: &str = "ui_print_paper_type";
 const UI_EXPORT_FORMAT_KEY: &str = "ui_export_format";
 const UI_EXPORT_QUALITY_KEY: &str = "ui_export_quality";
 const UI_EXPORT_MAX_KEY: &str = "ui_export_max_dim";
@@ -477,6 +478,10 @@ struct SavedUi {
     min_rating: u8,
     export: ExportOptions,
     print: print::PrintOptions,
+    /// The paper *type* the user last chose, by value, so it survives a
+    /// restart: the paper in the tray is the same paper next time, which is
+    /// not true of a printer-specific index.
+    print_paper_type: Option<String>,
 }
 
 impl SavedUi {
@@ -494,6 +499,7 @@ impl SavedUi {
             min_rating: load_pref(db, UI_MIN_RATING_KEY)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            print_paper_type: load_pref(db, UI_PRINT_TYPE_KEY).filter(|v| !v.is_empty()),
             print: print::PrintOptions {
                 orientation: print::Orientation::from_key(
                     &load_pref(db, UI_PRINT_ORIENTATION_KEY).unwrap_or_default(),
@@ -537,6 +543,11 @@ impl SavedUi {
         save_pref(db, UI_PRINT_ORIENTATION_KEY, self.print.orientation.key());
         save_pref(db, UI_PRINT_QUALITY_KEY, self.print.quality.key());
         save_bool_pref(db, UI_PRINT_FIT_KEY, self.print.fit_to_page);
+        save_pref(
+            db,
+            UI_PRINT_TYPE_KEY,
+            self.print_paper_type.as_deref().unwrap_or(""),
+        );
         save_pref(db, UI_EXPORT_FORMAT_KEY, self.export.format.key());
         save_pref(db, UI_EXPORT_QUALITY_KEY, &self.export.quality.to_string());
         save_pref(db, UI_EXPORT_MAX_KEY, &self.export.max_dim.to_string());
@@ -554,6 +565,7 @@ impl Default for SavedUi {
             min_rating: 0,
             export: ExportOptions::default(),
             print: print::PrintOptions::default(),
+            print_paper_type: None,
         }
     }
 }
@@ -860,6 +872,10 @@ struct App {
     /// Which of them CUPS would use, so the dialog can say so.
     print_default: Option<String>,
     print_papers: Vec<print::Paper>,
+    print_paper_types: Vec<print::PaperType>,
+    /// The paper type last chosen, kept by value: the paper in the tray is
+    /// the same paper next time, which is not true of a printer-specific index.
+    print_paper_type: Option<String>,
     print_pending: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// A CUPS query in flight. The scheduler is asked on a worker so opening
     /// the dialog never waits on it; the payload says whether it was the
@@ -978,6 +994,7 @@ impl App {
             crop_drag: None,
             export_opts: saved_ui.export,
             print_opts: saved_ui.print,
+            print_paper_type: saved_ui.print_paper_type.clone(),
             saved_ui,
             history: Histories::default(),
             show_export: false,
@@ -990,6 +1007,7 @@ impl App {
             print_printers: Vec::new(),
             print_default: None,
             print_papers: Vec::new(),
+            print_paper_types: Vec::new(),
             print_pending: None,
             print_probe: None,
             print_status: None,
@@ -1102,6 +1120,7 @@ impl ApplicationHandler for App {
             min_rating: self.min_rating,
             export: self.export_opts,
             print: self.print_opts,
+            print_paper_type: self.print_paper_type.clone(),
         };
         if ui != self.saved_ui {
             ui.save(self.db.as_ref());
@@ -1402,6 +1421,11 @@ impl App {
             .get(options.paper)
             .cloned()
             .unwrap_or_else(print::Paper::printer_default);
+        let paper_type = self
+            .print_paper_types
+            .get(options.paper_type)
+            .cloned()
+            .unwrap_or_else(|| self.print_paper_types[0].clone());
         // Render at most what the paper can use: this is a bound on the spool
         // file, not a claim about the printed resolution -- the printer scales
         // what it is given onto the page.
@@ -1441,7 +1465,13 @@ impl App {
         std::thread::spawn(move || {
             job.write();
             // Whatever CUPS says, including its own error text.
-            let _ = tx.send(print::send(printer.as_deref(), &options, &paper, &path));
+            let _ = tx.send(print::send(
+                printer.as_deref(),
+                &options,
+                &paper,
+                &paper_type,
+                &path,
+            ));
         });
         self.print_pending = Some(rx);
         self.print_status = Some(("Sending to the printer…".to_owned(), false));
@@ -2236,6 +2266,18 @@ impl App {
                     }
                     self.print_printer = probe.printer;
                     self.print_papers = probe.papers;
+                    self.print_paper_types = probe.paper_types;
+                    // A printer-specific index means nothing on another
+                    // printer, so the remembered choice is a value.
+                    self.print_opts.paper_type = self
+                        .print_paper_type
+                        .as_deref()
+                        .and_then(|wanted| {
+                            self.print_paper_types
+                                .iter()
+                                .position(|t| t.value.as_deref() == Some(wanted))
+                        })
+                        .unwrap_or(0);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => self.print_probe = Some(pending),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
@@ -3062,12 +3104,17 @@ mod tests {
                 dpi: 240,
             },
             print: print::PrintOptions {
+                // Both indices are per-printer: only the type's *value* is
+                // remembered (below), and the index is resolved from it when
+                // the printer's options arrive.
                 paper: 0,
+                paper_type: 0,
                 orientation: print::Orientation::Landscape,
                 quality: print::Quality::High,
                 copies: 1,
                 fit_to_page: false,
             },
+            print_paper_type: Some("com.canon-mtglossy".to_owned()),
         };
         saved.save(Some(&conn));
         assert_eq!(SavedUi::load(Some(&conn)), saved);
@@ -3075,14 +3122,19 @@ mod tests {
         // A cleared directory stays cleared rather than resurrecting the old one.
         let cleared = SavedUi {
             dir: None,
-            ..saved
+            ..saved.clone()
         };
         cleared.save(Some(&conn));
         assert_eq!(SavedUi::load(Some(&conn)), cleared);
 
-        // The paper is a per-printer choice, so it is deliberately not
-        // remembered: an index saved against one printer's list would name a
-        // different sheet on another's.
+        // The paper *size* is a per-printer choice and is deliberately not
+        // remembered -- an index saved against one printer's list would name a
+        // different sheet on another's -- but the paper *type* is remembered by
+        // value, because the paper in the tray is the same paper next time.
+        assert_eq!(
+            SavedUi::load(Some(&conn)).print_paper_type.as_deref(),
+            Some("com.canon-mtglossy")
+        );
         let mut with_paper = saved.clone();
         with_paper.print.paper = 5;
         with_paper.save(Some(&conn));

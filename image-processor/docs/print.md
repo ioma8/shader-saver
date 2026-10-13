@@ -24,6 +24,35 @@ that buys and costs:
   dialog does not cover can still be set as the printer's own default, and
   `Printer default` leaves it alone.
 
+## The paper type is what decides the ink
+
+This is the setting that matters most, and leaving it out is not neutral. A CUPS
+queue for a photo printer offers `MediaType`, defaulting to `auto` — which means
+*whatever the printer's own panel says*, and a printer's panel says plain paper.
+Plain-paper ink limits on glossy photo paper is a bleached, washed-out print,
+which is what prompted this section: a photo printed through this dialog with
+nothing but the paper *size* set came out pale.
+
+So the paper type is a control in the dialog, filled from the printer's own
+list of types (`com.canon-mtglossy` shows as `glossy`, `photographic` stays as
+it is — the labels only take the vendor prefix off, so nothing is invented about
+what a printer calls its papers). When it is left on the printer's default the
+dialog says why that is risky, in amber, every time.
+
+It is remembered **by value** across sessions rather than by index, because the
+paper in the tray is the same paper next time — and a printer-specific option
+index means nothing on another printer. The paper *size* is still chosen fresh
+each time for the same reason.
+
+## The quality option is spelled the way the queue defines it
+
+The job used to send the IPP attribute name, `print-quality=4`. That queue does
+not define an option called `print-quality` — its PPD offers
+`cupsPrintQuality/Quality: Draft *Normal High` — so CUPS ignored it, and the
+queue's own default was in force the whole time. Both are valid `lp` options and
+both reach the printer as the same IPP attribute, but only the second is what a
+CUPS queue actually looks up, so that is what is sent now.
+
 ## Everything about the paper comes from the printer
 
 A fixed list of sizes would be wrong on the machine this was written on. Its
@@ -118,6 +147,22 @@ holding — and during a folder export that is one of the *batch's* images, not
 the one on screen. Both therefore stand aside while a batch runs, with the
 dialog saying why. Nothing is corrupted either way; what is prevented is
 printing a different photograph than the one you are looking at.
+
+## What was checked before blaming the printer
+
+A bleached print has two possible homes: the file, or the machine. The file was
+ruled out by measurement rather than assumption — render a smooth gradient,
+export it through the same job the print path builds, and compare the file
+against the display texture: mean 133.57 against 133.08, worst pixel 2 levels
+apart, which is JPEG noise on a smooth ramp. A gamma or scaling slip anywhere
+between the panel and the encoded file would have shown as a brightness shift
+across the whole frame. That check is now a test
+(`the_export_matches_what_the_panel_shows`), so it cannot come back.
+
+What the printer reported at the same time, worth knowing rather than acting on:
+`marker-levels` showed the four inks at 50% and the maintenance cartridge at 5%
+— that is 95% *used*, so it is worth watching, though a spent maintenance
+cartridge stops a Canon rather than fading it.
 
 ## Failure is shown, not swallowed
 

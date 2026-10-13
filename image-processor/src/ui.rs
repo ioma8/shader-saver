@@ -981,6 +981,51 @@ pub(crate) fn print_dialog(ctx: &egui::Context, app: &mut App) {
                 app.print_opts.paper = index;
             }
 
+            // Paper type: the ink-laydown setting, and the one whose absence
+            // bleaches a photo print.
+            let mut chosen_type = None;
+            ui.horizontal(|ui| {
+                ui.label("Paper type");
+                let selected = app
+                    .print_paper_types
+                    .get(app.print_opts.paper_type)
+                    .map(|kind| kind.label.clone())
+                    .unwrap_or_else(|| "Printer default (auto)".to_owned());
+                egui::ComboBox::from_id_salt("print-paper-type")
+                    .selected_text(selected)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for (index, kind) in app.print_paper_types.iter().enumerate() {
+                            if ui
+                                .selectable_label(app.print_opts.paper_type == index, &kind.label)
+                                .clicked()
+                            {
+                                chosen_type = Some(index);
+                            }
+                        }
+                    });
+            });
+            if let Some(index) = chosen_type {
+                app.print_opts.paper_type = index;
+                // Kept by value, not index: the paper in the tray is the same
+                // paper next time, even on another printer.
+                app.print_paper_type = app
+                    .print_paper_types
+                    .get(index)
+                    .and_then(|kind| kind.value.clone());
+            }
+            if app.print_opts.paper_type == 0 {
+                ui.label(
+                    egui::RichText::new(
+                        "The paper type sets how much ink goes down. Left on the printer's \
+                         default it follows the printer's own panel, which is plain paper \
+                         — and plain-paper ink on photo paper comes out pale.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_rgb(230, 170, 90)),
+                );
+            }
+
             ui.horizontal(|ui| {
                 ui.label("Orientation");
                 for orientation in [

@@ -2603,6 +2603,71 @@ mod tests {
         let _ = std::fs::remove_file(&png_path);
     }
 
+    // What we hand to a printer has to be the picture on screen. A gamma or
+    // scaling slip anywhere between the display texture and the encoded file
+    // would show up as a brightness shift across the whole frame -- which is
+    // exactly what a bleached print looks like. Needs a GPU.
+    #[test]
+    fn the_export_matches_what_the_panel_shows() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            eprintln!("no GPU adapter; skipping the export fidelity test");
+            return;
+        };
+        let Ok((device, queue)) = pollster::block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor::default(), None),
+        ) else {
+            eprintln!("no GPU device; skipping the export fidelity test");
+            return;
+        };
+        // A smooth mid-tone gradient, where a gamma mistake is unmistakable.
+        let (w, h) = (256u32, 256u32);
+        let img = image::RgbaImage::from_fn(w, h, |x, y| {
+            let v = (20 + x * 200 / w).saturating_add(y * 30 / h) as u8;
+            image::Rgba([v, v, v, 255])
+        });
+        let mut proc = Processor::new(&device);
+        proc.upload_rgba(&img, &device, &queue);
+        let shown = proc.output_pixels(&device, &queue).unwrap();
+
+        let path = std::env::temp_dir().join("image_processor_fidelity_test.jpg");
+        let _ = std::fs::remove_file(&path);
+        proc.export_job(
+            &path,
+            &ExportOptions {
+                format: ExportFormat::Jpeg,
+                quality: 95,
+                max_dim: 0,
+                dpi: 600,
+            },
+            &device,
+            &queue,
+        )
+        .expect("a job should be readied")
+        .write();
+        let written = image::open(&path).expect("the export should exist").to_rgba8();
+        let _ = std::fs::remove_file(&path);
+
+        let luma = |px: &[u8], i: usize| {
+            0.2126 * f64::from(px[i * 4])
+                + 0.7152 * f64::from(px[i * 4 + 1])
+                + 0.0722 * f64::from(px[i * 4 + 2])
+        };
+        let n = (w * h) as usize;
+        let panel: f64 = (0..n).map(|i| luma(&shown, i)).sum::<f64>() / n as f64;
+        let file: f64 = (0..n).map(|i| luma(written.as_raw(), i)).sum::<f64>() / n as f64;
+        assert!(
+            (panel - file).abs() < 2.0,
+            "the file is not the picture we showed: panel mean {panel:.2}, file mean {file:.2}"
+        );
+        let worst = (0..n)
+            .map(|i| (luma(&shown, i) - luma(written.as_raw(), i)).abs())
+            .fold(0.0f64, f64::max);
+        assert!(worst < 6.0, "a pixel differs by {worst:.1}: not just JPEG noise");
+    }
+
     // What reaches the file is exactly the crop rect, pixel for pixel.
     #[test]
     fn exporting_takes_exactly_the_crop() {

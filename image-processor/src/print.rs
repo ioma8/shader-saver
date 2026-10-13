@@ -16,6 +16,11 @@
 //!   Canon_G3030_series je nečinná"). The parsers here are positional instead:
 //!   printer names are the *first* token of an `lpstat -a` line, the second of
 //!   an `lpstat -p` line, and whatever follows the colon in `lpstat -d`.
+//! * **The paper *type* decides how much ink goes down, and leaving it out is
+//!   not neutral.** A Canon queue defaults to `MediaType=auto`, which means
+//!   "whatever the printer's own panel says" -- and the panel says plain paper.
+//!   Plain-paper ink limits on glossy photo paper is a bleached print, which is
+//!   exactly what one user got. The dialog now sends the type.
 //! * **The paper sizes are the printer's, not a fixed list.** The Canon on that
 //!   machine lists 41 of them -- A4 and A5 but no A3, Letter and Legal but no
 //!   Tabloid, 215x345mm and 89x89mm alongside 4x6 and 8x10, envelopes, and its
@@ -77,12 +82,17 @@ impl Quality {
             Self::High => "High",
         }
     }
-    /// 3 = draft, 4 = normal, 5 = high (IPP `print-quality`).
-    fn cups_value(self) -> u8 {
+    /// The PPD option *value*, which is what CUPS queues define and honour
+    /// (`cupsPrintQuality/Quality: Draft *Normal High` on the printer this was
+    /// written for). The numeric IPP attribute it stands for is `print-quality`
+    /// 3/4/5, which CUPS turns this into for a driverless queue -- but a queue
+    /// that does not define a `print-quality` option ignores that name
+    /// entirely, which is what used to happen here.
+    fn cups_value(self) -> &'static str {
         match self {
-            Self::Draft => 3,
-            Self::Normal => 4,
-            Self::High => 5,
+            Self::Draft => "Draft",
+            Self::Normal => "Normal",
+            Self::High => "High",
         }
     }
     pub fn key(self) -> &'static str {
@@ -145,12 +155,75 @@ impl Orientation {
     }
 }
 
+/// A paper type the printer accepts: the ink-laydown setting. `value` is the
+/// CUPS option value; the first entry is always the printer's own default.
+#[derive(Clone, PartialEq, Debug)]
+pub struct PaperType {
+    pub label: String,
+    /// `None` leaves the type to the printer, which is what its own `auto`
+    /// setting means -- and is why a photo printed without choosing one can
+    /// come out with plain-paper ink on it.
+    pub value: Option<String>,
+}
+
+/// `com.canon-mtglossy` -> `glossy`. The words come from the value itself, so
+/// nothing is invented about what a printer calls its papers; the vendor prefix
+/// is all that is stripped.
+fn media_type_label(value: &str) -> String {
+    let base = value.strip_prefix("com.canon-").unwrap_or(value);
+    let base = base
+        .strip_prefix("mt")
+        .filter(|rest| rest.len() > 1)
+        .unwrap_or(base);
+    base.to_owned()
+}
+
+/// The paper types a printer offers, from `lpoptions -l`. The first entry is
+/// the printer's own default.
+pub fn parse_paper_types(lpoptions: &str) -> Vec<PaperType> {
+    let mut types = vec![PaperType {
+        label: "Printer default (auto)".to_owned(),
+        value: None,
+    }];
+    let Some(line) = lpoptions.lines().find(|line| {
+        line.split(':')
+            .next()
+            .is_some_and(|head| head.starts_with("MediaType"))
+    }) else {
+        return types;
+    };
+    let Some((_, values)) = line.split_once(':') else {
+        return types;
+    };
+    for value in values.split_whitespace() {
+        let (is_default, name) = match value.strip_prefix('*') {
+            Some(name) => (true, name),
+            None => (false, value),
+        };
+        // `auto` is the default entry above, whatever the printer marks.
+        if name.is_empty() || name == "auto" {
+            continue;
+        }
+        if types.iter().any(|t| t.value.as_deref() == Some(name)) {
+            continue;
+        }
+        types.push(PaperType {
+            label: media_type_label(name),
+            value: Some(name.to_owned()),
+        });
+        let _ = is_default;
+    }
+    types
+}
+
 /// What the dialog collects. Everything here maps onto `lp` options; nothing
 /// here is baked into the image except its size.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct PrintOptions {
     /// Index into the paper list the dialog is showing.
     pub paper: usize,
+    /// Index into the paper type list. 0 is the printer's own default.
+    pub paper_type: usize,
     pub orientation: Orientation,
     pub quality: Quality,
     pub copies: u32,
@@ -161,6 +234,7 @@ impl Default for PrintOptions {
     fn default() -> Self {
         Self {
             paper: 0,
+            paper_type: 0,
             orientation: Orientation::Printer,
             quality: Quality::Normal,
             copies: 1,
@@ -394,7 +468,13 @@ pub fn parse_printers(lpstat_a: &str, lpstat_p: &str, lpstat_d: &str) -> (Vec<St
 
 /// The argv for `lp`: printer, copies, paper, orientation, quality, scaling,
 /// then the file.
-pub fn lp_args(printer: Option<&str>, options: &PrintOptions, paper: &Paper, path: &Path) -> Vec<String> {
+pub fn lp_args(
+    printer: Option<&str>,
+    options: &PrintOptions,
+    paper: &Paper,
+    paper_type: &PaperType,
+    path: &Path,
+) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
     if let Some(printer) = printer.filter(|p| !p.is_empty()) {
         args.push("-d".to_owned());
@@ -411,10 +491,15 @@ pub fn lp_args(printer: Option<&str>, options: &PrintOptions, paper: &Paper, pat
     if let Some(media) = &paper.media {
         option(format!("media={media}"));
     }
+    // The ink-laydown setting. Omitting it is not neutral: the printer then
+    // falls back to its own panel, which is plain paper.
+    if let Some(paper_type) = &paper_type.value {
+        option(format!("MediaType={paper_type}"));
+    }
     if let Some(value) = options.orientation.cups_value() {
         option(format!("orientation-requested={value}"));
     }
-    option(format!("print-quality={}", options.quality.cups_value()));
+    option(format!("cupsPrintQuality={}", options.quality.cups_value()));
     if options.fit_to_page {
         option("fit-to-page".to_owned());
     }
@@ -493,16 +578,16 @@ pub fn available_printers() -> (Vec<String>, Option<String>) {
     )
 }
 
-/// The papers `printer` offers. With no printer named, CUPS answers for its own
-/// default, which is what the dialog starts on.
-pub fn papers_for(printer: Option<&str>) -> Vec<Paper> {
+/// Everything `lpoptions` says about `printer`, as one listing: the papers and
+/// the paper types both come out of it, so it is only asked once.
+pub fn list_options(printer: Option<&str>) -> String {
     let mut args: Vec<&str> = Vec::new();
     if let Some(printer) = printer.filter(|p| !p.is_empty()) {
         args.push("-p");
         args.push(printer);
     }
     args.push("-l");
-    parse_papers(&query("lpoptions", &args))
+    query("lpoptions", &args)
 }
 
 /// Everything the dialog needs to know, in one round trip, so a worker can
@@ -514,6 +599,8 @@ pub struct Probe {
     /// else the first queue. The caller shows the papers for exactly this.
     pub printer: Option<String>,
     pub papers: Vec<Paper>,
+    /// The paper types that printer takes, from the same listing.
+    pub paper_types: Vec<PaperType>,
 }
 
 /// Ask CUPS about the queues (when `with_printers`) and about `printer`'s
@@ -528,12 +615,13 @@ pub fn probe(printer: Option<&str>, with_printers: bool) -> Probe {
         .map(str::to_owned)
         .or_else(|| default.clone())
         .or_else(|| printers.first().cloned());
-    let papers = papers_for(target.as_deref());
+    let listed = list_options(target.as_deref());
     Probe {
         printers,
         default,
         printer: target,
-        papers,
+        papers: parse_papers(&listed),
+        paper_types: parse_paper_types(&listed),
     }
 }
 
@@ -544,9 +632,10 @@ pub fn send(
     printer: Option<&str>,
     options: &PrintOptions,
     paper: &Paper,
+    paper_type: &PaperType,
     path: &Path,
 ) -> Result<String, String> {
-    let args = lp_args(printer, options, paper, path);
+    let args = lp_args(printer, options, paper, paper_type, path);
     let ran = run_bounded("lp", &args, SEND_TIMEOUT).ok_or_else(|| {
         // Killing it leaves the submission in an unknown state, so say so
         // rather than guessing in either direction.
@@ -717,24 +806,62 @@ mod tests {
         assert_eq!(fit_inside(1, 4000, (100, 100)), (1, 100));
     }
 
+    // The Canon's real MediaType line. The values are its own keys, so the
+    // labels only take the vendor prefix off -- nothing is invented about what
+    // a printer calls its papers -- except `auto`, which is the default entry.
+    const CANON_TYPES: &str = "MediaType/MediaType: com.canon-mtluster com.canon-mtgr \
+        com.canon-mtmat com.canon-mtglossy com.canon-mthires com.canon-mthagakiglossy \
+        com.canon-mtsemisuper com.canon-mtgreeting com.canon-mtcardstock com.canon-0780 \
+        com.canon-mtinkjet envelope stationery photographic *auto\n";
+
+    #[test]
+    fn paper_types_come_from_the_printer_including_its_default() {
+        let types = parse_paper_types(CANON_TYPES);
+        assert_eq!(types[0].label, "Printer default (auto)");
+        assert_eq!(types[0].value, None, "the default sends no option at all");
+        assert_eq!(types.len(), 1 + 14, "auto appears once, as the default");
+        assert!(types.iter().any(|t| t.value.as_deref() == Some("photographic")));
+        let glossy = types
+            .iter()
+            .find(|t| t.value.as_deref() == Some("com.canon-mtglossy"))
+            .expect("glossy paper is offered");
+        assert_eq!(glossy.label, "glossy");
+        // A value that is not a Canon key keeps its own name.
+        assert!(types.iter().any(|t| t.label == "stationery"));
+        // Nothing to read: the default alone, which is what the printer would
+        // have done anyway.
+        assert_eq!(parse_paper_types("").len(), 1);
+        assert_eq!(media_type_label("com.canon-mtmat"), "mat");
+        assert_eq!(media_type_label("com.canon-0780"), "0780");
+        assert_eq!(media_type_label("photographic"), "photographic");
+    }
+
     #[test]
     fn the_lp_command_says_what_the_dialog_says() {
         let papers = parse_papers(CANON_OPTIONS);
+        let types = parse_paper_types(CANON_TYPES);
         let a4 = papers
             .iter()
             .find(|p| p.media.as_deref() == Some("A4"))
             .unwrap()
             .clone();
+        let glossy = types
+            .iter()
+            .find(|t| t.value.as_deref() == Some("com.canon-mtglossy"))
+            .unwrap()
+            .clone();
         let path = PathBuf::from("/Users/someone/.image-processor/print.jpg");
 
         // Everything at its default: one comment-free, single-copy job with the
-        // paper left to the printer.
-        let plain = lp_args(None, &PrintOptions::default(), &papers[0], &path);
+        // paper and the paper type left to the printer. The quality is spelled
+        // the way a CUPS queue defines it -- `cupsPrintQuality`, not the IPP
+        // attribute name, which such a queue ignores.
+        let plain = lp_args(None, &PrintOptions::default(), &papers[0], &types[0], &path);
         assert_eq!(
             plain,
             vec![
                 "-o",
-                "print-quality=4",
+                "cupsPrintQuality=Normal",
                 "-o",
                 "fit-to-page",
                 "--",
@@ -744,12 +871,19 @@ mod tests {
 
         let options = PrintOptions {
             paper: 1,
+            paper_type: 1,
             orientation: Orientation::Landscape,
             quality: Quality::High,
             copies: 3,
             fit_to_page: false,
         };
-        let full = lp_args(Some("Canon_G3030_series"), &options, &a4, &path);
+        let full = lp_args(
+            Some("Canon_G3030_series"),
+            &options,
+            &a4,
+            &glossy,
+            &path,
+        );
         assert_eq!(
             full,
             vec![
@@ -760,9 +894,11 @@ mod tests {
                 "-o",
                 "media=A4",
                 "-o",
+                "MediaType=com.canon-mtglossy",
+                "-o",
                 "orientation-requested=4",
                 "-o",
-                "print-quality=5",
+                "cupsPrintQuality=High",
                 "--",
                 "/Users/someone/.image-processor/print.jpg"
             ]
@@ -772,10 +908,14 @@ mod tests {
             orientation: Orientation::Portrait,
             ..PrintOptions::default()
         };
-        let args = lp_args(Some(""), &portrait, &papers[0], &path);
+        let args = lp_args(Some(""), &portrait, &papers[0], &types[0], &path);
         assert!(args.contains(&"orientation-requested=3".to_owned()));
         assert!(!args.contains(&"-d".to_owned()));
         assert!(!args.contains(&"-n".to_owned()), "one copy needs no -n");
+        // The paper type decides the ink, so it is sent whenever it is not the
+        // printer's own default.
+        assert!(!args.iter().any(|a| a.starts_with("MediaType")));
+        assert!(full.iter().any(|a| a == "MediaType=com.canon-mtglossy"));
     }
 
     // `std::process` has no timeout, so `run_bounded` supplies one. Without
