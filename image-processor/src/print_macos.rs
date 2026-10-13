@@ -23,8 +23,8 @@ use objc2::{AllocAnyThread, MainThreadMarker};
 
 use crate::print;
 use objc2_app_kit::{
-    NSImage, NSImageView, NSImageScaling, NSPrintInfo, NSPrintOperation,
-    NSPrintingPaginationMode, NSPrinter,
+    NSImage, NSImageView, NSImageScaling, NSModalResponseOK, NSPrintInfo, NSPrintOperation,
+    NSPrintPanel, NSPrintPanelOptions, NSPrintingPaginationMode, NSPrinter,
 };
 use objc2_foundation::{NSData, NSMutableData, NSString};
 
@@ -74,14 +74,41 @@ fn print_info(page: &Page) -> Retained<NSPrintInfo> {
     info
 }
 
+/// Whether two names are the same printer. AppKit uses the printer's own name
+/// ("Canon G3030 series"); CUPS names its queue "Canon_G3030_series". Matching
+/// the strings exactly therefore fails for exactly the printers whose names
+/// have spaces in them, which is most of them.
+fn same_printer(appkit: &str, cups: &str) -> bool {
+    let normalise = |name: &str| {
+        name.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(|c| c.to_lowercase())
+            .collect::<String>()
+    };
+    normalise(appkit) == normalise(cups)
+}
+
 /// Select the printer CUPS would use, so the sheet opens on the one already in
-/// use rather than on whatever AppKit would guess. Best effort: a sheet with
-/// the wrong preselection is a nuisance, not a failure.
-pub fn preselect_default_printer(info: &NSPrintInfo, name: &str) {
-    let name = NSString::from_str(name);
-    if let Some(printer) = NSPrinter::printerWithName(&name) {
-        info.setPrinter(&printer);
+/// use rather than on whatever AppKit would guess. Best effort: a sheet with the
+/// wrong preselection is a nuisance, not a failure.
+pub fn preselect_default_printer(info: &NSPrintInfo, cups_name: &str) {
+    for name in printer_names() {
+        if same_printer(&name, cups_name) {
+            if let Some(printer) = NSPrinter::printerWithName(&NSString::from_str(&name)) {
+                info.setPrinter(&printer);
+            }
+            return;
+        }
     }
+}
+
+/// The printer names AppKit knows. Worth seeing next to the CUPS queue names,
+/// which are not always spelled the same way.
+pub fn printer_names() -> Vec<String> {
+    NSPrinter::printerNames()
+        .iter()
+        .map(|name| name.to_string())
+        .collect()
 }
 
 /// Write the page to PDF. No sheet, no printer: this is the half of printing
@@ -111,9 +138,33 @@ pub fn to_pdf(page: &Page) -> Result<Vec<u8>, String> {
     Ok(data.to_vec())
 }
 
-/// Show the system print sheet. Blocks until the user is done with it, which is
-/// what a modal sheet does — that is why the caller renders first, off the UI
-/// thread, so only the sheet itself is modal.
+/// Ask for a page: paper size, orientation, scaling, and whatever the driver
+/// adds. Returns `false` if the user cancelled.
+///
+/// This is a separate step from printing on purpose. `runOperation` shows the
+/// panel and then prints, and if the panel does not come up for any reason
+/// there is nothing to stop it going straight to the printer — which is exactly
+/// what happened once while this was being written: a page of photo paper came
+/// out of a print that nobody asked for. Asking first and turning the panel off
+/// for the job removes that possibility: no answer, no print.
+fn ask_for_page(mtm: MainThreadMarker, info: &NSPrintInfo) -> bool {
+    let panel = NSPrintPanel::printPanel(mtm);
+    // The stock panel offers copies and the page range and nothing else: paper
+    // size, orientation and scaling are opt-in, which is why a sheet can come
+    // up with no way to choose the paper at all.
+    panel.setOptions(
+        NSPrintPanelOptions::ShowsCopies
+            | NSPrintPanelOptions::ShowsPageRange
+            | NSPrintPanelOptions::ShowsPaperSize
+            | NSPrintPanelOptions::ShowsOrientation
+            | NSPrintPanelOptions::ShowsScaling
+            | NSPrintPanelOptions::ShowsPageSetupAccessory
+            | NSPrintPanelOptions::ShowsPreview,
+    );
+    panel.runModalWithPrintInfo(info) == NSModalResponseOK
+}
+
+/// Show the system print sheet and print what the user confirms.
 pub fn run_dialog(page: &Page) -> Result<String, String> {
     let mtm = main_thread()?;
     let view = image_view(mtm, page)?;
@@ -122,21 +173,24 @@ pub fn run_dialog(page: &Page) -> Result<String, String> {
     if let Some(name) = default {
         preselect_default_printer(&info, &name);
     }
-    let operation = NSPrintOperation::printOperationWithView_printInfo(&view, &info);
-    operation.setShowsPrintPanel(true);
-    operation.setShowsProgressPanel(true);
-    operation.setJobTitle(Some(&NSString::from_str("Image Processor")));
-    if !operation.runOperation() {
-        // The sheet's own button: cancelled, or the job failed. Either way
-        // nothing was printed.
+    if !ask_for_page(mtm, &info) {
         return Err("the print sheet was closed without printing".to_owned());
+    }
+    // The panel writes the user's choices back into the print info it was given
+    // -- paper, orientation, scaling, and whatever the driver added -- and that
+    // is the object the job is built from.
+    let operation = NSPrintOperation::printOperationWithView_printInfo(&view, &info);
+    operation.setShowsPrintPanel(false);
+    operation.setShowsProgressPanel(true);
+    if !operation.runOperation() {
+        return Err("the job could not be run".to_owned());
     }
     Ok("sent to the printer".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{to_pdf, Page};
+    use super::{same_printer, to_pdf, Page};
     use objc2::{AllocAnyThread, MainThreadMarker};
     use objc2_app_kit::NSImage;
     use objc2_foundation::NSData;
@@ -158,17 +212,41 @@ mod tests {
         bytes
     }
 
+    // The printers whose names contain spaces are exactly the ones an exact
+    // string match fails on, and the Canon on this machine is one of them.
+    #[test]
+    fn printer_names_match_across_appkit_and_cups() {
+        assert!(same_printer("Canon G3030 series", "Canon_G3030_series"));
+        assert!(same_printer("HP_LaserJet_P2055dn", "HP_LaserJet_P2055dn"));
+        assert!(same_printer("Epson ET-2850 Series", "Epson_ET-2850_Series"));
+        assert!(!same_printer("Canon G3030 series", "HP_LaserJet_P2055dn"));
+        assert!(!same_printer("", "anything"));
+    }
+
+    // The file's own resolution is what AppKit sizes the page from, which is the
+    // whole reason the render records one: a 1200x800 render at 600 dpi is two
+    // inches wide, and "do not scale" then means two inches rather than whatever
+    // the driver would have assumed. An image is not a view, so unlike the rest
+    // of this module it can be checked off the main thread.
+    #[test]
+    fn appkit_reads_the_size_out_of_the_resolution_we_write() {
+        let data = NSData::with_bytes(&page_bytes(600, 1200, 800));
+        let image = NSImage::initWithData(NSImage::alloc(), &data).expect("a readable image");
+        let size = image.size();
+        // 1200/600 inch = 2 in = 144 points; 800/600 in = 96 points.
+        assert!((size.width - 144.0).abs() < 2.0, "width {} points", size.width);
+        assert!((size.height - 96.0).abs() < 2.0, "height {} points", size.height);
+    }
+
     // AppKit views may only be built on the main thread, and objc2 makes that a
     // compile-time proof rather than a runtime gamble -- so the way in has to
     // refuse rather than proceed. Under `cargo test` that is exactly the
     // situation, which is why this is a test and the sheet itself is not: the
-    // page building is verified by hand through the PDF button, which uses the
-    // same view and page setup as the sheet.
+    // page building is verified by hand, by looking at the panel and by writing
+    // a PDF through the same view and page setup.
     #[test]
     fn building_a_page_off_the_main_thread_is_refused() {
         if MainThreadMarker::new().is_some() {
-            // Single-threaded harnesses put tests on the main thread; then the
-            // refusal cannot be observed and there is nothing to check.
             eprintln!("running on the main thread; nothing to check here");
             return;
         }

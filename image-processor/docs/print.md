@@ -42,6 +42,34 @@ main-thread access at compile time — AppKit views may not be built anywhere
 else. `to_pdf` refuses with a plain error rather than risking it, and a test
 pins that refusal.
 
+### The sheet's options are opt-in
+
+The first version of this shipped a sheet with **no way to choose the paper**,
+because AppKit's stock print panel offers only copies and a page range. Paper
+size, orientation, scaling and the page-setup accessory have to be asked for:
+
+```rust
+panel.setOptions(ShowsCopies | ShowsPageRange | ShowsPaperSize
+                 | ShowsOrientation | ShowsScaling | ShowsPageSetupAccessory
+                 | ShowsPreview);
+```
+
+Two more things learned the same way, by looking at the panel rather than at the
+code:
+
+- **AppKit and CUPS name printers differently.** AppKit uses the printer's own
+  name, `Canon G3030 series`; CUPS calls its queue `Canon_G3030_series`. Matching
+  the strings exactly fails for exactly the printers whose names contain spaces,
+  which is most of them, so the preselection never fired. Names are compared with
+  spaces and case removed now.
+- **`runOperation` prints if the panel does not come up.** It shows the panel and
+  then prints; when the panel failed to appear it went straight to the printer,
+  and a page of photo paper came out of a print nobody asked for. So asking and
+  printing are separate steps: the panel runs modally on its own, and only an
+  explicit OK builds and runs the job — with `showsPrintPanel` off, since the
+  question has already been asked. A panel that fails to appear returns Abort,
+  which is not OK, so nothing prints.
+
 ### What is checked, and what is not
 
 Checked by hand, because it is the whole risky half: a real photograph goes
@@ -51,13 +79,14 @@ page, which rasterises to the photograph, correctly scaled to the paper
 the printer was set to). `PDF…` is the same code path, so it doubles as the
 "look before you spend paper" button.
 
-**Not** checked here: the sheet itself. `cargo test` runs tests on spawned
-threads, and AppKit views require the main thread, so no test can put the sheet
-up — the first print from this build is the first real exercise of it. The
-modal-loop hazard is real and known: a sheet pumps the run loop, which is why
-the render happens on a worker and only the sheet is modal, and why this is the
-same pattern the app already uses for file dialogs (`rfd`), which are also
-modal AppKit panels opened from inside the frame.
+**Not** checked by any test: the panel and the sheet. `cargo test` runs tests on
+spawned threads, and AppKit views require the main thread, so no test can put
+them up — they were checked by eye instead, which is how the missing paper size
+and the printer-name mismatch were found. The modal-loop hazard is real and
+known: a panel pumps the run loop, which is why the render happens on a worker
+and only the panel is modal, and why this is the same pattern the app already
+uses for file dialogs (`rfd`), which are also modal AppKit panels opened from
+inside the frame.
 
 ## The CUPS path (everything that is not macOS)
 
