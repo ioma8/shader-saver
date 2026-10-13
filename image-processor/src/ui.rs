@@ -669,6 +669,18 @@ fn brush_radius_px(min_dim: f32, radius: f32) -> f32 {
     radius.clamp(2.0, (min_dim * 0.25).max(2.0))
 }
 
+/// How far the image moves this frame. A drag and a two-finger trackpad swipe
+/// are both reported by egui in "how the content should move" units, so either
+/// one just adds to the offset; a drag wins if both land in the same frame.
+/// Neither moves anything while the image is fitted, where there is nothing to
+/// pan to.
+fn pan_delta(fit: bool, drag: Option<egui::Vec2>, scroll: egui::Vec2) -> egui::Vec2 {
+    if fit {
+        return egui::Vec2::ZERO;
+    }
+    drag.unwrap_or(scroll)
+}
+
 /// Offset that keeps the image point under `anchor` (panel coordinates) fixed
 /// while the scale changes from `old_scale` to `new_scale`. Shared by the wheel
 /// and by a trackpad pinch, which must both scale *about the cursor*.
@@ -1611,7 +1623,7 @@ pub(crate) fn edit(
 
                             if processor.has_image() {
                                 ui.label(
-                                    egui::RichText::new("Scroll or pinch: zoom · Double-click: 100% / fit · Hold/Space: original · Hold R: reference")
+                                    egui::RichText::new("Pinch or ⌘-scroll: zoom · scroll or drag: pan · Double-click: 100% / fit · Hold/Space: original · Hold R: reference")
                                         .small()
                                         .color(egui::Color32::from_gray(120)),
                                 );
@@ -1773,10 +1785,21 @@ pub(crate) fn edit(
                                     (*zoom_offset, *zoom_scale)
                                 };
 
-                                // Pan when zoomed — drag translates the image offset
-                                if is_dragging && !*zoom_fit {
-                                    *zoom_offset += response.drag_delta();
-                                }
+                                // Pan: a one-finger drag, or a two-finger trackpad
+                                // swipe. egui reports the swipe in "how the
+                                // content should move" units -- the same as a
+                                // drag delta -- so both just add to the offset
+                                // and the image follows the fingers.
+                                let delta = pan_delta(
+                                    *zoom_fit,
+                                    is_dragging.then(|| response.drag_delta()),
+                                    if response.hovered() {
+                                        ctx.input(|i| i.smooth_scroll_delta)
+                                    } else {
+                                        egui::Vec2::ZERO
+                                    },
+                                );
+                                *zoom_offset += delta;
 
                                 let img_rect = egui::Rect::from_min_size(
                                     panel_rect.min + img_offset,
@@ -1829,23 +1852,15 @@ pub(crate) fn edit(
                                     );
                                 }
 
-                                // Scroll zooms, and so does a trackpad pinch --
-                                // on macOS that arrives as a Zoom event, which
-                                // egui reports as a per-frame factor (so does
-                                // ctrl/cmd-scroll, which egui routes here rather
-                                // than to the scroll delta). Both scale about
-                                // the cursor, so whatever is under it stays put.
+                                // Zoom about the cursor. A trackpad pinch arrives
+                                // as a Zoom event, which egui reports as a
+                                // per-frame factor; ctrl/cmd-scroll takes the
+                                // same path (egui routes it here rather than to
+                                // the scroll delta, so plain scrolling is free
+                                // to pan).
                                 if response.hovered() {
-                                    let (scroll, pinch) =
-                                        ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
-                                    let factor = if (pinch - 1.0).abs() > 1e-3 {
-                                        pinch
-                                    } else if scroll.abs() > 0.5 {
-                                        (1.0_f32 + scroll * 0.003).clamp(0.8, 1.25)
-                                    } else {
-                                        1.0
-                                    };
-                                    if (factor - 1.0).abs() > 1e-6 {
+                                    let factor = ctx.input(|i| i.zoom_delta());
+                                    if (factor - 1.0).abs() > 1e-3 {
                                         let cursor = response.hover_pos()
                                             .unwrap_or(panel_rect.center());
                                         let c = cursor - panel_rect.min;
@@ -1874,7 +1889,21 @@ pub(crate) fn edit(
 
 #[cfg(test)]
 mod tests {
-    use super::{brush_radius_px, brush_size_step, step_brush, zoom_about};
+    use super::{brush_radius_px, brush_size_step, pan_delta, step_brush, zoom_about};
+
+    // A two-finger swipe and a drag both pan the image in the direction of the
+    // gesture (egui's scroll delta already means "how the content should
+    // move"), and neither does anything while the image is fitted, where there
+    // is nothing to pan to.
+    #[test]
+    fn a_scroll_or_drag_pans_only_when_zoomed_in() {
+        let scroll = egui::vec2(12.0, -30.0);
+        assert_eq!(pan_delta(false, None, scroll), scroll);
+        assert_eq!(pan_delta(true, None, scroll), egui::Vec2::ZERO);
+        let drag = egui::vec2(-5.0, 7.0);
+        assert_eq!(pan_delta(false, Some(drag), scroll), drag);
+        assert_eq!(pan_delta(true, Some(drag), scroll), egui::Vec2::ZERO);
+    }
 
     // Zooming about the cursor must leave the image point under the cursor
     // where it is -- that is the whole reason the anchor is passed in.
