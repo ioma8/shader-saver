@@ -54,11 +54,16 @@ keep a session bounded; realistic use is orders of magnitude smaller.
   a print shop wants, the second keeps the depth of the edit chain;
 - an optional **longest side** (the aspect is kept), with the output size shown
   before you commit;
+- a **resolution** to record in the file, in dpi — a JPEG that says nothing
+  about its size leaves whoever prints it to guess, so 300 is the default and 0
+  records nothing;
 - **Export this image…** to a file, or **Export N picked…** (picks, or with none
   everything the browse filter is showing) to a folder.
 
 What is written is **the crop**, at the size the dialog reports, because both go
-through `crop_px` — the same whole-pixel rect the panel draws.
+through `crop_px` — the same whole-pixel rect the panel draws. A failed write
+removes its own half-written file rather than leaving a truncated image at the
+target.
 
 ### The folder export
 

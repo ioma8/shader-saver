@@ -77,6 +77,7 @@ const UI_PRINT_FIT_KEY: &str = "ui_print_fit";
 const UI_EXPORT_FORMAT_KEY: &str = "ui_export_format";
 const UI_EXPORT_QUALITY_KEY: &str = "ui_export_quality";
 const UI_EXPORT_MAX_KEY: &str = "ui_export_max_dim";
+const UI_EXPORT_DPI_KEY: &str = "ui_export_dpi";
 const UI_WINDOW_W_KEY: &str = "ui_window_width";
 const UI_WINDOW_H_KEY: &str = "ui_window_height";
 const DEFAULT_WINDOW: (f32, f32) = (1600.0, 1000.0);
@@ -515,6 +516,9 @@ impl SavedUi {
                 max_dim: load_pref(db, UI_EXPORT_MAX_KEY)
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0),
+                dpi: load_pref(db, UI_EXPORT_DPI_KEY)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(ExportOptions::default().dpi),
             },
         }
     }
@@ -536,6 +540,7 @@ impl SavedUi {
         save_pref(db, UI_EXPORT_FORMAT_KEY, self.export.format.key());
         save_pref(db, UI_EXPORT_QUALITY_KEY, &self.export.quality.to_string());
         save_pref(db, UI_EXPORT_MAX_KEY, &self.export.max_dim.to_string());
+        save_pref(db, UI_EXPORT_DPI_KEY, &self.export.dpi.to_string());
     }
 }
 
@@ -852,8 +857,14 @@ struct App {
     /// `None` means whatever CUPS has as its default.
     print_printer: Option<String>,
     print_printers: Vec<String>,
+    /// Which of them CUPS would use, so the dialog can say so.
+    print_default: Option<String>,
     print_papers: Vec<print::Paper>,
     print_pending: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// A CUPS query in flight. The scheduler is asked on a worker so opening
+    /// the dialog never waits on it; the payload says whether it was the
+    /// opening query, and which printer the papers belong to.
+    print_probe: Option<std::sync::mpsc::Receiver<(bool, print::Probe)>>,
     /// The last thing to report, and whether it went wrong.
     print_status: Option<(String, bool)>,
 }
@@ -977,8 +988,10 @@ impl App {
             show_print: false,
             print_printer: None,
             print_printers: Vec::new(),
+            print_default: None,
             print_papers: Vec::new(),
             print_pending: None,
+            print_probe: None,
             print_status: None,
         }
     }
@@ -1340,20 +1353,43 @@ impl App {
     /// than every frame. The paper list belongs to a printer, so it is fetched
     /// per printer and the choice starts again at the printer's own default.
     fn open_print_dialog(&mut self) {
-        let (printers, default) = print::available_printers();
-        self.print_printer = default.or_else(|| printers.first().cloned());
-        self.print_papers = print::papers_for(self.print_printer.as_deref());
-        self.print_printers = printers;
-        self.print_opts.paper = 0;
-        self.print_status = None;
         self.show_print = true;
+        self.print_status = None;
+        self.probe_printer(None, true);
+    }
+
+    /// Ask CUPS about the queues and/or one printer's papers, on a worker: a
+    /// query takes ~70 ms here, and a scheduler that is not answering would
+    /// otherwise block the window for as long as it liked. A second call
+    /// replaces the first, which drops its receiver and so its answer with it.
+    fn probe_printer(&mut self, printer: Option<String>, with_printers: bool) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let probe = print::probe(printer.as_deref(), with_printers);
+            let _ = tx.send((with_printers, probe));
+        });
+        self.print_probe = Some(rx);
     }
 
     /// Render the crop and hand it to CUPS, on a thread: the render and encode
     /// take a moment, and the outcome comes back through a channel so the
     /// dialog can report what `lp` said.
     fn start_print(&mut self) {
-        let Some(dir) = app_dir() else {
+        // A folder export is driving the processor through other images, so
+        // what is loaded is not what is on screen: rendering now would print
+        // the wrong photograph. The dialog says so and disables the button;
+        // this is the belt to that braces.
+        if self.exporting() {
+            self.print_status = Some((
+                "An export is running — printing is paused until it finishes".to_owned(),
+                true,
+            ));
+            return;
+        }
+        if self.print_pending.is_some() {
+            return;
+        }
+        let Some(dir) = app_dir().filter(|dir| std::fs::create_dir_all(dir).is_ok()) else {
             self.print_status = Some(("No place to write the print file".to_owned(), true));
             return;
         };
@@ -1380,7 +1416,15 @@ impl App {
             format: ExportFormat::Jpeg,
             quality: 92,
             max_dim: tw.max(th),
+            // The image was laid out for this paper at this resolution, so say
+            // so: with the resolution recorded, "do not scale" means the size
+            // this was prepared at rather than whatever the driver assumes. A
+            // 4961 px frame for A4 is 8.27 inches at 600, which is the page.
+            dpi: print::PRINT_DPI as u16,
         };
+        // One fixed name, overwritten each time: prints are serialised by the
+        // disabled Print button, so nothing can be reading it while it is
+        // rewritten, and there is nothing left on disk to clean up.
         let path = dir.join("print.jpg");
         let job = match (self.processor.as_ref(), self.gpu.as_ref()) {
             (Some(proc), Some(gpu)) => {
@@ -1927,15 +1971,24 @@ impl App {
             self.register_image(&path);
         }
         if requests.show_export {
+            // One at a time: both are centred, and both act on "the image".
+            self.show_print = false;
             self.show_export = true;
         }
         if requests.show_print {
+            self.show_export = false;
             self.open_print_dialog();
         }
         if let Some(path) = requests.export_path {
-            let options = self.export_opts;
-            if let (Some(proc), Some(gpu)) = (&self.processor, &self.gpu) {
-                proc.export(&path, &options, &gpu.device, &gpu.queue);
+            // Same reason as printing: a batch has another image loaded, so
+            // this would write that one to the file the user chose.
+            if self.exporting() {
+                eprintln!("export ignored: a folder export is running");
+            } else {
+                let options = self.export_opts;
+                if let (Some(proc), Some(gpu)) = (&self.processor, &self.gpu) {
+                    proc.export(&path, &options, &gpu.device, &gpu.queue);
+                }
             }
         }
         if requests.classify_folder {
@@ -2170,6 +2223,24 @@ impl App {
             self.finish_similar_cull();
         }
         self.step_export_queue();
+        // What CUPS said about the printers, if the query has come back.
+        if let Some(pending) = self.print_probe.take() {
+            match pending.try_recv() {
+                Ok((with_printers, probe)) => {
+                    if with_printers {
+                        self.print_printers = probe.printers;
+                        self.print_default = probe.default;
+                        // Paper belongs to a printer, so the choice starts again
+                        // at the one these papers came from.
+                        self.print_opts.paper = 0;
+                    }
+                    self.print_printer = probe.printer;
+                    self.print_papers = probe.papers;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.print_probe = Some(pending),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
         // Whatever `lp` had to say about the last job.
         if let Some(pending) = self.print_pending.take() {
             match pending.try_recv() {
@@ -2323,6 +2394,21 @@ impl App {
                                     ui.selectable_value(&mut self.export_opts.max_dim, value, label);
                                 }
                             });
+                            if self.export_opts.format == ExportFormat::Jpeg {
+                                ui.horizontal(|ui| {
+                                    ui.label("Resolution");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.export_opts.dpi)
+                                            .range(0..=1200)
+                                            .suffix(" dpi"),
+                                    )
+                                    .on_hover_text(
+                                        "Recorded in the file so its print size is known. 0 \
+                                         records nothing, and the size is then whatever the \
+                                         software opening it assumes.",
+                                    );
+                                });
+                            }
                             if let Some(proc) = self.processor.as_ref() {
                                 if let Some((w, h)) = proc.export_size(&self.export_opts) {
                                     let cropped = proc
@@ -2339,8 +2425,17 @@ impl App {
                                 }
                             }
                             ui.add_space(4.0);
-                            let has_image =
-                                self.processor.as_ref().is_some_and(Processor::has_image);
+                            let has_image = self.processor.as_ref().is_some_and(Processor::has_image)
+                                && !self.exporting();
+                            if self.exporting() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "A folder export is running — exporting waits for it",
+                                    )
+                                    .small()
+                                    .color(egui::Color32::from_rgb(230, 170, 90)),
+                                );
+                            }
                             ui.horizontal_wrapped(|ui| {
                                 if ui
                                     .add_enabled(has_image, egui::Button::new("Export this image…"))
@@ -2964,6 +3059,7 @@ mod tests {
                 format: ExportFormat::Jpeg,
                 quality: 72,
                 max_dim: 2048,
+                dpi: 240,
             },
             print: print::PrintOptions {
                 paper: 0,

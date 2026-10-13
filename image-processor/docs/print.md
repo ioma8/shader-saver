@@ -80,6 +80,45 @@ unprintable border to the driver rather than guessing at them.
 The file is written to `~/.image-processor/print.jpg` and reused each time, so
 there is nothing to clean up.
 
+## Nothing waits forever
+
+`std::process` has no timeout, so every command goes through a bounded runner:
+5 seconds for a query, 60 for `lp`. A scheduler that answers at all answers in
+milliseconds (70 ms measured here) — but one that has stopped answering would
+otherwise block whichever thread asked. That matters more than it sounds:
+
+- the **queries run on a worker**, not the UI thread, so opening the dialog
+  never waits on CUPS at all; while one is in flight the dialog says so and the
+  Print button waits. Asking about a different printer replaces the question,
+  and the first answer is dropped with its receiver.
+- **`lp` is bounded too.** If it never answers, the job is reported as *unknown*
+  — "the job may or may not have been sent" — rather than leaving the Print
+  button disabled for the rest of the session, which is what waiting forever
+  would do.
+
+A failed or timed-out query is treated as an empty one: the dialog falls back to
+`System default` and the printer's own default paper, both of which still print.
+
+## It records the size it prepared
+
+The JPEG handed to `lp` carries its resolution in the JFIF header, because a
+file that does not say how big it is leaves the driver guessing — and the
+guess is what turns "Fit to page" off into an unpredictable result. With the
+resolution recorded, turning fitting off means *the size this was prepared at*:
+a 4961 px frame laid out for A4 is 8.27 inches at 600, which is the page.
+
+That is also why the export dialog has a **Resolution** field: a JPEG sent to a
+client is better off saying what size it is, and 300 dpi is the conventional
+default. Zero records nothing, which is the same as before that field existed.
+
+## While an export is running
+
+Printing and single-image exporting both act on the image the processor is
+holding — and during a folder export that is one of the *batch's* images, not
+the one on screen. Both therefore stand aside while a batch runs, with the
+dialog saying why. Nothing is corrupted either way; what is prevented is
+printing a different photograph than the one you are looking at.
+
 ## Failure is shown, not swallowed
 
 `lp` reports an unknown printer, a stopped queue or an unreadable file on

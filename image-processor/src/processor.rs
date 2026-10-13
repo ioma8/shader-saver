@@ -291,6 +291,12 @@ pub struct ExportOptions {
     pub quality: u8,
     /// Longest side of the output, or 0 to keep the edited size.
     pub max_dim: u32,
+    /// Resolution in pixels per inch to record in the file, or 0 to record
+    /// none. A JPEG written without one says nothing about how big it is, so
+    /// whoever prints it has to guess: the app's own print path sets this, and
+    /// an exported file is better off saying it too. Ignored for PNG, whose
+    /// encoder here writes no resolution chunk.
+    pub dpi: u16,
 }
 
 impl Default for ExportOptions {
@@ -299,6 +305,9 @@ impl Default for ExportOptions {
             format: ExportFormat::Png16,
             quality: 90,
             max_dim: 0,
+            // The conventional JPEG resolution; a 2048 px export is then a
+            // 6.8 inch print rather than an arbitrary size.
+            dpi: 300,
         }
     }
 }
@@ -358,10 +367,16 @@ impl ExportJob {
         let out: &[u16] = scaled.as_deref().unwrap_or(source);
         match options.format {
             ExportFormat::Png16 => {
-                if let Some(img) =
-                    image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(ow, oh, out.to_vec())
-                {
-                    img.save(&path).ok();
+                let saved = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(
+                    ow,
+                    oh,
+                    out.to_vec(),
+                )
+                .map(|img| img.save(&path).is_ok());
+                // A half-written file at the target is worse than none: say so
+                // by leaving nothing behind.
+                if saved != Some(true) {
+                    let _ = std::fs::remove_file(&path);
                 }
             }
             ExportFormat::Jpeg => {
@@ -370,14 +385,27 @@ impl ExportJob {
                     .chunks_exact(4)
                     .flat_map(|px| px[..3].iter().map(|v| (u32::from(*v) * 255 / 65535) as u8))
                     .collect();
-                if let Ok(file) = std::fs::File::create(&path) {
-                    let mut writer = std::io::BufWriter::new(file);
-                    image::codecs::jpeg::JpegEncoder::new_with_quality(
-                        &mut writer,
-                        options.quality.clamp(1, 100),
-                    )
-                    .encode(&rgb, ow, oh, image::ExtendedColorType::Rgb8)
-                    .ok();
+                let wrote = std::fs::File::create(&path)
+                    .ok()
+                    .map(|file| {
+                        let mut writer = std::io::BufWriter::new(file);
+                        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                            &mut writer,
+                            options.quality.clamp(1, 100),
+                        );
+                        if options.dpi > 0 {
+                            // Without this the file claims only a pixel aspect
+                            // ratio, and its printed size is anyone's guess.
+                            encoder.set_pixel_density(image::codecs::jpeg::PixelDensity::dpi(
+                                options.dpi,
+                            ));
+                        }
+                        encoder
+                            .encode(&rgb, ow, oh, image::ExtendedColorType::Rgb8)
+                            .is_ok()
+                    });
+                if wrote != Some(true) {
+                    let _ = std::fs::remove_file(&path);
                 }
             }
         }
@@ -2525,6 +2553,7 @@ mod tests {
             format: ExportFormat::Jpeg,
             quality: 90,
             max_dim: 16,
+            dpi: 600,
         };
         // The crop is 32x64; the longest side is what shrinks to 16.
         assert_eq!(proc.export_size(&options), Some((8, 16)));
@@ -2536,6 +2565,16 @@ mod tests {
         proc.export_job(&path, &options, &device, &queue)
             .expect("a job should be readied")
             .write();
+        // The file has to say how big it is, or whoever prints it has to
+        // guess: this is the JFIF density the printer's driver reads.
+        let bytes = std::fs::read(&path).expect("the export should have been written");
+        let app0 = bytes.windows(5).position(|w| w == b"JFIF\0");
+        let app0 = app0.expect("a JFIF segment");
+        let units = bytes[app0 + 7];
+        let density = u16::from_be_bytes([bytes[app0 + 8], bytes[app0 + 9]]);
+        assert_eq!(units, 1, "units should be pixels per inch");
+        assert_eq!(density, 600, "the recorded resolution");
+
         let decoded = image::open(&path).expect("the export should have been written");
         assert_eq!((decoded.width(), decoded.height()), (8, 16));
         let gray = decoded.to_luma8();
@@ -2552,6 +2591,7 @@ mod tests {
             format: ExportFormat::Png16,
             quality: 90,
             max_dim: 0,
+            dpi: 0,
         };
         assert_eq!(proc.export_size(&png_options), Some((32, 64)));
         proc.export_job(&png_path, &png_options, &device, &queue)

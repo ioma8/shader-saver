@@ -922,20 +922,29 @@ pub(crate) fn print_dialog(ctx: &egui::Context, app: &mut App) {
                         }
                         for name in &app.print_printers {
                             let picked = app.print_printer.as_deref() == Some(name.as_str());
-                            if ui.selectable_label(picked, name).clicked() {
+                            let label = if app.print_default.as_deref() == Some(name.as_str()) {
+                                format!("{name}  (default)")
+                            } else {
+                                name.clone()
+                            };
+                            if ui.selectable_label(picked, label).clicked() {
                                 chosen_printer = Some(Some(name.clone()));
                             }
                         }
                     });
             });
             if let Some(printer) = chosen_printer {
-                app.print_printer = printer;
-                // Paper belongs to the printer, so the list is fetched again.
-                app.print_papers = print::papers_for(app.print_printer.as_deref());
-                app.print_opts.paper = 0;
+                // Fetched on a worker; the list arrives on a later frame.
                 app.print_status = None;
+                app.probe_printer(printer, false);
             }
-            if app.print_printers.is_empty() {
+            if app.print_probe.is_some() {
+                ui.label(
+                    egui::RichText::new("Asking CUPS…")
+                        .small()
+                        .color(egui::Color32::from_gray(150)),
+                );
+            } else if app.print_printers.is_empty() {
                 ui.label(
                     egui::RichText::new(
                         "No printers reported — the system default will be used",
@@ -1003,24 +1012,30 @@ pub(crate) fn print_dialog(ctx: &egui::Context, app: &mut App) {
             ui.separator();
 
             // What will be sent, and on what.
+            // What will be sent: the paper's box, the crop inside it, and the
+            // part of the image texture the crop occupies.
             let paper = app
                 .print_papers
                 .get(app.print_opts.paper)
                 .cloned()
                 .unwrap_or_else(print::Paper::printer_default);
-            let landscape = app.print_opts.orientation.landscape();
-            let (box_w, box_h) = print::page_box(&paper, landscape, print::PRINT_DPI);
-            let (send_w, send_h) = match app.processor.as_ref().and_then(|p| p.image_size) {
+            let (box_w, box_h) = print::page_box(
+                &paper,
+                app.print_opts.orientation.landscape(),
+                print::PRINT_DPI,
+            );
+            let (crop_px, uv) = match app.processor.as_ref().and_then(|p| p.image_size) {
                 Some((w, h)) => {
                     let crop = app
                         .processor
                         .as_ref()
                         .map(|p| processor::crop_px(p.crop, (w, h)))
                         .unwrap_or((0, 0, w, h));
-                    print::fit_inside(crop.2, crop.3, (box_w, box_h))
+                    (crop, processor::crop_fractions(crop, (w, h)))
                 }
-                None => (1, 1),
+                None => ((0, 0, 1, 1), [0.0, 0.0, 1.0, 1.0]),
             };
+            let (send_w, send_h) = print::fit_inside(crop_px.2, crop_px.3, (box_w, box_h));
 
             let (sheet_area, _) =
                 ui.allocate_exact_size(egui::vec2(220.0, 170.0), egui::Sense::hover());
@@ -1042,17 +1057,6 @@ pub(crate) fn print_dialog(ctx: &egui::Context, app: &mut App) {
             );
             match app.image_tex_id {
                 Some(texture) => {
-                    let uv = match app.processor.as_ref().and_then(|p| p.image_size) {
-                        Some((w, h)) => {
-                            let crop = app
-                                .processor
-                                .as_ref()
-                                .map(|p| processor::crop_px(p.crop, (w, h)))
-                                .unwrap_or((0, 0, w, h));
-                            processor::crop_fractions(crop, (w, h))
-                        }
-                        None => [0.0, 0.0, 1.0, 1.0],
-                    };
                     painter.image(
                         texture,
                         image,
@@ -1099,6 +1103,15 @@ pub(crate) fn print_dialog(ctx: &egui::Context, app: &mut App) {
                 );
             }
 
+            if app.exporting() {
+                ui.label(
+                    egui::RichText::new(
+                        "An export is running and has the image — printing waits for it",
+                    )
+                    .small()
+                    .color(egui::Color32::from_rgb(230, 170, 90)),
+                );
+            }
             if let Some((message, failed)) = &app.print_status {
                 ui.label(
                     egui::RichText::new(message.as_str())
@@ -1112,7 +1125,9 @@ pub(crate) fn print_dialog(ctx: &egui::Context, app: &mut App) {
             }
 
             ui.horizontal(|ui| {
-                let ready = app.print_pending.is_none()
+                let ready = !app.exporting()
+                    && app.print_pending.is_none()
+                    && app.print_probe.is_none()
                     && app.processor.as_ref().is_some_and(Processor::has_image);
                 if ui
                     .add_enabled(ready, egui::Button::new("Print"))

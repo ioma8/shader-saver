@@ -23,8 +23,19 @@
 //!   printer cannot load and miss paper it can. The list comes from the
 //!   printer's own options.
 
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a CUPS query may take. A scheduler that answers at all answers in
+/// milliseconds (70 ms measured on the machine this was written for); one that
+/// does not answer must not take the window with it. `std::process` has no
+/// timeout of its own.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// `lp` spools a file and returns. Longer than this means the scheduler is not
+/// answering, and waiting forever would leave the dialog unusable.
+const SEND_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A paper the chosen printer accepts. `media` is the CUPS option value; the
 /// first entry is always the printer's own default.
@@ -277,7 +288,10 @@ fn size_label(base: &str) -> Option<String> {
         return None;
     }
     // A paper is never a handful of millimetres, so small bare numbers are
-    // inches: `4x6` is 10x15cm while `215x345` is already millimetres.
+    // inches: `4x6` is 10x15cm while `215x345` is already millimetres. This is
+    // CUPS's own habit -- the metric names on the printer this was written for
+    // all carry `mm` -- but a description listing `10x15` meaning centimetres
+    // would be labelled inches here.
     let unit = if named_mm || w > 30.0 || h > 30.0 {
         "mm"
     } else {
@@ -410,36 +424,117 @@ pub fn lp_args(printer: Option<&str>, options: &PrintOptions, paper: &Paper, pat
     args
 }
 
+/// A finished command, or nothing if it ran out of time.
+struct Ran {
+    ok: bool,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run a command with a deadline, killing it if it overruns.
+fn run_bounded(program: &str, args: &[String], timeout: Duration) -> Option<Ran> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The pipes are read only once it has finished, so a command
+                // cannot block writing into a full pipe while we wait on it.
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    let _ = pipe.read_to_string(&mut stdout);
+                }
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                return Some(Ran {
+                    ok: status.success(),
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// A CUPS query's standard output, or nothing: a query that fails or hangs is
+/// the same as one that said nothing, and every caller has a fallback.
+fn query(program: &str, args: &[&str]) -> String {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+    match run_bounded(program, &args, QUERY_TIMEOUT) {
+        Some(ran) if ran.ok => ran.stdout,
+        _ => String::new(),
+    }
+}
+
 /// The printers this machine has, and its default. Empty on anything that is
 /// not CUPS (a caller then offers the system default alone).
 pub fn available_printers() -> (Vec<String>, Option<String>) {
-    let query = |args: &[&str]| -> String {
-        Command::new("lpstat")
-            .args(args)
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-            .unwrap_or_default()
-    };
-    parse_printers(&query(&["-a"]), &query(&["-p"]), &query(&["-d"]))
+    parse_printers(
+        &query("lpstat", &["-a"]),
+        &query("lpstat", &["-p"]),
+        &query("lpstat", &["-d"]),
+    )
 }
 
 /// The papers `printer` offers. With no printer named, CUPS answers for its own
 /// default, which is what the dialog starts on.
 pub fn papers_for(printer: Option<&str>) -> Vec<Paper> {
-    let mut command = Command::new("lpoptions");
+    let mut args: Vec<&str> = Vec::new();
     if let Some(printer) = printer.filter(|p| !p.is_empty()) {
-        command.arg("-p").arg(printer);
+        args.push("-p");
+        args.push(printer);
     }
-    let listed = command
-        .arg("-l")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .unwrap_or_default();
-    parse_papers(&listed)
+    args.push("-l");
+    parse_papers(&query("lpoptions", &args))
+}
+
+/// Everything the dialog needs to know, in one round trip, so a worker can
+/// fetch it without the window waiting.
+pub struct Probe {
+    pub printers: Vec<String>,
+    pub default: Option<String>,
+    /// The printer `papers` belong to: the one asked for, else CUPS's default,
+    /// else the first queue. The caller shows the papers for exactly this.
+    pub printer: Option<String>,
+    pub papers: Vec<Paper>,
+}
+
+/// Ask CUPS about the queues (when `with_printers`) and about `printer`'s
+/// papers. Blocking: run it on a worker.
+pub fn probe(printer: Option<&str>, with_printers: bool) -> Probe {
+    let (printers, default) = if with_printers {
+        available_printers()
+    } else {
+        (Vec::new(), None)
+    };
+    let target = printer
+        .map(str::to_owned)
+        .or_else(|| default.clone())
+        .or_else(|| printers.first().cloned());
+    let papers = papers_for(target.as_deref());
+    Probe {
+        printers,
+        default,
+        printer: target,
+        papers,
+    }
 }
 
 /// Hand `path` to CUPS. Returns what `lp` said, or its complaint — `lp` reports
@@ -451,24 +546,29 @@ pub fn send(
     paper: &Paper,
     path: &Path,
 ) -> Result<String, String> {
-    let output = Command::new("lp")
-        .args(lp_args(printer, options, paper, path))
-        .output()
-        .map_err(|e| format!("could not run lp: {e}"))?;
-    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_owned();
-    if output.status.success() {
-        let said = text(&output.stdout);
+    let args = lp_args(printer, options, paper, path);
+    let ran = run_bounded("lp", &args, SEND_TIMEOUT).ok_or_else(|| {
+        // Killing it leaves the submission in an unknown state, so say so
+        // rather than guessing in either direction.
+        format!(
+            "no answer from lp after {} seconds — is the print system running? \
+             The job may or may not have been sent.",
+            SEND_TIMEOUT.as_secs()
+        )
+    })?;
+    if ran.ok {
+        let said = ran.stdout.trim();
         Ok(if said.is_empty() {
             "sent to the printer".to_owned()
         } else {
-            said
+            said.to_owned()
         })
     } else {
-        let said = text(&output.stderr);
+        let said = ran.stderr.trim();
         Err(if said.is_empty() {
-            format!("lp exited with {}", output.status)
+            "lp refused the job".to_owned()
         } else {
-            said
+            said.to_owned()
         })
     }
 }
@@ -676,6 +776,29 @@ mod tests {
         assert!(args.contains(&"orientation-requested=3".to_owned()));
         assert!(!args.contains(&"-d".to_owned()));
         assert!(!args.contains(&"-n".to_owned()), "one copy needs no -n");
+    }
+
+    // `std::process` has no timeout, so `run_bounded` supplies one. Without
+    // it a wedged scheduler blocks whatever thread asked -- the UI thread, for
+    // the queries.
+    #[test]
+    fn a_command_that_overruns_is_killed() {
+        let short = Duration::from_millis(150);
+        // Answers in time, and its output is captured.
+        let ran = run_bounded("echo", &["hello".to_owned()], short).expect("echo answers");
+        assert!(ran.ok);
+        assert_eq!(ran.stdout.trim(), "hello");
+        // Fails in time, and says so without being an error itself.
+        let failed = run_bounded("false", &[], short).expect("false answers");
+        assert!(!failed.ok);
+        // Never answers: written off rather than waited on.
+        let args = vec!["5".to_owned()];
+        assert!(
+            run_bounded("sleep", &args, short).is_none(),
+            "a command that overruns must be killed, not waited for"
+        );
+        // A program that does not exist is not a hang either.
+        assert!(run_bounded("this-is-not-a-program", &[], short).is_none());
     }
 
     #[test]
