@@ -17,9 +17,11 @@
 //!   printer names are the *first* token of an `lpstat -a` line, the second of
 //!   an `lpstat -p` line, and whatever follows the colon in `lpstat -d`.
 //! * **The paper sizes are the printer's, not a fixed list.** The Canon on that
-//!   machine offers A4, 4x6, 5x7, 8x10 and friends with no Letter, Legal or
-//!   13x18cm; a built-in list would send a media name it does not know. The
-//!   list comes from the printer's own options.
+//!   machine lists 41 of them -- A4 and A5 but no A3, Letter and Legal but no
+//!   Tabloid, 215x345mm and 89x89mm alongside 4x6 and 8x10, envelopes, and its
+//!   own custom-size placeholder. A built-in list would offer paper that
+//!   printer cannot load and miss paper it can. The list comes from the
+//!   printer's own options.
 
 use std::path::Path;
 use std::process::Command;
@@ -514,8 +516,9 @@ mod tests {
         assert_eq!(default, None);
     }
 
-    // The Canon's own list, abridged. Note what is *not* there: no Letter, no
-    // Legal, no 13x18cm. A built-in list would offer paper it cannot load.
+    // Abridged from the Canon's real list, which is 41 entries. Note what is
+    // *not* in it: no A3, no Tabloid -- and a built-in list would offer exactly
+    // that sort of paper while missing the metric sizes it does have.
     const CANON_OPTIONS: &str = "PageSize/Media Size: 215x345mm 3.5x5 3.5x5.Fullbleed 4x6 \
         4x6.Fullbleed 5x5 5x5.Fullbleed 5x7 *A4 A4.Fullbleed A5 A6\n";
 

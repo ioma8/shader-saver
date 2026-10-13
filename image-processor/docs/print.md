@@ -27,9 +27,11 @@ that buys and costs:
 ## Everything about the paper comes from the printer
 
 A fixed list of sizes would be wrong on the machine this was written on. Its
-Canon offers A4, 3.5x5, 4x6, 5x5, 5x7, 8x10 and friends — and **no Letter, no
-Legal, no 13x18cm**. Sending `media=Letter` to it would fail the job or be
-ignored, so the list is read from the printer's own description
+Canon lists **41** of them: A4 and A5 but **no A3**, Letter and Legal but no
+Tabloid, `215x345mm` and `89x89mm` alongside `4x6` and `8x10`, envelopes, and a
+custom-size placeholder. A built-in list would offer paper that printer cannot
+load and miss paper it can. Sending it a `media` name it does not know fails the
+job, so the list is read from the printer's own description
 (`lpoptions -p <printer> -l`) and the sizes are labelled from the names:
 `4x6` becomes `4 × 6 in`, `215x345mm` stays millimetres, `5x5.Fullbleed` is
 `5 × 5 in (borderless)`, and `A4` keeps its name. The printer's own default is
