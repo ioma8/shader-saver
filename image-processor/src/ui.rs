@@ -125,8 +125,37 @@ fn paint_badges(p: &egui::Painter, rect: egui::Rect, meta: cull::CullMeta) {
     }
 }
 
+/// The "edited" marker, for a thumbnail whose image carries edits. Drawn rather
+/// than typed: a glyph for this would need a font to have the character, and
+/// two rails with handles read as "adjustments" without one.
+fn paint_edited_badge(p: &egui::Painter, img_area: egui::Rect) {
+    if img_area.width() < 30.0 || img_area.height() < 24.0 {
+        return;
+    }
+    let badge = egui::Rect::from_min_size(
+        egui::pos2(img_area.right() - 21.0, img_area.bottom() - 17.0),
+        egui::vec2(18.0, 14.0),
+    );
+    p.rect_filled(badge, 3.0, egui::Color32::from_rgba_unmultiplied(18, 18, 18, 205));
+    let rail = egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(238, 238, 238));
+    for (rail_index, y) in [0.3_f32, 0.7].into_iter().enumerate() {
+        let y = badge.top() + badge.height() * y;
+        p.line_segment(
+            [egui::pos2(badge.left() + 4.0, y), egui::pos2(badge.right() - 4.0, y)],
+            rail,
+        );
+        let x = if rail_index == 0 {
+            badge.left() + 6.5
+        } else {
+            badge.right() - 6.5
+        };
+        p.circle_filled(egui::pos2(x, y), 2.0, egui::Color32::WHITE);
+    }
+}
+
 // The thumbnail image plus its cull badges, shared by the browse grid and the
-// edit filmstrip. `reject_overlay` tints the cell when flagged for culling.
+// edit filmstrip. `reject_overlay` tints the cell when flagged for culling, and
+// `edited` marks a thumbnail whose image has edits on it.
 fn paint_thumb_cell(
     p: &egui::Painter,
     img_area: egui::Rect,
@@ -134,6 +163,7 @@ fn paint_thumb_cell(
     meta: cull::CullMeta,
     placeholder_size: f32,
     reject_overlay: bool,
+    edited: bool,
 ) {
     if let Some(tex) = tex {
         let ts = tex.size_vec2();
@@ -162,6 +192,11 @@ fn paint_thumb_cell(
         );
     }
     paint_badges(p, img_area, meta);
+    // Last, because it is the one mark whose absence means something: nothing
+    // here says the image is untouched.
+    if edited {
+        paint_edited_badge(p, img_area);
+    }
 }
 
 fn show_dir_item(
@@ -276,6 +311,7 @@ pub(crate) fn browse(
     let similar_summary = app.similar_summary;
     let show_cull_help = &mut app.flags.show_cull_help;
     let confirm_trash = &mut app.flags.confirm_trash;
+    let edited = &app.edited;
     let thumbs = &app.thumbs;
 
 
@@ -388,6 +424,7 @@ pub(crate) fn browse(
                                     (BrowseFilter::Picks, "Picks"),
                                     (BrowseFilter::Rejects, "Rejects"),
                                     (BrowseFilter::Unflagged, "Unflagged"),
+                                    (BrowseFilter::Edited, "Edited"),
                                 ] {
                                     if ui.selectable_label(*filter == f, lbl).clicked() {
                                         *filter = f;
@@ -585,6 +622,7 @@ pub(crate) fn browse(
                                             meta_map.get(&entry.path).copied().unwrap_or_default(),
                                             18.0,
                                             true,
+                                            edited.contains(&entry.path),
                                         );
 
                                         let name = entry
@@ -1474,6 +1512,7 @@ pub(crate) fn edit(
     let export_progress = &app.export_progress;
     let print_status = &app.print_status;
     let centre_view = &mut app.flags.centre_view;
+    let edited = &app.edited;
     let thumbs = &app.thumbs;
     let view = &app.view;
     let image_tex_id = app.image_tex_id;
@@ -2393,6 +2432,7 @@ pub(crate) fn edit(
                                             meta_map.get(&entry.path).copied().unwrap_or_default(),
                                             14.0,
                                             false,
+                                            edited.contains(&entry.path),
                                         );
                                         if is_cur {
                                             p.rect_stroke(
@@ -3042,6 +3082,62 @@ mod pointer_tests {
         let (requests, _) =
             retouch_frame(&ctx, vec![button(far, egui::PointerButton::Primary, false)], &[]);
         assert!(requests.retouch.is_none());
+    }
+}
+
+#[cfg(test)]
+mod edited_badge_tests {
+    use super::paint_edited_badge;
+
+    #[test]
+    fn the_marker_draws_a_badge_with_two_rails() {
+        // Drawn rather than typed, so this pins that it is drawing at all --
+        // and that a thumbnail too small for it is left alone.
+        let ctx = egui::Context::default();
+        let mut drawn = 0;
+        let run = |area: egui::Rect| -> usize {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(200.0, 200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        paint_edited_badge(ui.painter(), area);
+                    });
+                },
+            );
+            fn count(shape: &egui::Shape) -> usize {
+                match shape {
+                    egui::Shape::Rect(_)
+                    | egui::Shape::LineSegment { .. }
+                    | egui::Shape::Circle(_) => 1,
+                    egui::Shape::Vec(shapes) => shapes.iter().map(count).sum(),
+                    _ => 0,
+                }
+            }
+            output
+                .shapes
+                .iter()
+                .map(|clipped| count(&clipped.shape))
+                .sum()
+        };
+        // A frame with no marker at all, for a baseline: the panel draws itself.
+        let baseline = run(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(0.0, 0.0)));
+        drawn += run(egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 80.0)));
+        // A background, two rails, two handles.
+        assert!(
+            drawn - baseline >= 5,
+            "the marker should draw: {drawn} shapes against a baseline of {baseline}"
+        );
+        // Too small to carry it: as if it were not there.
+        assert_eq!(
+            run(egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(20.0, 12.0))),
+            baseline
+        );
     }
 }
 

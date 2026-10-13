@@ -315,6 +315,18 @@ fn save_pref(conn: &rusqlite::Connection, key: &str, value: &str) {
     );
 }
 
+/// Whether a saved state is an edit the user made, as opposed to what the app
+/// writes by itself. Opening a RAW saves one (the capture-sharpening seed), so
+/// the state has to be compared against the state a fresh open would leave
+/// behind rather than against a row's existence.
+fn is_edited(state: &EditState, path: &Path) -> bool {
+    let mut initial = EditState::default();
+    if imgload::is_raw(path) {
+        init_raw_sharpening(&mut initial);
+    }
+    state != &initial
+}
+
 fn load_bool_pref(conn: &rusqlite::Connection, key: &str, default: bool) -> bool {
     load_pref(conn, key)
         .and_then(|v| match v.as_str() {
@@ -621,6 +633,8 @@ enum BrowseFilter {
     Picks,
     Rejects,
     Unflagged,
+    /// Images with edits of their own on them.
+    Edited,
 }
 
 impl BrowseFilter {
@@ -630,6 +644,7 @@ impl BrowseFilter {
             Self::Picks => "picks",
             Self::Rejects => "rejects",
             Self::Unflagged => "unflagged",
+            Self::Edited => "edited",
         }
     }
     fn from_key(key: &str) -> Self {
@@ -637,6 +652,7 @@ impl BrowseFilter {
             "picks" => Self::Picks,
             "rejects" => Self::Rejects,
             "unflagged" => Self::Unflagged,
+            "edited" => Self::Edited,
             _ => Self::All,
         }
     }
@@ -859,6 +875,9 @@ struct App {
     crop_active: bool,
     crop_aspect: usize,
     crop_drag: Option<ui::CropDrag>,
+    /// Images in the folder being browsed that carry edits of their own, for
+    /// the grid's marker and its filter.
+    edited: std::collections::HashSet<PathBuf>,
     // The UI state as it was last written to the database, so a change made
     // anywhere can be detected in one comparison.
     saved_ui: SavedUi,
@@ -1019,6 +1038,7 @@ impl App {
             similar_progress: None,
             similar_candidates: HashMap::new(),
             similar_summary: None,
+            edited: std::collections::HashSet::new(),
             retouch_active: false,
             brush_radius: 40.0,
             retouch_status: None,
@@ -1217,6 +1237,9 @@ impl App {
             Some((ci, exif))
         };
         spawn_folder_workers(paths, work, tx);
+        // The marker and its filter read from this, and they have to be right
+        // before the thumbnails themselves arrive.
+        self.refresh_edited();
     }
 
     fn rebind_image_textures(&mut self) {
@@ -1282,6 +1305,47 @@ impl App {
             Some(state)
         };
         spawn_folder_workers(paths, work, self.adjust_tx.clone());
+    }
+
+    /// Re-read which of the browsed folder's images have edits of their own.
+    ///
+    /// Every row is fetched but only the folder's are parsed: a state can carry
+    /// a look transform, and parsing the whole library to mark one folder would
+    /// be work for nothing.
+    fn refresh_edited(&mut self) {
+        self.edited.clear();
+        let (Some(dir), Some(db)) = (self.browse_dir.clone(), self.db.as_ref()) else {
+            return;
+        };
+        let Ok(mut query) = db.prepare("SELECT path, params FROM edits") else {
+            return;
+        };
+        let Ok(rows) = query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            return;
+        };
+        for (path, params) in rows.flatten() {
+            let path = PathBuf::from(path);
+            if !path.starts_with(&dir) {
+                continue;
+            }
+            if let Ok(state) = serde_json::from_str::<EditState>(&params) {
+                if is_edited(&state, &path) {
+                    self.edited.insert(path);
+                }
+            }
+        }
+    }
+
+    /// Keep the marker honest as edits land: a save that changes nothing (or is
+    /// only the sharpening seed) leaves an image unmarked.
+    fn note_edited(&mut self, path: &Path, state: &EditState) {
+        if is_edited(state, path) {
+            self.edited.insert(path.to_path_buf());
+        } else {
+            self.edited.remove(path);
+        }
     }
 
     /// Record the state on screen as an undo step. Called wherever an edit is
@@ -2453,6 +2517,7 @@ impl App {
                     BrowseFilter::Picks => meta.flag == cull::Flag::Pick,
                     BrowseFilter::Rejects => meta.flag == cull::Flag::Reject,
                     BrowseFilter::Unflagged => meta.flag == cull::Flag::None,
+                    BrowseFilter::Edited => self.edited.contains(&entry.path),
                 };
                 flag_ok && meta.rating >= self.min_rating
             })
@@ -2884,6 +2949,7 @@ impl App {
                 }
                 let path = self.current_path.clone();
                 if let (Some(path), Some(state)) = (path, state) {
+                    self.note_edited(&path, &state);
                     self.commit_history(&path, state);
                 }
             }
@@ -3123,15 +3189,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_bool_pref, load_edits, load_look, look_reference_thumb, move_file, save_bool_pref,
-        export_targets, print, ExportFormat, ExportOptions, Histories, ImageHistory, HISTORY_IMAGES,
-        HISTORY_STEPS,
+        init_raw_sharpening, load_bool_pref, load_edits, load_look, look_reference_thumb, move_file,
+        save_bool_pref,
+        export_targets, is_edited, print, ExportFormat, ExportOptions, Histories, ImageHistory,
+        HISTORY_IMAGES, HISTORY_STEPS,
         save_edits, save_f32_pref, save_look, save_pref, saved_window, BrowseFilter, BrowseSort,
         CapturedLook, SavedUi, DEFAULT_WINDOW, UI_FILTER_KEY, UI_MIN_RATING_KEY, UI_WINDOW_H_KEY,
         UI_WINDOW_W_KEY,
     };
     use std::path::{Path, PathBuf};
-    use crate::processor::{EditState, LookProfile};
+    use crate::processor::{EditState, LookProfile, RetouchSpot};
 
     #[test]
     fn raw_development_and_applied_look_round_trip_through_database() {
@@ -3307,6 +3374,51 @@ mod tests {
         assert_eq!(saved_window(None), DEFAULT_WINDOW);
     }
 
+    // A row in the database is not the test: opening a RAW writes one to seed
+    // its capture sharpening, and every image opened once would otherwise be
+    // marked as edited for the rest of its life.
+    #[test]
+    fn opening_an_image_is_not_an_edit() {
+        let raw = Path::new("/tmp/DSC03764.ARW");
+        let jpeg = Path::new("/tmp/DSC03764.JPG");
+
+        // What a fresh open leaves behind is untouched: a plain default for a
+        // JPEG, and the sharpening seed for a RAW.
+        let mut seeded = EditState::default();
+        init_raw_sharpening(&mut seeded);
+        assert!(!is_edited(&seeded, raw), "the seed is the app's own writing");
+        assert!(!is_edited(&EditState::default(), jpeg));
+        // A RAW state that is not seeded at all is *not* untouched: the only
+        // way there is to zero the sharpening, which is a choice.
+        assert!(is_edited(&EditState::default(), raw));
+
+        // Anything the user changes is an edit, on either kind of file.
+        let exposed = EditState {
+            exposure: 0.5,
+            ..seeded.clone()
+        };
+        assert!(is_edited(&exposed, raw));
+        assert!(is_edited(&exposed, jpeg));
+        // Including a deliberate change to a seeded value: sharpening to zero
+        // is a choice, not a default.
+        let flat = EditState {
+            unsharp_strength: 0.0,
+            ..seeded.clone()
+        };
+        assert!(is_edited(&flat, raw));
+        // A dab, a crop or a look all count, because they are all in the state.
+        let dabbed = EditState {
+            retouch_spots: vec![RetouchSpot::default()],
+            ..EditState::default()
+        };
+        assert!(is_edited(&dabbed, jpeg));
+        let cropped = EditState {
+            crop: [0.1, 0.1, 0.5, 0.5],
+            ..EditState::default()
+        };
+        assert!(is_edited(&cropped, jpeg));
+    }
+
     #[test]
     fn browse_filter_and_sort_keys_round_trip() {
         for filter in [
@@ -3314,6 +3426,7 @@ mod tests {
             BrowseFilter::Picks,
             BrowseFilter::Rejects,
             BrowseFilter::Unflagged,
+            BrowseFilter::Edited,
         ] {
             assert_eq!(BrowseFilter::from_key(filter.key()), filter);
         }
