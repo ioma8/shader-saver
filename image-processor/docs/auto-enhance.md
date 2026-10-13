@@ -41,7 +41,12 @@ therefore reads the photo's own statistics and sets, in one pass:
   keeps some of its mood.
 - **Levels** — `levels_black`/`levels_white` at the 0.3/99.7 percentiles, and
   `levels_gamma` chosen to put the median at 0.45.
-- **Contrast** — from the post-levels inter-quartile range toward ~0.30.
+- **Contrast** — measured on the *input*, before the level stretch normalises it:
+  `clamp((0.48 - input_iqr) * 400, 0, 60)`. After the stretch every image looks
+  equally wide, so measuring there loses the difference that matters — a camera
+  JPEG is already contrasty (the camera applies its own curve) while our develop
+  is deliberately flat. On `DSC03764` that is `contrast ≈ 23` for the RAW
+  against `≈ 2` for its JPEG.
 - **Shadows / highlights** — recovery only when the tails are actually bunched.
 - **Vibrance** — modest, larger when the image is already colour-poor.
 

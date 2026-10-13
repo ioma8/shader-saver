@@ -74,11 +74,14 @@ const STAT_SIZE: u32 = 256;
 
 /// Where the median should land after levels + gamma.
 const MEDIAN_TARGET: f64 = 0.45;
-/// Always-on S-curve (the shader's curve keeps 0 and 1 fixed, so it cannot
-/// clip). This is the "punch" the tonal stages would otherwise lack.
-const BASE_CONTRAST: f64 = 10.0;
-/// Inter-quartile range a stretched histogram normally reaches.
-const CONTRAST_IQR_TARGET: f64 = 0.45;
+/// Inter-quartile range a well-finished photo tends to have. Contrast is added
+/// to reach it, measured on the *input* before the levels normalise it away: a
+/// camera JPEG is already contrasty (the camera applies its own curve), while
+/// our develop is deliberately flat, so the same measurement gives the RAW more
+/// and the JPEG almost none.
+const CONTRAST_TARGET_IQR: f64 = 0.48;
+/// How much S-curve to add per unit of missing inter-quartile range.
+const CONTRAST_SLOPE: f64 = 400.0;
 /// How much of the gray-world white-balance correction to apply. A RAW is
 /// already white-balanced as shot, and a strong grey-world reads a blue sky or
 /// green field as a cast, so apply only a little.
@@ -135,13 +138,11 @@ pub fn suggest_edit(img: &RgbaImage) -> EditState {
     // Remap helper mirrors the shader: levels stretch, then 1/gamma exponent.
     let remap = |v: f64| (((v - black) / range).clamp(0.0, 1.0)).powf(1.0 / gamma);
 
-    // Contrast: an always-on S-curve, widened further if the image is flat.
-    let iqr = (remap(stats.quantile(0.75)) - remap(stats.quantile(0.25))).max(0.01);
-    let mut contrast = BASE_CONTRAST;
-    if iqr < CONTRAST_IQR_TARGET {
-        contrast += ((CONTRAST_IQR_TARGET / iqr) - 1.0) * 40.0;
-    }
-    state.contrast = contrast.clamp(0.0, 90.0) as f32;
+    // Contrast: give the input the spread it is missing. Measured before the
+    // level stretch, because after it every image looks equally wide; a camera
+    // JPEG needs almost none, a flat develop needs a lot.
+    let input_iqr = stats.quantile(0.75) - stats.quantile(0.25);
+    state.contrast = ((CONTRAST_TARGET_IQR - input_iqr) * CONTRAST_SLOPE).clamp(0.0, 60.0) as f32;
 
     // Shadows/highlights: recover only when a tail is genuinely bunched.
     let q10 = remap(stats.quantile(0.10));
