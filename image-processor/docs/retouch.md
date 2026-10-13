@@ -1,7 +1,7 @@
 # Retouch brush
 
 A healing brush for spots, dust and small intrusions. The tool lives in the
-right panel (`🩹 Retouch`): arm it, click the spot you want gone, and it picks a
+right panel (`⚕ Retouch`): arm it, click the spot you want gone, and it picks a
 patch of the same image to put in its place -- feathered and tone-matched, so
 the join does not show. It is deliberately close to Photoshop's *spot healing
 brush*: you never pick the source yourself.
@@ -14,17 +14,17 @@ and they can be undone individually.
 
 | Action | Result |
 |---|---|
-| Click `🩹 Retouch` | Arm the tool. Dab markers and the brush cursor appear. |
+| Click `⚕ Retouch` | Arm the tool. Dab markers and the brush cursor appear. |
 | Click the photo | Heal that spot. The dab's ring becomes a marker. |
 | `[` / `]` | Shrink / grow the brush. The cursor ring resizes under the pointer. |
 | Right-click a marker | Delete that dab, restoring the original pixels. |
 | `Clear N retouch(es)` | Delete every dab on this image. |
-| Click `🩹 Retouch` again | Put the tool away. Dabs stay; markers and the cursor go. |
+| Click `⚕ Retouch` again | Put the tool away. Dabs stay; markers and the cursor go. |
 | Reset All Edits | Clears the dabs along with every other edit. |
 
-`DSC03795.ARW` — a sensor dust spot and a stray edge are removed without
-touching the surrounding texture; the dabs are a separate layer, so changing
-exposure afterwards keeps the retouch and re-renders it.
+A dab is a layer, not a pixel edit: it re-renders from the current pixels, so
+a later exposure or contrast change keeps it, and removing one restores the
+render byte-for-byte (asserted by the GPU test below).
 
 ## Where the source patch comes from
 
@@ -62,8 +62,8 @@ contrast → tonal → sharpen → blur → retouch → display
 ```
 
 Each dab copies its source with a bilinear tap (so a non-integer offset does
-not jitter) and blends it in with a smooth radial feather -- full strength in
-the middle, smoothly to nothing at the rim -- so there is no hard edge. Up to
+not jitter) and blends it in through a smooth radial weight, so there is no
+hard edge. Up to
 64 dabs per image (`MAX_RETOUCH_SPOTS`); the shader loops only over the live
 count, and with no dabs the pass is a straight copy.
 

@@ -831,7 +831,7 @@ pub(crate) fn edit(
                             .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let resp = ui
-                                .selectable_label(*retouch_active, "🩹 Retouch")
+                                .selectable_label(*retouch_active, "⚕ Retouch")
                                 .on_hover_text(
                                     "Healing brush: click the photo to heal a spot.\n\
                                      [ and ] change the size · right-click a dab to delete it",
