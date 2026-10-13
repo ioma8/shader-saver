@@ -316,6 +316,74 @@ pub fn fit_within(w: u32, h: u32, max: u32) -> (u32, u32) {
     )
 }
 
+/// An export whose pixels are already off the GPU, waiting to be written.
+///
+/// Holds a full-frame 16-bit readback -- about 190 MB for a 24 MP frame -- which
+/// is why callers keep at most one of these alive at a time.
+pub struct ExportJob {
+    path: std::path::PathBuf,
+    options: ExportOptions,
+    pixels: Vec<u16>,
+    width: u32,
+    crop: (u32, u32, u32, u32),
+}
+
+impl ExportJob {
+    /// Crop, scale and encode. Pure CPU and file I/O, safe to run anywhere.
+    pub fn write(self) {
+        let ExportJob {
+            path,
+            options,
+            pixels,
+            width,
+            crop,
+        } = self;
+        let (cw, ch) = (crop.2, crop.3);
+        let (ow, oh) = fit_within(cw, ch, options.max_dim);
+        // The whole frame is the common case; do not copy it to crop it.
+        let height = pixels.len() as u32 / 4 / width.max(1);
+        let cropped = if crop == (0, 0, width, height) {
+            None
+        } else {
+            Some(crop_pixels(&pixels, width, crop))
+        };
+        let source: &[u16] = cropped.as_deref().unwrap_or(&pixels);
+        let scaled = if (ow, oh) != (cw, ch) {
+            // Through a float buffer, so a big reduction does not band the way
+            // integer truncation would.
+            Some(resize_u16(source, cw, ch, ow, oh))
+        } else {
+            None
+        };
+        let out: &[u16] = scaled.as_deref().unwrap_or(source);
+        match options.format {
+            ExportFormat::Png16 => {
+                if let Some(img) =
+                    image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(ow, oh, out.to_vec())
+                {
+                    img.save(&path).ok();
+                }
+            }
+            ExportFormat::Jpeg => {
+                // JPEG has no alpha and no room for 16 bits a channel.
+                let rgb: Vec<u8> = out
+                    .chunks_exact(4)
+                    .flat_map(|px| px[..3].iter().map(|v| (u32::from(*v) * 255 / 65535) as u8))
+                    .collect();
+                if let Ok(file) = std::fs::File::create(&path) {
+                    let mut writer = std::io::BufWriter::new(file);
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(
+                        &mut writer,
+                        options.quality.clamp(1, 100),
+                    )
+                    .encode(&rgb, ow, oh, image::ExtendedColorType::Rgb8)
+                    .ok();
+                }
+            }
+        }
+    }
+}
+
 /// Take the crop out of a full-frame RGBA buffer, row by row. Split out of
 /// `export` so the pixels that reach a file can be checked without writing one.
 fn crop_pixels(pixels: &[u16], width: u32, crop: (u32, u32, u32, u32)) -> Vec<u16> {
@@ -332,13 +400,67 @@ fn crop_pixels(pixels: &[u16], width: u32, crop: (u32, u32, u32, u32)) -> Vec<u1
     out
 }
 
+/// Smallest span a crop may keep, in fractions of the image. The tool never
+/// goes near this; it exists so a hand-edited row cannot collapse a crop to
+/// nothing.
+pub const MIN_CROP_FRACTION: f32 = 0.0005;
+
+/// Pull a loaded crop into a shape the pipeline can draw. The tool only ever
+/// writes a sane rect, but the crop travels through a JSON column, and a
+/// non-finite value used to reach `f32::clamp`'s assertion and abort the
+/// process -- the same hazard retouch dabs are sanitised against.
+fn sanitize_crop(crop: &mut [f32; 4]) {
+    if crop.iter().any(|v| !v.is_finite()) {
+        *crop = FULL_CROP;
+        return;
+    }
+    // A crop the tool could have written is left exactly as it is: the rest of
+    // this only exists for values the tool cannot produce.
+    let inside = (0.0..=1.0).contains(&crop[0])
+        && (0.0..=1.0).contains(&crop[1])
+        && crop[2] >= MIN_CROP_FRACTION
+        && crop[3] >= MIN_CROP_FRACTION
+        && crop[0] + crop[2] <= 1.0
+        && crop[1] + crop[3] <= 1.0;
+    if inside {
+        return;
+    }
+    let (mut x0, mut y0) = (crop[0].clamp(0.0, 1.0), crop[1].clamp(0.0, 1.0));
+    let (mut x1, mut y1) = (
+        (crop[0] + crop[2]).clamp(0.0, 1.0),
+        (crop[1] + crop[3]).clamp(0.0, 1.0),
+    );
+    if x1 < x0 {
+        std::mem::swap(&mut x0, &mut x1);
+    }
+    if y1 < y0 {
+        std::mem::swap(&mut y0, &mut y1);
+    }
+    let w = (x1 - x0).clamp(MIN_CROP_FRACTION, 1.0);
+    let h = (y1 - y0).clamp(MIN_CROP_FRACTION, 1.0);
+    *crop = [
+        x0.min(1.0 - w),
+        y0.min(1.0 - h),
+        w,
+        h,
+    ];
+}
+
 /// The crop as whole pixels `(x, y, w, h)` inside an image of `input` pixels.
 ///
 /// Rounding to whole pixels is what makes a crop exact: the display draws this
 /// rect with no resampling and the exporter copies the same pixels, so what
 /// gets written out is what the panel showed.
+///
+/// Total: a non-finite crop or a zero-sized image would otherwise reach
+/// `f32::clamp` with its bounds the wrong way round and panic.
 pub fn crop_px(crop: [f32; 4], input: (u32, u32)) -> (u32, u32, u32, u32) {
-    let (wf, hf) = (input.0 as f32, input.1 as f32);
+    let crop = if crop.iter().all(|v| v.is_finite()) {
+        crop
+    } else {
+        FULL_CROP
+    };
+    let (wf, hf) = (input.0.max(1) as f32, input.1.max(1) as f32);
     let x0 = (crop[0] * wf).round().clamp(0.0, wf - 1.0);
     let y0 = (crop[1] * hf).round().clamp(0.0, hf - 1.0);
     let x1 = ((crop[0] + crop[2]) * wf).round().clamp(x0 + 1.0, wf);
@@ -867,6 +989,7 @@ impl Processor {
             self.state.curve_points = vec![[0.0, 0.0], [1.0, 1.0]];
         }
         sanitize_retouch_spots(&mut self.state.retouch_spots);
+        sanitize_crop(&mut self.state.crop);
     }
 
     // Derive auto adjustments from the luminance histogram. Call with the
@@ -1559,15 +1682,21 @@ impl Processor {
         Some(fit_within(crop.2, crop.3, options.max_dim))
     }
 
-    pub fn export(
+    /// Ready an export: everything that needs the GPU is done here, so writing
+    /// it can happen anywhere afterwards -- on a thread, or one at a time.
+    ///
+    /// Split out from [`Processor::export`] so a folder export can hold exactly
+    /// one in flight: each job carries a full-frame 16-bit readback, which is
+    /// far too big to stack up.
+    pub fn export_job(
         &self,
         path: &Path,
         options: &ExportOptions,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-    ) {
+    ) -> Option<ExportJob> {
         let (Some(output), Some((width, height))) = (self.final_tex(), self.image_size) else {
-            return;
+            return None;
         };
 
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -1599,9 +1728,7 @@ impl Processor {
         );
         queue.submit([encoder.finish()]);
 
-        let Some(data) = map_read(device, &staging) else {
-            return;
-        };
+        let data = map_read(device, &staging)?;
 
         // Half-float RGBA -> gamma-encoded u16 RGBA (values are 0..1).
         let pixels: Vec<u16> = {
@@ -1623,50 +1750,27 @@ impl Processor {
         // Only the crop is written out; otherwise the file would not match what
         // the panel shows. The rect is the same whole-pixel one used there, so
         // no resampling is involved.
-        let crop = crop_px(self.crop, (width, height));
-        let (cw, ch) = (crop.2, crop.3);
-        let (ow, oh) = fit_within(cw, ch, options.max_dim);
-        let options = *options;
-        std::thread::spawn(move || {
-            let cropped = crop_pixels(&pixels, width, crop);
-            // Downscaling goes through a float buffer, so a big reduction does
-            // not band the way integer truncation would.
-            let cropped = if (ow, oh) == (cw, ch) {
-                cropped
-            } else {
-                resize_u16(&cropped, cw, ch, ow, oh)
-            };
-            match options.format {
-                ExportFormat::Png16 => {
-                    if let Some(img) =
-                        image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(ow, oh, cropped)
-                    {
-                        img.save(path).ok();
-                    }
-                }
-                ExportFormat::Jpeg => {
-                    // JPEG has no alpha and no room for 16 bits a channel.
-                    let rgb: Vec<u8> = cropped
-                        .chunks_exact(4)
-                        .flat_map(|px| {
-                            px[..3]
-                                .iter()
-                                .map(|v| (u32::from(*v) * 255 / 65535) as u8)
-                                .collect::<Vec<u8>>()
-                        })
-                        .collect();
-                    if let Ok(file) = std::fs::File::create(path) {
-                        let mut writer = std::io::BufWriter::new(file);
-                        image::codecs::jpeg::JpegEncoder::new_with_quality(
-                            &mut writer,
-                            options.quality.clamp(1, 100),
-                        )
-                        .encode(&rgb, ow, oh, image::ExtendedColorType::Rgb8)
-                        .ok();
-                    }
-                }
-            }
-        });
+        Some(ExportJob {
+            path: path.to_path_buf(),
+            options: *options,
+            pixels,
+            width,
+            crop: crop_px(self.crop, (width, height)),
+        })
+    }
+
+    /// Export one image, on a thread of its own. A single export is small
+    /// enough for that; a folder of them goes through [`ExportJob`] instead.
+    pub fn export(
+        &self,
+        path: &Path,
+        options: &ExportOptions,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        if let Some(job) = self.export_job(path, options, device, queue) {
+            std::thread::spawn(move || job.write());
+        }
     }
 }
 
@@ -2323,6 +2427,47 @@ mod tests {
 
     // The shader reads the dab list as `vec4 a / vec4 b` per spot after a
     // four-float header; this pins the packing those declarations decode.
+    // Regression: a non-finite crop used to reach f32::clamp with its bounds
+    // the wrong way round and abort the process, and a zero-sized image did the
+    // same. Nothing from a JSON column may be able to do that.
+    #[test]
+    fn a_corrupt_crop_neither_panics_nor_collapses() {
+        let input = (100u32, 100u32);
+        for crop in [
+            [f32::NAN, 0.0, f32::NAN, 1.0],
+            [0.1, f32::NAN, 0.5, 1.0],
+            [0.1, 0.0, f32::NAN, f32::NAN],
+            [0.1, 0.0, f32::INFINITY, 1.0],
+            [f32::NEG_INFINITY, 0.0, 0.5, 1.0],
+            [5.0, -5.0, 0.1, 0.1],
+            [0.8, 0.8, -0.4, -0.4],
+            [0.5, 0.5, 0.0, 0.0],
+        ] {
+            let px = super::crop_px(crop, input);
+            assert!(px.2 >= 1 && px.3 >= 1, "{crop:?} collapsed to {px:?}");
+            assert!(
+                px.0 + px.2 <= input.0 && px.1 + px.3 <= input.1,
+                "{crop:?} escaped the image: {px:?}"
+            );
+        }
+        // No image at all is not a crash either.
+        assert!(super::crop_px(super::FULL_CROP, (0, 0)).2 >= 1);
+
+        // Sanitising turns a wild row into something renderable.
+        let mut nan = [f32::NAN, 0.0, 0.5, 0.5];
+        super::sanitize_crop(&mut nan);
+        assert_eq!(nan, super::FULL_CROP);
+        let mut wild = [0.99, 0.99, 0.99, 0.99];
+        super::sanitize_crop(&mut wild);
+        assert!(wild.iter().all(|v| v.is_finite()));
+        assert!(wild[0] + wild[2] <= 1.0 + 1e-6 && wild[1] + wild[3] <= 1.0 + 1e-6);
+        assert!(wild[2] >= super::MIN_CROP_FRACTION && wild[3] >= super::MIN_CROP_FRACTION);
+        // A sane crop survives untouched.
+        let mut fine = [0.1, 0.2, 0.5, 0.4];
+        super::sanitize_crop(&mut fine);
+        assert_eq!(fine, [0.1, 0.2, 0.5, 0.4]);
+    }
+
     // The crop has to survive the round trip through whole pixels, or the panel
     // and the export would drift apart by a pixel at a time.
     #[test]
@@ -2386,17 +2531,12 @@ mod tests {
 
         let path = std::env::temp_dir().join("image_processor_export_test.jpg");
         let _ = std::fs::remove_file(&path);
-        proc.export(&path, &options, &device, &queue);
-        // The file is written on a detached thread.
-        let mut decoded = None;
-        for _ in 0..200 {
-            if let Ok(open) = image::open(&path) {
-                decoded = Some(open);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let decoded = decoded.expect("the export should have been written");
+        // Written synchronously here, so the test does not race the worker the
+        // real export would use.
+        proc.export_job(&path, &options, &device, &queue)
+            .expect("a job should be readied")
+            .write();
+        let decoded = image::open(&path).expect("the export should have been written");
         assert_eq!((decoded.width(), decoded.height()), (8, 16));
         let gray = decoded.to_luma8();
         let mean = gray.pixels().map(|p| f64::from(p[0])).sum::<f64>() / f64::from(8 * 16);
@@ -2414,16 +2554,10 @@ mod tests {
             max_dim: 0,
         };
         assert_eq!(proc.export_size(&png_options), Some((32, 64)));
-        proc.export(&png_path, &png_options, &device, &queue);
-        let mut png = None;
-        for _ in 0..200 {
-            if let Ok(open) = image::open(&png_path) {
-                png = Some(open);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let png = png.expect("the PNG should have been written");
+        proc.export_job(&png_path, &png_options, &device, &queue)
+            .expect("a job should be readied")
+            .write();
+        let png = image::open(&png_path).expect("the PNG should have been written");
         assert_eq!((png.width(), png.height()), (32, 64));
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&png_path);

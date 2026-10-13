@@ -89,10 +89,10 @@ cargo run --release -- ~/Pictures    # browse a folder
 - 1–5: rate · 0: clear rating · P: pick · X: reject · 6–9: color label
 - Left/Right: previous/next image · Enter (Browse): open selected
 - ⌘/Ctrl+Z: undo · ⌘/Ctrl+Shift+Z (or Ctrl+Y): redo — per image, in memory
-- ⌘/Ctrl+E: export
+- ⌘/Ctrl+E: export — [details](docs/undo-and-export.md)
 - Double-click a slider: reset it
 - Crop: `⛶ Crop` in the right panel arms the crop tool; drag the corners or
-  edges, or inside to move it
+  edges, or inside to move it — [details](docs/crop.md)
 - Curves: click to add a point, right-click or drag out to remove,
   double-click to reset
 - Retouch: click to heal a spot, `[` / `]` to size the brush (matched on the

@@ -883,22 +883,38 @@ fn crop_handle(rect: egui::Rect, p: egui::Pos2, reach: f32) -> Option<u8> {
     Some(sides)
 }
 
+/// The crop tool's geometry for one frame.
+#[derive(Clone, Copy)]
+struct CropFrame {
+    /// The panel the overlay is clipped to.
+    panel: egui::Rect,
+    /// The rectangle, in image pixels.
+    crop: CropPx,
+    input: (f32, f32),
+    /// Width/height the drag locks to, if any.
+    aspect: Option<f32>,
+    /// Maps image coordinates to the screen.
+    view: ImageView,
+}
+
 /// The crop tool's layer: the rectangle with everything outside it dimmed, its
 /// handles, and the drag that resizes it. It is drawn against the *whole*
 /// frame, which is what you crop against. Returns the new crop when the drag
 /// moved it.
-#[allow(clippy::too_many_arguments)]
 fn paint_crop_tool(
     ui: &egui::Ui,
-    panel: egui::Rect,
-    view: &ImageView,
-    crop: CropPx,
-    input: (f32, f32),
-    aspect: Option<f32>,
+    frame: &CropFrame,
     drag: &mut Option<CropDrag>,
     response: &egui::Response,
     ctx: &egui::Context,
 ) -> Option<CropPx> {
+    let CropFrame {
+        panel,
+        crop,
+        input,
+        aspect,
+        view,
+    } = *frame;
     let painter = ui.painter().with_clip_rect(panel);
     let rect = egui::Rect::from_min_max(
         view.to_screen(crop.0 / input.0, crop.1 / input.1),
@@ -1144,6 +1160,7 @@ pub(crate) fn edit(
     let crop_aspect = &mut app.crop_aspect;
     let crop_drag = &mut app.crop_drag;
     let export_progress = &app.export_progress;
+    let centre_view = &mut app.flags.centre_view;
     let thumbs = &app.thumbs;
     let view = &app.view;
     let image_tex_id = app.image_tex_id;
@@ -2137,7 +2154,7 @@ pub(crate) fn edit(
                                 let (vw, vh) = (uv[2] * iw, uv[3] * ih);
                                 let fit_scale = (panel_size.x / vw).min(panel_size.y / vh);
 
-                                let (img_offset, img_scale) = if *zoom_fit {
+                                let (mut img_offset, img_scale) = if *zoom_fit {
                                     let fw = vw * fit_scale;
                                     let fh = vh * fit_scale;
                                     (egui::vec2(
@@ -2147,6 +2164,19 @@ pub(crate) fn edit(
                                 } else {
                                     (*zoom_offset, *zoom_scale)
                                 };
+                                // A newly opened image starts centred. Fitting
+                                // does that by construction; at 100% the last
+                                // image's pan would otherwise be inherited.
+                                if *centre_view {
+                                    *centre_view = false;
+                                    if !*zoom_fit {
+                                        img_offset = egui::vec2(
+                                            (panel_size.x - vw * img_scale) / 2.0,
+                                            (panel_size.y - vh * img_scale) / 2.0,
+                                        );
+                                        *zoom_offset = img_offset;
+                                    }
+                                }
 
                                 // Pan: a one-finger drag, or a two-finger trackpad
                                 // swipe. egui reports the swipe in "how the
@@ -2223,11 +2253,13 @@ pub(crate) fn edit(
                                     let ratio = aspect_ratio(*crop_aspect, input_px);
                                     if let Some(moved) = paint_crop_tool(
                                         ui,
-                                        panel_rect,
-                                        &view,
-                                        crop_px,
-                                        input_px,
-                                        ratio,
+                                        &CropFrame {
+                                            panel: panel_rect,
+                                            crop: crop_px,
+                                            input: input_px,
+                                            aspect: ratio,
+                                            view,
+                                        },
                                         crop_drag,
                                         &response,
                                         ctx,
@@ -2299,9 +2331,37 @@ pub(crate) fn edit(
 mod tests {
     use super::{
         brush_radius_px, brush_size_step, crop_handle, crop_inside, crop_with_aspect, drag_crop,
-        pan_delta, step_brush, take_requests, zoom_about, ImageView, KEY_REDO, KEY_UNDO,
-        MIN_CROP_PX,
+        aspect_ratio, pan_delta, step_brush, take_requests, zoom_about, ImageView, CROP_ASPECTS,
+        KEY_REDO, KEY_UNDO, MIN_CROP_PX,
     };
+
+    // The preset labels and the ratios have to stay in step: `aspect_ratio`
+    // falls through to the last arm, so a label added without one would lock
+    // the wrong shape silently.
+    #[test]
+    fn every_aspect_preset_has_a_ratio() {
+        let input = (4000.0, 2000.0);
+        assert_eq!(aspect_ratio(0, input), None, "Free");
+        assert_eq!(aspect_ratio(1, input), Some(2.0), "Original");
+        for (index, expected) in [(2, 1.0), (3, 0.8), (4, 1.25), (5, 1.5), (6, 2.0 / 3.0)] {
+            let got = aspect_ratio(index, input).expect("a locked ratio");
+            assert!((got - expected).abs() < 1e-6, "index {index}: {got} != {expected}");
+        }
+        assert_eq!(
+            CROP_ASPECTS.len(),
+            8,
+            "a new preset needs its own arm in aspect_ratio"
+        );
+        for (index, label) in CROP_ASPECTS.iter().enumerate() {
+            if index == 0 {
+                continue;
+            }
+            assert!(
+                aspect_ratio(index, input).is_some(),
+                "preset {label} has no ratio"
+            );
+        }
+    }
 
     // The key handler sets a temp flag and the frame's requests pick it up;
     // this pins that the two names match.

@@ -357,6 +357,13 @@ impl ImageHistory {
             self.reset(state);
             return;
         }
+        // Controls that set the dirty flag without changing anything (a preset
+        // that is already selected, say) must not spend an undo step -- pressing
+        // undo and watching nothing happen is worse than doing nothing.
+        if self.states[self.at] == state {
+            self.last_push = now;
+            return;
+        }
         // Only ever merge into an entry that has something behind it: `states[0]`
         // is the state the image was opened with and must stay reachable.
         if now - self.last_push < HISTORY_MERGE_SECS && self.at > 0 {
@@ -392,6 +399,30 @@ impl ImageHistory {
         self.last_push = 0.0;
         Some(self.states[self.at].clone())
     }
+}
+
+/// Where a batch writes each source, resolved up front so collisions are
+/// settled before anything is written. Two files in one folder can share a
+/// stem -- a RAW and its JPEG, say -- and both used to be written to the same
+/// name, the second quietly replacing the first.
+fn export_targets(dir: &Path, sources: &[PathBuf], extension: &str) -> Vec<PathBuf> {
+    let mut used = std::collections::HashSet::new();
+    sources
+        .iter()
+        .map(|source| {
+            let stem = source
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("image");
+            let mut name = format!("{stem}.{extension}");
+            let mut n = 2;
+            while !used.insert(name.clone()) {
+                name = format!("{stem}-{n}.{extension}");
+                n += 1;
+            }
+            dir.join(name)
+        })
+        .collect()
 }
 
 /// Per-image undo histories, capped in both directions.
@@ -682,6 +713,9 @@ struct GpuState {
 
 struct AppFlags {
     output_dirty: bool,
+    /// Centre the view on the next frame. An image opens where the last one was
+    /// left otherwise, which is fine when fitting and nonsense at 100%.
+    centre_view: bool,
     zoom_fit: bool,
     strip_scroll: bool,
     grid_scroll: bool,
@@ -778,12 +812,19 @@ struct App {
     saved_ui: SavedUi,
     // Per-image undo/redo.
     history: Histories,
-    // Export: the settings dialog, and a batch walking out one image per frame.
+    // Export: the settings dialog, and a batch walking out one image at a time.
     show_export: bool,
     export_opts: ExportOptions,
-    export_queue: Vec<PathBuf>,
+    /// Sources still to write, with the target each was assigned when the batch
+    /// was set up.
+    export_queue: Vec<(PathBuf, PathBuf)>,
+    /// `Some` while a batch is running; the directory is only kept so the batch
+    /// knows it is in progress.
     export_dir: Option<PathBuf>,
     export_progress: Option<(usize, usize)>,
+    /// Signalled by the worker when a file is written. Only one export is ever
+    /// in flight: each job holds the whole frame's readback.
+    export_done: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl App {
@@ -832,6 +873,7 @@ impl App {
             reference_tex: None,
             flags: AppFlags {
                 output_dirty: false,
+                centre_view: true,
                 zoom_fit: saved_ui.zoom_fit,
                 strip_scroll: false,
                 grid_scroll: false,
@@ -899,6 +941,7 @@ impl App {
             export_queue: Vec::new(),
             export_dir: None,
             export_progress: None,
+            export_done: None,
         }
     }
 }
@@ -1145,9 +1188,9 @@ impl App {
     }
 
     /// Step one place through the open image's history.
-    fn step_history(&mut self, forward: bool) -> bool {
+    fn step_history(&mut self, forward: bool) {
         let Some(path) = self.current_path.clone() else {
-            return false;
+            return;
         };
         let state = {
             let history = self.history.entry(&path);
@@ -1158,10 +1201,9 @@ impl App {
             }
         };
         let Some(state) = state else {
-            return false;
+            return;
         };
         self.load_edit_state(&path, state);
-        true
     }
 
     /// Put `state` into the processor and redraw, mirroring what opening an
@@ -1231,7 +1273,15 @@ impl App {
         let Some(path) = self.current_path.clone() else {
             return;
         };
-        let state = self.processor.as_ref().map(Processor::edit_state);
+        // From the database, not from the processor: by now the processor is
+        // holding the *last exported image's* state, and taking that as this
+        // image's own is how a batch export used to overwrite the edits of
+        // whatever was open.
+        let state = self
+            .db
+            .as_ref()
+            .and_then(|db| load_edits(db, &path))
+            .unwrap_or_default();
         let Some(img) = imgload::load_edit_rgba(&path) else {
             return;
         };
@@ -1240,41 +1290,72 @@ impl App {
                 proc.upload_rgba(&img, &gpu.device, &gpu.queue);
             }
         }
-        if let Some(state) = state {
-            self.load_edit_state(&path, state);
-        }
+        self.load_edit_state(&path, state);
         self.rebind_image_textures();
         self.flags.output_dirty = true;
     }
 
-    /// Export one queued image. One per frame, so a folder export does not
-    /// freeze the window, and the open image is restored at the end.
+    /// A batch export is running: the processor is being driven through other
+    /// people's images, so nothing about the state on screen may be persisted.
+    fn exporting(&self) -> bool {
+        self.export_dir.is_some()
+    }
+
+    /// Write one queued image, then wait for it before starting the next.
+    ///
+    /// One at a time, because an [`processor::ExportJob`] carries a full-frame
+    /// 16-bit readback -- around 190 MB for a 24 MP frame -- and letting those
+    /// stack up is how a folder export runs out of memory. One *per frame*, so
+    /// the window keeps drawing while it works.
     fn step_export_queue(&mut self) {
-        if self.export_queue.is_empty() {
+        if !self.exporting() {
             return;
         }
-        let Some(dir) = self.export_dir.clone() else {
-            self.export_queue.clear();
-            return;
-        };
-        let path = self.export_queue.remove(0);
-        let options = self.export_opts;
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("image");
-        let target = dir.join(format!("{stem}.{}", options.format.extension()));
-        if self.render_saved(&path) {
-            if let (Some(proc), Some(gpu)) = (&self.processor, &self.gpu) {
-                proc.export(&target, &options, &gpu.device, &gpu.queue);
+        if let Some(done_rx) = self.export_done.take() {
+            match done_rx.try_recv() {
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let (done, total) = self.export_progress.unwrap_or((0, 1));
+                    self.export_progress = Some((done + 1, total));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.export_done = Some(done_rx);
+                    return;
+                }
             }
         }
-        let (done, total) = self.export_progress.unwrap_or((0, 1));
-        self.export_progress = Some((done + 1, total));
         if self.export_queue.is_empty() {
-            self.export_progress = None;
+            // Everything is written: put the open image back.
             self.export_dir = None;
+            self.export_progress = None;
+            // In its own image, this was the last one exported.
             self.reopen_current();
+            return;
+        }
+        let (path, target) = self.export_queue.remove(0);
+        let options = self.export_opts;
+        let mut wrote = false;
+        if self.render_saved(&path) {
+            let job = match (self.processor.as_ref(), self.gpu.as_ref()) {
+                (Some(proc), Some(gpu)) => {
+                    proc.export_job(&target, &options, &gpu.device, &gpu.queue)
+                }
+                _ => None,
+            };
+            if let Some(job) = job {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    job.write();
+                    // A closed receiver just means the batch was stopped.
+                    let _ = tx.send(());
+                });
+                self.export_done = Some(rx);
+                wrote = true;
+            }
+        }
+        if !wrote {
+            // Unreadable, or the GPU could not ready it: count it and move on.
+            let (done, total) = self.export_progress.unwrap_or((0, 1));
+            self.export_progress = Some((done + 1, total));
         }
     }
 
@@ -1449,8 +1530,11 @@ impl App {
             self.reset_history(path, proc.edit_state());
         }
         self.flags.output_dirty = true;
-        // Whatever zoom mode was last used, not always fit.
-        self.flags.zoom_fit = self.saved_ui.zoom_fit;
+        // Whatever zoom mode was last used, not always fit -- but a crop is
+        // placed against the whole frame, so arm-fit wins while it is open.
+        self.flags.zoom_fit = self.saved_ui.zoom_fit || self.crop_active;
+        // 100% is meaningless at the last image's scale and offset.
+        self.flags.centre_view = !self.flags.zoom_fit;
         self.retouch_status = None;
         self.retouch_confirm_clear = false;
         self.crop_drag = None;
@@ -1926,7 +2010,9 @@ impl App {
                 if let Some(db) = &self.db {
                     save_edits(db, &path, &state);
                 }
-                self.commit_history(&path, state.clone());
+                if !self.exporting() {
+                    self.commit_history(&path, state.clone());
+                }
                 if self.current_path.as_deref() == Some(path.as_path()) {
                     if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
                         proc.apply_edit_state(&state);
@@ -2177,6 +2263,11 @@ impl App {
                             });
                             if let Some((done, total)) = self.export_progress {
                                 ui.label(format!("Exporting {done} of {total}…"));
+                                if ui.button("Stop").clicked() {
+                                    // Anything already sent still lands; the
+                                    // rest of the queue is dropped.
+                                    self.export_queue.clear();
+                                }
                             }
                         });
                     if let Some(path) = export_path {
@@ -2184,15 +2275,41 @@ impl App {
                         close = true;
                     }
                     if let Some((paths, dir)) = batch {
-                        // Driven one image per frame so the window stays live.
+                        // Targets are settled up front, so two sources that
+                        // share a stem cannot land on one file.
+                        let targets =
+                            export_targets(&dir, &paths, self.export_opts.format.extension());
                         self.export_progress = Some((0, paths.len()));
                         self.export_dir = Some(dir);
-                        self.export_queue = paths;
+                        self.export_queue = paths.into_iter().zip(targets).collect();
+                        self.export_done = None;
                         close = true;
                     }
                     if close {
                         self.show_export = false;
                     }
+                }
+                if self.exporting() && !self.show_export {
+                    // Say so: the processor is being driven through other
+                    // images, and edits made now are deliberately not kept.
+                    egui::Window::new("exporting")
+                        .title_bar(false)
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 40.0))
+                        .show(ctx, |ui| {
+                            let (done, total) = self.export_progress.unwrap_or((0, 1));
+                            ui.label(format!("Exporting image {done} of {total}…"));
+                            ui.label(
+                                egui::RichText::new("Editing is paused until it finishes")
+                                    .small()
+                                    .color(egui::Color32::from_gray(160)),
+                            );
+                            ui.add_space(4.0);
+                            if ui.button("Stop").clicked() {
+                                self.export_queue.clear();
+                            }
+                        });
                 }
                 if !ctx.wants_keyboard_input() {
                     // Undo/redo. `command` is Cmd on macOS and Ctrl elsewhere,
@@ -2346,15 +2463,20 @@ impl App {
             if let (Some(proc), Some(gpu)) = (self.processor.as_mut(), self.gpu.as_ref()) {
                 proc.process(&gpu.device, &gpu.queue);
             }
-            let state = self.processor.as_ref().map(Processor::edit_state);
-            if let (Some(db), Some(path), Some(state)) =
-                (&self.db, &self.current_path, state.as_ref())
-            {
-                save_edits(db, path, state);
-            }
-            let path = self.current_path.clone();
-            if let (Some(path), Some(state)) = (path, state) {
-                self.commit_history(&path, state);
+            // While a batch export is running the processor holds one of *its*
+            // images, so saving now would write that state over the open
+            // image's -- and push it onto the open image's undo stack.
+            if !self.exporting() {
+                let state = self.processor.as_ref().map(Processor::edit_state);
+                if let (Some(db), Some(path), Some(state)) =
+                    (&self.db, &self.current_path, state.as_ref())
+                {
+                    save_edits(db, path, state);
+                }
+                let path = self.current_path.clone();
+                if let (Some(path), Some(state)) = (path, state) {
+                    self.commit_history(&path, state);
+                }
             }
             self.flags.output_dirty = true;
         }
@@ -2593,7 +2715,8 @@ fn main() {
 mod tests {
     use super::{
         load_bool_pref, load_edits, load_look, look_reference_thumb, move_file, save_bool_pref,
-        ExportFormat, ExportOptions, Histories, ImageHistory, HISTORY_IMAGES, HISTORY_STEPS,
+        export_targets, ExportFormat, ExportOptions, Histories, ImageHistory, HISTORY_IMAGES,
+        HISTORY_STEPS,
         save_edits, save_f32_pref, save_look, save_pref, saved_window, BrowseFilter, BrowseSort,
         CapturedLook, SavedUi, DEFAULT_WINDOW, UI_FILTER_KEY, UI_MIN_RATING_KEY, UI_WINDOW_H_KEY,
         UI_WINDOW_W_KEY,
@@ -2804,6 +2927,46 @@ mod tests {
         history.commit(state_with_exposure(9.0), 5.7);
         assert_eq!(history.states.len(), 2);
         assert_eq!(history.undo().unwrap().exposure, 0.0);
+    }
+
+    // Regression: a control that sets the dirty flag without changing anything
+    // used to spend an undo step, so undo looked broken -- press it and nothing
+    // moves. A no-op must also leave the redo branch alone.
+    #[test]
+    fn an_unchanged_commit_is_not_an_undo_step() {
+        let mut history = ImageHistory::default();
+        history.reset(state_with_exposure(1.0));
+        history.commit(state_with_exposure(1.0), 10.0);
+        history.commit(state_with_exposure(1.0), 20.0);
+        assert_eq!(history.states.len(), 1, "no step for an unchanged state");
+        // Back-step, change, then re-commit the same value it started from.
+        history.commit(state_with_exposure(2.0), 30.0);
+        assert_eq!(history.states.len(), 2);
+        history.commit(state_with_exposure(2.0), 40.0);
+        assert_eq!(history.states.len(), 2);
+        assert_eq!(history.undo().unwrap().exposure, 1.0);
+        history.commit(state_with_exposure(2.0), 50.0);
+        assert!(history.redo().is_none(), "the no-op ate the redo branch");
+    }
+
+    // Regression: two sources sharing a stem in one folder (a RAW and its JPEG)
+    // used to be written to the same file, the second replacing the first.
+    #[test]
+    fn batch_targets_are_unique_even_for_repeated_stems() {
+        let dir = Path::new("/tmp/exports");
+        let sources = vec![
+            PathBuf::from("/a/DSC0001.ARW"),
+            PathBuf::from("/a/DSC0001.JPG"),
+            PathBuf::from("/a/DSC0002.ARW"),
+            PathBuf::from("/b/DSC0001.NEF"),
+        ];
+        let targets = export_targets(dir, &sources, "jpg");
+        assert_eq!(targets[0], dir.join("DSC0001.jpg"));
+        assert_eq!(targets[1], dir.join("DSC0001-2.jpg"));
+        assert_eq!(targets[2], dir.join("DSC0002.jpg"));
+        assert_eq!(targets[3], dir.join("DSC0001-3.jpg"));
+        let unique: std::collections::HashSet<_> = targets.iter().collect();
+        assert_eq!(unique.len(), sources.len());
     }
 
     #[test]
