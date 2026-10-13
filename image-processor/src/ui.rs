@@ -669,6 +669,13 @@ fn brush_radius_px(min_dim: f32, radius: f32) -> f32 {
     radius.clamp(2.0, (min_dim * 0.25).max(2.0))
 }
 
+/// Offset that keeps the image point under `anchor` (panel coordinates) fixed
+/// while the scale changes from `old_scale` to `new_scale`. Shared by the wheel
+/// and by a trackpad pinch, which must both scale *about the cursor*.
+fn zoom_about(anchor: egui::Vec2, old_scale: f32, new_scale: f32, offset: egui::Vec2) -> egui::Vec2 {
+    anchor - (anchor - offset) * (new_scale / old_scale)
+}
+
 /// Step the brush radius by `steps` (`[` is -1, `]` is +1). Multiplicative, so
 /// the feel is the same at every size, and clamped like [`brush_radius_px`].
 fn step_brush(min_dim: f32, radius: f32, steps: i32) -> f32 {
@@ -1604,7 +1611,7 @@ pub(crate) fn edit(
 
                             if processor.has_image() {
                                 ui.label(
-                                    egui::RichText::new("Scroll: zoom · Double-click: 100% / fit · Hold/Space: original · Hold R: reference")
+                                    egui::RichText::new("Scroll or pinch: zoom · Double-click: 100% / fit · Hold/Space: original · Hold R: reference")
                                         .small()
                                         .color(egui::Color32::from_gray(120)),
                                 );
@@ -1822,20 +1829,35 @@ pub(crate) fn edit(
                                     );
                                 }
 
-                                // Scroll: zoom at cursor
-                                let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
-                                if scroll.abs() > 0.5 && response.hovered() {
-                                    let cursor = response.hover_pos()
-                                        .unwrap_or(panel_rect.center());
-                                    let c = cursor - panel_rect.min;
-                                    let factor = (1.0_f32 + scroll * 0.003).clamp(0.8, 1.25);
-                                    // Clamp minimum to fit_scale so scrolling out never goes smaller than fit
-                                    let new_scale = (img_scale * factor).clamp(fit_scale, 20.0);
-                                    let ratio = new_scale / img_scale;
-                                    *zoom_offset = c - (c - img_offset) * ratio;
-                                    *zoom_scale = new_scale;
-                                    // Snap to fit mode when at or very near the fit scale
-                                    *zoom_fit = new_scale <= fit_scale * 1.03;
+                                // Scroll zooms, and so does a trackpad pinch --
+                                // on macOS that arrives as a Zoom event, which
+                                // egui reports as a per-frame factor (so does
+                                // ctrl/cmd-scroll, which egui routes here rather
+                                // than to the scroll delta). Both scale about
+                                // the cursor, so whatever is under it stays put.
+                                if response.hovered() {
+                                    let (scroll, pinch) =
+                                        ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+                                    let factor = if (pinch - 1.0).abs() > 1e-3 {
+                                        pinch
+                                    } else if scroll.abs() > 0.5 {
+                                        (1.0_f32 + scroll * 0.003).clamp(0.8, 1.25)
+                                    } else {
+                                        1.0
+                                    };
+                                    if (factor - 1.0).abs() > 1e-6 {
+                                        let cursor = response.hover_pos()
+                                            .unwrap_or(panel_rect.center());
+                                        let c = cursor - panel_rect.min;
+                                        // Clamp minimum to fit_scale so zooming out never goes smaller than fit
+                                        let new_scale =
+                                            (img_scale * factor).clamp(fit_scale, 20.0);
+                                        *zoom_offset =
+                                            zoom_about(c, img_scale, new_scale, img_offset);
+                                        *zoom_scale = new_scale;
+                                        // Snap to fit mode when at or very near the fit scale
+                                        *zoom_fit = new_scale <= fit_scale * 1.03;
+                                    }
                                 }
                             }
                         } else {
@@ -1852,7 +1874,24 @@ pub(crate) fn edit(
 
 #[cfg(test)]
 mod tests {
-    use super::{brush_radius_px, brush_size_step, step_brush};
+    use super::{brush_radius_px, brush_size_step, step_brush, zoom_about};
+
+    // Zooming about the cursor must leave the image point under the cursor
+    // where it is -- that is the whole reason the anchor is passed in.
+    #[test]
+    fn zooming_about_a_point_keeps_that_point_still() {
+        let offset = egui::vec2(30.0, -12.0);
+        let anchor = egui::vec2(240.0, 180.0);
+        let image_point_under_anchor = (anchor - offset) / 2.0;
+        for new_scale in [0.5_f32, 1.0, 1.7, 4.0, 20.0] {
+            let moved = zoom_about(anchor, 2.0, new_scale, offset);
+            let under_anchor = (anchor - moved) / new_scale;
+            assert!(
+                (under_anchor - image_point_under_anchor).length() < 1e-3,
+                "at scale {new_scale} the point under the cursor moved to {under_anchor:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_brush_steps_and_clamps_to_what_the_search_can_use() {

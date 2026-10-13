@@ -78,10 +78,13 @@ cargo run --release -- ~/Pictures    # browse a folder
 
 ## Editor shortcuts
 
-- Scroll: zoom · drag: pan · double-click: 100% / fit
+- Scroll or trackpad pinch: zoom · drag: pan · double-click: 100% / fit
 - Hold mouse or Space: show original
 - 1–5: rate · 0: clear rating · P: pick · X: reject · 6–9: color label
 - Left/Right: previous/next image · Enter (Browse): open selected
 - Double-click a slider: reset it
 - Curves: click to add a point, right-click or drag out to remove,
   double-click to reset
+- Retouch: click to heal a spot, `[` / `]` to size the brush (matched on the
+  physical keys, so the Czech `ú` / `)` layout works), right-click a dab to
+  delete it
