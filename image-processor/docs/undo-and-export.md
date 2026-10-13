@@ -46,6 +46,36 @@ The stack is capped at `HISTORY_STEPS` per image and `HISTORY_IMAGES` images. A
 state can carry a 33-cubed look LUT (~860 KB for the pair), so the caps are what
 keep a session bounded; realistic use is orders of magnitude smaller.
 
+## Copy settings, and paste them
+
+`⌘⇧C` takes a copy of the open image's develop settings; `⌘⇧V` puts them on the
+open image, and `Paste settings to N visible` puts them on everything the browse
+filter is showing. The chord is the one photo apps use for this, which leaves
+plain copy and paste free.
+
+What travels is everything that describes how the image is *developed* — exposure,
+white balance, the curve, the tonal zones, blur and sharpening, the camera preset,
+the AI look, and whether the pixels are a sensor render at all. That last one
+matters: the settings are applied *to* something, so a develop pasted onto a frame
+still rendered from the camera's preview would not look like the frame it came
+from.
+
+What does not travel is the two things that belong to a single photograph: the
+**crop** and the **retouch dabs**. A crop pasted onto twenty frames is a mistake
+you would have to undo one frame at a time.
+
+Pasting onto other frames is a database write and nothing more — the edits are
+applied when a frame is rendered, so nothing has to be re-rendered now, and the
+grid's edited marker appears on each frame as it changes. The image on screen is
+re-rendered through the same path undo uses, so that paste can be undone. The
+frames that live only in the database have no history to push onto — they carry
+the new settings from the moment they are opened — so undo covers the frame on
+screen and no others.
+
+Neither copying nor pasting does anything while a folder export is running: the
+processor is holding one of the export's images, so a copy would take that
+frame's settings and a paste would put them onto a file on its way out.
+
 ## Export
 
 `Export…` in the panel, or `⌘/Ctrl+E`. The dialog offers:

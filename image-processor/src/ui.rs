@@ -25,6 +25,9 @@ pub(crate) struct UiRequests {
     pub similar_cull: bool,
     pub undo: bool,
     pub redo: bool,
+    pub copy_settings: bool,
+    /// Images to paste the copied develop settings onto.
+    pub paste_settings: Option<Vec<PathBuf>>,
     pub show_export: bool,
     pub show_print: bool,
     /// A destination for a print-ready PDF (macOS, where printing is AppKit's).
@@ -59,6 +62,8 @@ pub(crate) fn take_requests(ctx: &egui::Context) -> UiRequests {
         look_folder: take::<bool>(ctx, KEY_LOOK_FOLDER).is_some(),
         similar_cull: take::<bool>(ctx, KEY_SIMILAR_CULL).is_some(),
         undo: take::<bool>(ctx, KEY_UNDO).is_some(),
+        copy_settings: take::<bool>(ctx, KEY_COPY_SETTINGS).is_some(),
+        paste_settings: take(ctx, KEY_PASTE_SETTINGS),
         show_export: take::<bool>(ctx, KEY_SHOW_EXPORT).is_some(),
         show_print: take::<bool>(ctx, KEY_SHOW_PRINT).is_some(),
         export_pdf: take(ctx, KEY_EXPORT_PDF),
@@ -1511,6 +1516,7 @@ pub(crate) fn edit(
     let crop_drag = &mut app.crop_drag;
     let export_progress = &app.export_progress;
     let print_status = &app.print_status;
+    let develop_clipboard = &app.develop_clipboard;
     let centre_view = &mut app.flags.centre_view;
     let edited = &app.edited;
     let thumbs = &app.thumbs;
@@ -2376,6 +2382,62 @@ pub(crate) fn edit(
                                         .color(egui::Color32::from_rgb(150, 190, 240)),
                                 );
                             }
+                            // Develop settings, copied from one frame and put
+                            // onto others: the thing you do to a shoot.
+                            let clipboard_ready = develop_clipboard.is_some();
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        processor.has_image(),
+                                        egui::Button::new("Copy settings")
+                                            .min_size(egui::vec2(110.0, 0.0)),
+                                    )
+                                    .on_hover_text("Take a copy of this image's develop settings")
+                                    .clicked()
+                                {
+                                    ctx.data_mut(|d| {
+                                        d.insert_temp(egui::Id::new(KEY_COPY_SETTINGS), true)
+                                    });
+                                }
+                                if ui
+                                    .add_enabled(
+                                        clipboard_ready && processor.has_image(),
+                                        egui::Button::new("Paste")
+                                            .min_size(egui::vec2(110.0, 0.0)),
+                                    )
+                                    .on_hover_text("Put them on this image")
+                                    .clicked()
+                                {
+                                    if let Some(path) = current_path.clone() {
+                                        ctx.data_mut(|d| {
+                                            d.insert_temp(egui::Id::new(KEY_PASTE_SETTINGS), vec![path])
+                                        });
+                                    }
+                                }
+                            });
+                            if clipboard_ready
+                                && visible.len() > 1
+                                && ui
+                                    .add(
+                                        egui::Button::new(format!(
+                                            "Paste settings to {} visible",
+                                            visible.len()
+                                        ))
+                                        .min_size(egui::vec2(228.0, 0.0)),
+                                    )
+                                    .on_hover_text(
+                                        "Crop and retouch dabs are left alone; everything else travels",
+                                    )
+                                    .clicked()
+                            {
+                                let targets: Vec<PathBuf> = visible
+                                    .iter()
+                                    .map(|&i| thumbs[i].path.clone())
+                                    .collect();
+                                ctx.data_mut(|d| {
+                                    d.insert_temp(egui::Id::new(KEY_PASTE_SETTINGS), targets)
+                                });
+                            }
                             // bottom_up layout: added after Export, so it sits above it
                             if ui.add_enabled(
                                 processor.has_image(),
@@ -2737,7 +2799,8 @@ mod tests {
     use super::{
         brush_radius_px, brush_size_step, crop_handle, crop_inside, crop_with_aspect, drag_crop,
         aspect_ratio, pan_delta, step_brush, take_requests, zoom_about, ImageView, CROP_ASPECTS,
-        KEY_EXPORT_PDF, KEY_REDO, KEY_SHOW_PRINT, KEY_UNDO, MIN_CROP_PX,
+        KEY_COPY_SETTINGS, KEY_EXPORT_PDF, KEY_PASTE_SETTINGS, KEY_REDO, KEY_SHOW_PRINT, KEY_UNDO,
+        MIN_CROP_PX,
     };
 
     // The preset labels and the ratios have to stay in step: `aspect_ratio`
@@ -2766,6 +2829,26 @@ mod tests {
                 "preset {label} has no ratio"
             );
         }
+    }
+
+    // The settings clipboard sets a flag or a list of targets and the frame's
+    // requests pick them up.
+    #[test]
+    fn the_settings_clipboard_requests_are_picked_up() {
+        let ctx = egui::Context::default();
+        let targets = vec![PathBuf::from("/tmp/a.jpg"), PathBuf::from("/tmp/b.jpg")];
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new(KEY_COPY_SETTINGS), true);
+                d.insert_temp(egui::Id::new(KEY_PASTE_SETTINGS), targets.clone());
+            });
+        });
+        let requests = take_requests(&ctx);
+        assert!(requests.copy_settings);
+        assert_eq!(requests.paste_settings, Some(targets));
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let quiet = take_requests(&ctx);
+        assert!(!quiet.copy_settings && quiet.paste_settings.is_none());
     }
 
     // The print entry points set a temp flag or a path and the frame's requests

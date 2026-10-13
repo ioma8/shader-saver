@@ -67,6 +67,8 @@ const KEY_UNDO: &str = "undo_edit";
 const KEY_SHOW_EXPORT: &str = "show_export_dialog";
 const KEY_SHOW_PRINT: &str = "show_print_dialog";
 const KEY_EXPORT_PDF: &str = "export_pdf";
+const KEY_COPY_SETTINGS: &str = "copy_settings";
+const KEY_PASTE_SETTINGS: &str = "paste_settings";
 const KEY_REDO: &str = "redo_edit";
 // Undo history: how many steps an image keeps, how many images are remembered,
 // and how long a burst of changes (a slider drag, one change per frame) counts
@@ -878,6 +880,9 @@ struct App {
     /// Images in the folder being browsed that carry edits of their own, for
     /// the grid's marker and its filter.
     edited: std::collections::HashSet<PathBuf>,
+    /// Develop settings copied from an image, waiting to be pasted onto others.
+    /// A session clipboard: not worth surviving a restart.
+    develop_clipboard: Option<EditState>,
     // The UI state as it was last written to the database, so a change made
     // anywhere can be detected in one comparison.
     saved_ui: SavedUi,
@@ -1039,6 +1044,7 @@ impl App {
             similar_candidates: HashMap::new(),
             similar_summary: None,
             edited: std::collections::HashSet::new(),
+            develop_clipboard: None,
             retouch_active: false,
             brush_radius: 40.0,
             retouch_status: None,
@@ -1345,6 +1351,66 @@ impl App {
             self.edited.insert(path.to_path_buf());
         } else {
             self.edited.remove(path);
+        }
+    }
+
+    /// Take a copy of the open image's develop settings.
+    fn copy_settings(&mut self) {
+        if self.exporting() {
+            // The processor is holding one of a folder export's images, so what
+            // it would hand over is that frame's state, not the open one's.
+            return;
+        }
+        if let Some(state) = self.processor.as_ref().map(Processor::edit_state) {
+            self.develop_clipboard = Some(state);
+        }
+    }
+
+    /// Put the copied develop settings onto `targets`.
+    ///
+    /// Only the image on screen has to be rendered again; for the others the
+    /// new state is written to the database and will be there when they are
+    /// opened. That is the whole reason this is cheap: the edits are applied at
+    /// render time, not baked into anything.
+    ///
+    /// A paste onto the open image also becomes an undo step, through the same
+    /// frame-level persistence every other edit goes through. The frames that
+    /// are only in the database have no history to push onto -- they carry the
+    /// new settings from the moment they are opened -- so undo covers the frame
+    /// on screen and no others.
+    fn paste_settings(&mut self, targets: &[PathBuf], needs_process: &mut bool) {
+        if self.exporting() {
+            // Same reason as copy, and worse: the state would be applied to an
+            // image on its way to a file. Nothing here is time-critical enough
+            // to be worth that.
+            return;
+        }
+        let Some(clipboard) = self.develop_clipboard.clone() else {
+            return;
+        };
+        for path in targets {
+            if self.current_path.as_deref() == Some(path.as_path()) {
+                // The open one re-renders now, including a fresh RAW
+                // development, since the paste can carry that too.
+                let mut state = self
+                    .processor
+                    .as_ref()
+                    .map(Processor::edit_state)
+                    .unwrap_or_default();
+                processor::copy_develop_settings(&mut state, &clipboard);
+                self.load_edit_state(path, state);
+                *needs_process = true;
+                continue;
+            }
+            let Some(db) = self.db.as_ref() else {
+                continue;
+            };
+            let mut state = load_edits(db, path).unwrap_or_default();
+            processor::copy_develop_settings(&mut state, &clipboard);
+            save_edits(db, path, &state);
+            // The grid's marker follows, so the frames just changed are visible
+            // as changed.
+            self.note_edited(path, &state);
         }
     }
 
@@ -2198,6 +2264,12 @@ impl App {
         if let Some(path) = requests.open_path {
             self.register_image(&path);
         }
+        if requests.copy_settings {
+            self.copy_settings();
+        }
+        if let Some(targets) = requests.paste_settings {
+            self.paste_settings(&targets, needs_process);
+        }
         if requests.show_export {
             // One at a time: both are centred, and both act on "the image".
             self.show_print = false;
@@ -2807,6 +2879,26 @@ impl App {
                     if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::E))
                     {
                         ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_SHOW_EXPORT), true));
+                    }
+                    // Copy/paste settings, the chord every photo app uses for
+                    // it, which leaves plain copy and paste free.
+                    let (copy_settings, paste_settings) = ctx.input(|i| {
+                        let chord = |key: egui::Key| {
+                            (i.modifiers.command || i.modifiers.ctrl)
+                                && i.modifiers.shift
+                                && i.key_pressed(key)
+                        };
+                        (chord(egui::Key::C), chord(egui::Key::V))
+                    });
+                    if copy_settings {
+                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_COPY_SETTINGS), true));
+                    }
+                    if paste_settings {
+                        if let Some(path) = self.current_path.clone() {
+                            ctx.data_mut(|d| {
+                                d.insert_temp(egui::Id::new(KEY_PASTE_SETTINGS), vec![path])
+                            });
+                        }
                     }
                     let (left, right, up, down, enter, space) = ctx.input(|i| {
                         (

@@ -57,6 +57,9 @@ images.
   `PDF…` writes a print-ready PDF of the same page (look before you spend
   paper). Elsewhere the dialog is built in egui and the job goes through CUPS
   (`lp`). Both print the crop. See [Printing](docs/print.md)
+- **Copy settings** — `⌘⇧C` / `⌘⇧V` take the develop settings from one frame and
+  put them on another, or on everything the browse filter is showing. The crop
+  and the retouch dabs stay behind: those belong to one photograph
 - **Persistent edits** — every image's edit state is saved to SQLite
   (`~/.image-processor/edits.db`) and restored when reopened;
   Reset All Edits reverts to defaults

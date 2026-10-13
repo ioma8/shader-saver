@@ -47,6 +47,23 @@ fn combined_photo_lut(weights: [f32; 3]) -> Vec<f32> {
     result
 }
 
+/// Put the settings that describe how an image is *developed* onto another one,
+/// leaving alone the things that belong to a single photograph.
+///
+/// Framing and spot removal stay: a crop or a retouch dab pasted onto a
+/// neighbour would be wrong in a way the user would have to undo one frame at a
+/// time. Everything else travels, including `raw_isp_enabled` -- whether the
+/// pixels are a sensor render or the camera's preview decides what the settings
+/// are applied *to*, so a develop pasted onto a frame still rendered from a
+/// preview would not look like the frame it came from.
+pub fn copy_develop_settings(to: &mut EditState, from: &EditState) {
+    let crop = to.crop;
+    let retouch_spots = std::mem::take(&mut to.retouch_spots);
+    *to = from.clone();
+    to.crop = crop;
+    to.retouch_spots = retouch_spots;
+}
+
 /// Most spots one image can carry. Each is a fixed slot in a uniform buffer,
 /// so this is a hard cap rather than a growing allocation.
 pub const MAX_RETOUCH_SPOTS: usize = 64;
@@ -2687,6 +2704,47 @@ mod tests {
         );
         // The whole frame is a straight copy.
         assert_eq!(super::crop_pixels(&pixels, w, (0, 0, w, h)), pixels);
+    }
+
+    // What a paste carries and what it leaves: everything that describes how
+    // the image is developed, and nothing that belongs to one photograph.
+    #[test]
+    fn pasting_carries_the_develop_and_leaves_the_photograph() {
+        let source = EditState {
+            exposure: 0.8,
+            contrast: 31.0,
+            wb_temp: -12.0,
+            curve_points: vec![[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]],
+            camera_preset: Some(crate::camera_presets::CameraPreset::Fxs),
+            ai_lut_enabled: true,
+            raw_isp_enabled: true,
+            ..EditState::default()
+        };
+        let mut target = EditState {
+            exposure: -0.3,
+            crop: [0.2, 0.1, 0.5, 0.6],
+            retouch_spots: vec![RetouchSpot::default()],
+            ..EditState::default()
+        };
+        super::copy_develop_settings(&mut target, &source);
+
+        // The develop arrives.
+        assert_eq!(target.exposure, 0.8);
+        assert_eq!(target.contrast, 31.0);
+        assert_eq!(target.wb_temp, -12.0);
+        assert_eq!(target.curve_points.len(), 3);
+        assert!(target.camera_preset == source.camera_preset);
+        assert!(target.ai_lut_enabled);
+        // Including what the settings are applied to: a develop on a frame
+        // still rendered from a preview would not match the frame it came from.
+        assert!(target.raw_isp_enabled);
+        // The photograph does not come along.
+        assert_eq!(target.crop, [0.2, 0.1, 0.5, 0.6], "framing is per frame");
+        assert_eq!(target.retouch_spots.len(), 1, "dabs are per frame");
+        // Pasting onto itself changes nothing.
+        let mut same = source.clone();
+        super::copy_develop_settings(&mut same, &source);
+        assert!(same == source, "copying onto the same state must not change it");
     }
 
     #[test]
