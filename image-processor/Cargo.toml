@@ -25,5 +25,19 @@ tract = "0.23"
 rayon = "1"
 half = "2"
 
+# The system print sheet on macOS is AppKit's, which is Objective-C. Only that
+# platform needs these; the CUPS path in `print.rs` covers Linux.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+# NSMutableData comes with the NSData feature -- it is the same class family.
+objc2-foundation = { version = "0.3", features = ["NSData", "NSGeometry", "NSString"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSImage",
+    "NSImageView",
+    "NSPrintInfo",
+    "NSPrintOperation",
+    "NSPrinter",
+] }
+
 [patch.crates-io]
 block = { path = "vendor/block" }

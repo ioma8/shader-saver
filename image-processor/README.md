@@ -52,11 +52,11 @@ images.
   at the size the dialog reports. Picks (or the whole folder view) go out to a
   folder in one pass, one image per frame, each rendered from its own saved
   edits
-- **Print** — `Print…` beside Export: printer, the printer's own paper sizes,
-  orientation, quality, copies, fit-to-page, and a preview of the sheet with
-  the crop on it. Sends the crop through CUPS (`lp`) rather than the system
-  sheet, so no AppKit session under the event loop. See
-  [Printing](docs/print.md)
+- **Print** — `Print…` on macOS opens the **system print sheet**, which brings
+  every driver setting including the paper type that decides ink laydown;
+  `PDF…` writes a print-ready PDF of the same page (look before you spend
+  paper). Elsewhere the dialog is built in egui and the job goes through CUPS
+  (`lp`). Both print the crop. See [Printing](docs/print.md)
 - **Persistent edits** — every image's edit state is saved to SQLite
   (`~/.image-processor/edits.db`) and restored when reopened;
   Reset All Edits reverts to defaults

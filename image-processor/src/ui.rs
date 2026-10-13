@@ -27,6 +27,8 @@ pub(crate) struct UiRequests {
     pub redo: bool,
     pub show_export: bool,
     pub show_print: bool,
+    /// A destination for a print-ready PDF (macOS, where printing is AppKit's).
+    pub export_pdf: Option<PathBuf>,
     /// A dab to place: `[x, y, radius]`, all normalised to the image.
     pub retouch: Option<[f32; 3]>,
     /// Index of the dab to remove.
@@ -59,6 +61,7 @@ pub(crate) fn take_requests(ctx: &egui::Context) -> UiRequests {
         undo: take::<bool>(ctx, KEY_UNDO).is_some(),
         show_export: take::<bool>(ctx, KEY_SHOW_EXPORT).is_some(),
         show_print: take::<bool>(ctx, KEY_SHOW_PRINT).is_some(),
+        export_pdf: take(ctx, KEY_EXPORT_PDF),
         redo: take::<bool>(ctx, KEY_REDO).is_some(),
         retouch: take(ctx, KEY_RETOUCH),
         retouch_remove: take(ctx, KEY_RETOUCH_REMOVE),
@@ -890,6 +893,7 @@ fn crop_handle(rect: egui::Rect, p: egui::Pos2, reach: f32) -> Option<u8> {
 /// The sheet is drawn to the chosen paper's shape with the crop placed on it,
 /// because the two things that go wrong in printing are the wrong paper and an
 /// image that does not fit it. The command itself lives in `print.rs`.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn print_dialog(ctx: &egui::Context, app: &mut App) {
     if !app.show_print {
         return;
@@ -1468,6 +1472,7 @@ pub(crate) fn edit(
     let crop_aspect = &mut app.crop_aspect;
     let crop_drag = &mut app.crop_drag;
     let export_progress = &app.export_progress;
+    let print_status = &app.print_status;
     let centre_view = &mut app.flags.centre_view;
     let thumbs = &app.thumbs;
     let view = &app.view;
@@ -2286,7 +2291,45 @@ pub(crate) fn edit(
                                         d.insert_temp(egui::Id::new(KEY_SHOW_PRINT), true)
                                     });
                                 }
+                                // macOS prints through the system sheet, which
+                                // has its own everything; a print-ready PDF is
+                                // the one thing it cannot leave behind.
+                                #[cfg(target_os = "macos")]
+                                if ui.add_enabled(
+                                    processor.has_image(),
+                                    egui::Button::new("PDF…").min_size(egui::vec2(110.0, 0.0)),
+                                ).clicked() {
+                                    let stem = current_path
+                                        .as_ref()
+                                        .and_then(|p| p.file_stem())
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("print")
+                                        .to_owned();
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("PDF", &["pdf"])
+                                        .set_file_name(format!("{stem}.pdf"))
+                                        .save_file()
+                                    {
+                                        ctx.data_mut(|d| {
+                                            d.insert_temp(egui::Id::new(KEY_EXPORT_PDF), path)
+                                        });
+                                    }
+                                }
                             });
+                            // The macOS path has no dialog of its own to report
+                            // in, so what it has to say goes here.
+                            #[cfg(target_os = "macos")]
+                            if let Some((message, failed)) = print_status {
+                                ui.label(
+                                    egui::RichText::new(message)
+                                        .small()
+                                        .color(if *failed {
+                                            egui::Color32::from_rgb(230, 140, 130)
+                                        } else {
+                                            egui::Color32::from_rgb(150, 190, 240)
+                                        }),
+                                );
+                            }
                             if let Some((done, total)) = *export_progress {
                                 ui.label(
                                     egui::RichText::new(format!("Exporting {done} of {total}…"))
@@ -2649,10 +2692,12 @@ pub(crate) fn edit(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
         brush_radius_px, brush_size_step, crop_handle, crop_inside, crop_with_aspect, drag_crop,
         aspect_ratio, pan_delta, step_brush, take_requests, zoom_about, ImageView, CROP_ASPECTS,
-        KEY_REDO, KEY_UNDO, MIN_CROP_PX,
+        KEY_EXPORT_PDF, KEY_REDO, KEY_SHOW_PRINT, KEY_UNDO, MIN_CROP_PX,
     };
 
     // The preset labels and the ratios have to stay in step: `aspect_ratio`
@@ -2681,6 +2726,27 @@ mod tests {
                 "preset {label} has no ratio"
             );
         }
+    }
+
+    // The print entry points set a temp flag or a path and the frame's requests
+    // pick them up (macOS prints through the system sheet, so its PDF
+    // destination travels the same way as a file-dialog result).
+    #[test]
+    fn the_print_requests_are_picked_up() {
+        let ctx = egui::Context::default();
+        let destination = PathBuf::from("/tmp/print.pdf");
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.data_mut(|d| {
+                d.insert_temp(egui::Id::new(KEY_SHOW_PRINT), true);
+                d.insert_temp(egui::Id::new(KEY_EXPORT_PDF), destination.clone());
+            });
+        });
+        let requests = take_requests(&ctx);
+        assert!(requests.show_print);
+        assert_eq!(requests.export_pdf, Some(destination));
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let quiet = take_requests(&ctx);
+        assert!(!quiet.show_print && quiet.export_pdf.is_none());
     }
 
     // The key handler sets a temp flag and the frame's requests pick it up;

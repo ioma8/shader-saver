@@ -11,6 +11,8 @@ mod judge;
 mod look_model;
 mod presets;
 mod print;
+#[cfg(target_os = "macos")]
+mod print_macos;
 mod processor;
 mod rate;
 mod raw_develop;
@@ -64,6 +66,7 @@ const UI_MIN_RATING_KEY: &str = "ui_min_rating";
 const KEY_UNDO: &str = "undo_edit";
 const KEY_SHOW_EXPORT: &str = "show_export_dialog";
 const KEY_SHOW_PRINT: &str = "show_print_dialog";
+const KEY_EXPORT_PDF: &str = "export_pdf";
 const KEY_REDO: &str = "redo_edit";
 // Undo history: how many steps an image keeps, how many images are remembered,
 // and how long a burst of changes (a slider drag, one change per frame) counts
@@ -406,6 +409,17 @@ impl ImageHistory {
         self.last_push = 0.0;
         Some(self.states[self.at].clone())
     }
+}
+
+/// What a finished print render is for. macOS prints through AppKit, so the
+/// work splits in two: the render happens on a worker (it is slow), then the
+/// main thread opens the sheet or writes the PDF (AppKit insists, and the sheet
+/// is modal).
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+enum PrintTarget {
+    Sheet,
+    Pdf(PathBuf),
 }
 
 /// Where a batch writes each source, resolved up front so collisions are
@@ -865,21 +879,41 @@ struct App {
     export_done: Option<std::sync::mpsc::Receiver<()>>,
     // Print: the dialog, what CUPS said it has, and the last job's outcome.
     show_print: bool,
+    // The CUPS dialog's state; macOS uses the system sheet instead.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     print_opts: print::PrintOptions,
     /// `None` means whatever CUPS has as its default.
+    // The CUPS dialog's state; macOS uses the system sheet instead.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     print_printer: Option<String>,
+    // The CUPS dialog's state; macOS uses the system sheet instead.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     print_printers: Vec<String>,
     /// Which of them CUPS would use, so the dialog can say so.
+    // The CUPS dialog's state; macOS uses the system sheet instead.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     print_default: Option<String>,
+    // The CUPS dialog's state; macOS uses the system sheet instead.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     print_papers: Vec<print::Paper>,
+    // The CUPS dialog's state; macOS uses the system sheet instead.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     print_paper_types: Vec<print::PaperType>,
     /// The paper type last chosen, kept by value: the paper in the tray is
+    // The CUPS dialog's state; macOS uses the system sheet instead.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     /// the same paper next time, which is not true of a printer-specific index.
     print_paper_type: Option<String>,
     print_pending: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// Set while a render is on its way to AppKit. Where there is no system
+    /// sheet the worker submits the job itself, so there is nothing to carry.
+    #[cfg(target_os = "macos")]
+    print_target: Option<PrintTarget>,
     /// A CUPS query in flight. The scheduler is asked on a worker so opening
     /// the dialog never waits on it; the payload says whether it was the
     /// opening query, and which printer the papers belong to.
+    // The CUPS dialog's state; macOS uses the system sheet instead.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     print_probe: Option<std::sync::mpsc::Receiver<(bool, print::Probe)>>,
     /// The last thing to report, and whether it went wrong.
     print_status: Option<(String, bool)>,
@@ -1009,6 +1043,8 @@ impl App {
             print_papers: Vec::new(),
             print_paper_types: Vec::new(),
             print_pending: None,
+            #[cfg(target_os = "macos")]
+            print_target: None,
             print_probe: None,
             print_status: None,
         }
@@ -1051,17 +1087,20 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.gpu = Some(gpu);
 
-        // CLI: open an image (or browse a folder) passed as the first argument
-        if self.current_path.is_none() && self.browse_dir.is_none() {
-            if let Some(arg) = std::env::args().nth(1) {
-                let p = PathBuf::from(arg);
-                if p.is_file() {
-                    self.register_image(&p);
-                } else if p.is_dir() {
-                    self.scan_folder(&p);
+        // CLI: open an image (or browse a folder) passed as the first argument.
+        // It wins over the folder remembered from last session: asking for a
+        // particular image on the command line and being shown a folder instead
+        // is what the `browse_dir.is_none()` guard used to do.
+        if self.current_path.is_none() {
+            if let Some(arg) = std::env::args().nth(1).map(PathBuf::from) {
+                if arg.is_file() {
+                    self.register_image(&arg);
+                } else if arg.is_dir() {
+                    self.scan_folder(&arg);
                 }
             }
         }
+
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
@@ -1371,6 +1410,7 @@ impl App {
     /// `lpstat` and `lpoptions` are one-off queries, so they run here rather
     /// than every frame. The paper list belongs to a printer, so it is fetched
     /// per printer and the choice starts again at the printer's own default.
+    #[cfg(not(target_os = "macos"))]
     fn open_print_dialog(&mut self) {
         self.show_print = true;
         self.print_status = None;
@@ -1381,6 +1421,7 @@ impl App {
     /// query takes ~70 ms here, and a scheduler that is not answering would
     /// otherwise block the window for as long as it liked. A second call
     /// replaces the first, which drops its receiver and so its answer with it.
+    #[cfg(not(target_os = "macos"))]
     fn probe_printer(&mut self, printer: Option<String>, with_printers: bool) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -1393,6 +1434,7 @@ impl App {
     /// Render the crop and hand it to CUPS, on a thread: the render and encode
     /// take a moment, and the outcome comes back through a channel so the
     /// dialog can report what `lp` said.
+    #[cfg(not(target_os = "macos"))]
     fn start_print(&mut self) {
         // A folder export is driving the processor through other images, so
         // what is loaded is not what is on screen: rendering now would print
@@ -1475,6 +1517,98 @@ impl App {
         });
         self.print_pending = Some(rx);
         self.print_status = Some(("Sending to the printer…".to_owned(), false));
+    }
+
+    /// Render the crop and then open the system print sheet (or write a PDF).
+    ///
+    /// The render is a job on a worker, as the export is; `finish_print` picks
+    /// the bytes up on the main thread, because AppKit views may not be built
+    /// anywhere else.
+    #[cfg(target_os = "macos")]
+    fn start_print(&mut self, target: PrintTarget) {
+        if self.exporting() {
+            self.print_status = Some((
+                "An export is running — printing is paused until it finishes".to_owned(),
+                true,
+            ));
+            return;
+        }
+        if self.print_pending.is_some() {
+            return;
+        }
+        let Some(dir) = app_dir().filter(|dir| std::fs::create_dir_all(dir).is_ok()) else {
+            self.print_status = Some(("No place to write the print file".to_owned(), true));
+            return;
+        };
+        let Some((w, h)) = self.processor.as_ref().and_then(|p| p.image_size) else {
+            return;
+        };
+        // How many pixels to render. The sheet chooses the paper and the
+        // scaling, so this only has to be generous enough for any of them: a
+        // page's worth at 600 dpi, and the image's own size if it is smaller.
+        let box_px = print::page_box(&print::Paper::printer_default(), false, print::PRINT_DPI);
+        let (_, _, cw, ch) = self
+            .processor
+            .as_ref()
+            .map(|p| processor::crop_px(p.crop, (w, h)))
+            .unwrap_or((0, 0, w, h));
+        let (tw, th) = print::fit_inside(cw, ch, box_px);
+        let options = ExportOptions {
+            format: ExportFormat::Jpeg,
+            quality: 92,
+            max_dim: tw.max(th),
+            // The resolution is what tells AppKit how big the image is, so
+            // "do not scale" in the sheet means the size prepared here.
+            dpi: print::PRINT_DPI as u16,
+        };
+        let path = dir.join("print.jpg");
+        let job = match (self.processor.as_ref(), self.gpu.as_ref()) {
+            (Some(proc), Some(gpu)) => proc.export_job(&path, &options, &gpu.device, &gpu.queue),
+            _ => None,
+        };
+        let Some(job) = job else {
+            self.print_status = Some(("Could not render the image".to_owned(), true));
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            job.write();
+            let _ = tx.send(Ok(path.to_string_lossy().into_owned()));
+        });
+        self.print_target = Some(target);
+        self.print_pending = Some(rx);
+        self.print_status = Some(("Preparing the print…".to_owned(), false));
+    }
+
+    /// The render is ready: hand it to AppKit, on this thread.
+    #[cfg(target_os = "macos")]
+    fn finish_print(&mut self, rendered: Result<String, String>) {
+        let target = self.print_target.take().unwrap_or(PrintTarget::Sheet);
+        let said = rendered.and_then(|path| {
+            std::fs::read(&path)
+                .map_err(|why| format!("could not read the render: {why}"))
+                .and_then(|encoded| {
+                    let page = print_macos::Page {
+                        encoded,
+                        // The sheet has its own scaling control; this is what
+                        // the app asks for by default.
+                        fit_to_page: true,
+                    };
+                    match target {
+                        PrintTarget::Sheet => print_macos::run_dialog(&page),
+                        PrintTarget::Pdf(out) => print_macos::to_pdf(&page)
+                            .and_then(|bytes| {
+                                std::fs::write(&out, bytes)
+                                    .map_err(|why| format!("could not write the PDF: {why}"))
+                            })
+                            .map(|()| format!("Wrote {}", out.display())),
+                    }
+                })
+        });
+        self.print_status = Some(match said {
+            Ok(message) => (message, false),
+            Err(why) => (why, true),
+        });
     }
 
     /// A batch export is running: the processor is being driven through other
@@ -2007,7 +2141,14 @@ impl App {
         }
         if requests.show_print {
             self.show_export = false;
+            #[cfg(target_os = "macos")]
+            self.start_print(PrintTarget::Sheet);
+            #[cfg(not(target_os = "macos"))]
             self.open_print_dialog();
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(path) = requests.export_pdf {
+            self.start_print(PrintTarget::Pdf(path));
         }
         if let Some(path) = requests.export_path {
             // Same reason as printing: a batch has another image loaded, so
@@ -2286,8 +2427,17 @@ impl App {
         // Whatever `lp` had to say about the last job.
         if let Some(pending) = self.print_pending.take() {
             match pending.try_recv() {
-                Ok(Ok(said)) => self.print_status = Some((said, false)),
-                Ok(Err(why)) => self.print_status = Some((why, true)),
+                Ok(result) => {
+                    #[cfg(target_os = "macos")]
+                    self.finish_print(result);
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        self.print_status = Some(match result {
+                            Ok(said) => (said, false),
+                            Err(why) => (why, true),
+                        });
+                    }
+                }
                 Err(std::sync::mpsc::TryRecvError::Empty) => self.print_pending = Some(pending),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
             }
@@ -2546,6 +2696,7 @@ impl App {
                         self.show_export = false;
                     }
                 }
+                #[cfg(not(target_os = "macos"))]
                 ui::print_dialog(ctx, self);
                 if self.exporting() && !self.show_export {
                     // Say so: the processor is being driven through other

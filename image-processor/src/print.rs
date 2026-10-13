@@ -28,6 +28,13 @@
 //!   printer cannot load and miss paper it can. The list comes from the
 //!   printer's own options.
 
+// On macOS printing goes through AppKit (`print_macos`), which brings its own
+// paper list, quality and paper type -- so the CUPS options machinery here is
+// for the platforms that have no system sheet. It stays compiled and tested
+// everywhere rather than being gated out, because its parsers are what the
+// tests pin, and one attribute is cheaper than eight.
+#![cfg_attr(target_os = "macos", allow(dead_code))]
+
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};

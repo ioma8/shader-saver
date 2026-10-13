@@ -1,28 +1,79 @@
 # Printing
 
-`Print…` beside `Export…` opens a print dialog: printer, paper, orientation,
-quality, copies, fit-to-page, and a preview of the sheet with the crop on it.
-Printing writes the same thing the export does — **the crop** — through the same
-render path, then hands the file to CUPS.
+`Print…` in the right panel prints the crop. Two implementations, chosen by
+platform, because there is no cross-platform print dialog to use:
 
-## Why CUPS and not the system print dialog
+- **macOS** uses AppKit's `NSPrintOperation` — the real system sheet, with the
+  printer, presets, paper size, *paper type*, colour matching and everything
+  else the driver offers, plus Save-as-PDF and Preview. `PDF…` beside it writes
+  a print-ready PDF without touching a printer.
+- **Other platforms** use the CUPS dialog described further down: the app's own
+  options panel and `lp`.
 
-macOS's own print sheet belongs to `NSPrintOperation`, which means Objective-C
-FFI, an offscreen `NSView` to render into, and a modal loop running inside a
-winit frame. This app is pure Rust with no `unsafe` and no native bindings, and
-adding a modal AppKit session underneath its event loop is a good way to get a
-hang that cannot be debugged from the outside.
+The image is the same either way: **the crop**, rendered once through the same
+export path, with its resolution recorded in the file.
 
-So the dialog is built in egui and the job goes out through `lp`, CUPS's own
-command line client, which is exactly what the system sheet ends up doing. What
-that buys and costs:
+## macOS: the system sheet
 
-- **You get**: printer choice, the printer's own paper sizes, orientation,
-  quality, copies, fit-to-page, and a preview of what will come out.
+This is the better route and it is the one the app takes on a Mac, for one
+concrete reason: printing a photo needs settings that live in the *driver*, and
+a hand-built dialog can only send the ones it knows about. The paper type is the
+one that bit us (below); the sheet covers that and every other.
+
+How it works, in `src/print_macos.rs`:
+
+- the rendered JPEG becomes an `NSImage`, which goes into a **stock
+  `NSImageView`** — no view subclass, no message forwarding;
+- its frame is set to the image's own size, which AppKit derives from the
+  resolution recorded in the file. That is what the render's `dpi` is for: a
+  1200 px render at 600 dpi is two inches, and a test pins exactly that, since
+  it is the one part of the page geometry that can be checked without the main
+  thread;
+- page setup is `NSPrintingPaginationMode::Fit`, so the image scales to whatever
+  paper the sheet is on;
+- `NSPrintInfo::new()` picks up the **shared printer settings**, so the sheet
+  opens on the paper and printer last used — on the machine this was written
+  for, the 4×6 photo paper from the previous print;
+- the printer CUPS calls default is preselected, best effort.
+
+What is `unsafe` is two class-method calls. Everything else goes through objc2,
+whose bindings are memory-safe and use `MainThreadMarker` to *prove*
+main-thread access at compile time — AppKit views may not be built anywhere
+else. `to_pdf` refuses with a plain error rather than risking it, and a test
+pins that refusal.
+
+### What is checked, and what is not
+
+Checked by hand, because it is the whole risky half: a real photograph goes
+through the same view and page setup and comes out as a 1.87 MB PDF of one
+page, which rasterises to the photograph, correctly scaled to the paper
+(310.8 × 466.2 pt — the imageable area of 4×6 photo paper, because that is what
+the printer was set to). `PDF…` is the same code path, so it doubles as the
+"look before you spend paper" button.
+
+**Not** checked here: the sheet itself. `cargo test` runs tests on spawned
+threads, and AppKit views require the main thread, so no test can put the sheet
+up — the first print from this build is the first real exercise of it. The
+modal-loop hazard is real and known: a sheet pumps the run loop, which is why
+the render happens on a worker and only the sheet is modal, and why this is the
+same pattern the app already uses for file dialogs (`rfd`), which are also
+modal AppKit panels opened from inside the frame.
+
+## The CUPS path (everything that is not macOS)
+
+There is no print-dialog crate to reach for, and no cross-platform C library
+either: a print dialog belongs to a GUI toolkit (AppKit here, `PrintDlgExW` on
+Windows, GTK or Qt on Linux), while CUPS itself is a spooler with no UI. The
+nearest Rust crate, `printers`, is documented as running `lp`/`lpstat` on unix —
+which is exactly what this path does.
+
+So where there is no system sheet the dialog is egui's and the job goes out
+through `lp`, CUPS's own command line client. What that buys and costs:
+
+- **You get**: printer choice, the printer's own paper sizes and *paper types*,
+  orientation, quality, copies, fit-to-page, and a preview of what comes out.
 - **You do not get**: the system preview, a Save-as-PDF destination, or the
-  driver-specific panels (colour matching, duplex, tray). A page setup the
-  dialog does not cover can still be set as the printer's own default, and
-  `Printer default` leaves it alone.
+  driver panels the sheet would show (colour matching, duplex, tray).
 
 ## The paper type is what decides the ink
 
