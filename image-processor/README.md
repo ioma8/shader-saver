@@ -47,6 +47,11 @@ images.
   to preserve the canonicalized color mixtures before restyling, while a
   constrained profile model and approved edits provide a safe fallback and
   personalization for RAW or standard images
+- **Export** — `Export…` (or ⌘/Ctrl+E): JPEG at a chosen quality or 16-bit
+  PNG, optionally limited to a longest side, always written as the *crop* and
+  at the size the dialog reports. Picks (or the whole folder view) go out to a
+  folder in one pass, one image per frame, each rendered from its own saved
+  edits
 - **Persistent edits** — every image's edit state is saved to SQLite
   (`~/.image-processor/edits.db`) and restored when reopened;
   Reset All Edits reverts to defaults
@@ -84,6 +89,7 @@ cargo run --release -- ~/Pictures    # browse a folder
 - 1–5: rate · 0: clear rating · P: pick · X: reject · 6–9: color label
 - Left/Right: previous/next image · Enter (Browse): open selected
 - ⌘/Ctrl+Z: undo · ⌘/Ctrl+Shift+Z (or Ctrl+Y): redo — per image, in memory
+- ⌘/Ctrl+E: export
 - Double-click a slider: reset it
 - Crop: `⛶ Crop` in the right panel arms the crop tool; drag the corners or
   edges, or inside to move it

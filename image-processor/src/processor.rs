@@ -247,6 +247,75 @@ impl Default for EditState {
 /// No crop.
 pub const FULL_CROP: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 
+/// What an export is written as.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum ExportFormat {
+    /// 16-bit PNG: keeps the whole depth of the edit chain, for further work.
+    Png16,
+    /// 8-bit JPEG with a quality setting: what a client or a print shop wants.
+    Jpeg,
+}
+
+impl ExportFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Png16 => "PNG (16-bit)",
+            Self::Jpeg => "JPEG",
+        }
+    }
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Png16 => "png",
+            Self::Jpeg => "jpg",
+        }
+    }
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Png16 => "png16",
+            Self::Jpeg => "jpeg",
+        }
+    }
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "jpeg" => Self::Jpeg,
+            _ => Self::Png16,
+        }
+    }
+}
+
+/// How to write an export.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ExportOptions {
+    pub format: ExportFormat,
+    /// JPEG quality, 1..=100. Ignored for PNG.
+    pub quality: u8,
+    /// Longest side of the output, or 0 to keep the edited size.
+    pub max_dim: u32,
+}
+
+impl Default for ExportOptions {
+    fn default() -> Self {
+        Self {
+            format: ExportFormat::Png16,
+            quality: 90,
+            max_dim: 0,
+        }
+    }
+}
+
+/// Fit `(w, h)` inside a square `max`, keeping the aspect. `max == 0` means no
+/// limit.
+pub fn fit_within(w: u32, h: u32, max: u32) -> (u32, u32) {
+    if max == 0 || w.max(h) <= max {
+        return (w, h);
+    }
+    let scale = max as f32 / w.max(h) as f32;
+    (
+        ((w as f32 * scale).round() as u32).max(1),
+        ((h as f32 * scale).round() as u32).max(1),
+    )
+}
+
 /// Take the crop out of a full-frame RGBA buffer, row by row. Split out of
 /// `export` so the pixels that reach a file can be checked without writing one.
 fn crop_pixels(pixels: &[u16], width: u32, crop: (u32, u32, u32, u32)) -> Vec<u16> {
@@ -1482,7 +1551,21 @@ impl Processor {
     }
 
     // Export the half-float result as a 16-bit sRGB PNG (gamma-encoded u16).
-    pub fn export(&self, path: &Path, device: &wgpu::Device, queue: &wgpu::Queue) {
+    /// The size this export will be written at: after the crop, and after any
+    /// size limit.
+    pub fn export_size(&self, options: &ExportOptions) -> Option<(u32, u32)> {
+        let (width, height) = self.image_size?;
+        let crop = crop_px(self.crop, (width, height));
+        Some(fit_within(crop.2, crop.3, options.max_dim))
+    }
+
+    pub fn export(
+        &self,
+        path: &Path,
+        options: &ExportOptions,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
         let (Some(output), Some((width, height))) = (self.final_tex(), self.image_size) else {
             return;
         };
@@ -1542,12 +1625,46 @@ impl Processor {
         // no resampling is involved.
         let crop = crop_px(self.crop, (width, height));
         let (cw, ch) = (crop.2, crop.3);
+        let (ow, oh) = fit_within(cw, ch, options.max_dim);
+        let options = *options;
         std::thread::spawn(move || {
             let cropped = crop_pixels(&pixels, width, crop);
-            if let Some(img) =
-                image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(cw, ch, cropped)
-            {
-                img.save(path).ok();
+            // Downscaling goes through a float buffer, so a big reduction does
+            // not band the way integer truncation would.
+            let cropped = if (ow, oh) == (cw, ch) {
+                cropped
+            } else {
+                resize_u16(&cropped, cw, ch, ow, oh)
+            };
+            match options.format {
+                ExportFormat::Png16 => {
+                    if let Some(img) =
+                        image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_raw(ow, oh, cropped)
+                    {
+                        img.save(path).ok();
+                    }
+                }
+                ExportFormat::Jpeg => {
+                    // JPEG has no alpha and no room for 16 bits a channel.
+                    let rgb: Vec<u8> = cropped
+                        .chunks_exact(4)
+                        .flat_map(|px| {
+                            px[..3]
+                                .iter()
+                                .map(|v| (u32::from(*v) * 255 / 65535) as u8)
+                                .collect::<Vec<u8>>()
+                        })
+                        .collect();
+                    if let Ok(file) = std::fs::File::create(path) {
+                        let mut writer = std::io::BufWriter::new(file);
+                        image::codecs::jpeg::JpegEncoder::new_with_quality(
+                            &mut writer,
+                            options.quality.clamp(1, 100),
+                        )
+                        .encode(&rgb, ow, oh, image::ExtendedColorType::Rgb8)
+                        .ok();
+                    }
+                }
             }
         });
     }
@@ -2200,8 +2317,8 @@ fn photo_lut_enabled(state: &EditState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        combined_photo_lut, identity_photo_lut, percentile, photo_luts, EditState, LookProfile,
-        Processor, RetouchSpot, MAX_RETOUCH_SPOTS,
+        combined_photo_lut, identity_photo_lut, percentile, photo_luts, EditState, ExportFormat,
+        ExportOptions, LookProfile, Processor, RetouchSpot, MAX_RETOUCH_SPOTS,
     };
 
     // The shader reads the dab list as `vec4 a / vec4 b` per spot after a
@@ -2230,6 +2347,86 @@ mod tests {
         assert!(w >= 1 && h >= 1);
         let (_, _, w, h) = super::crop_px(super::crop_from_px((0.0, 0.0, 99999.0, 99999.0), input), input);
         assert_eq!((w, h), input);
+    }
+
+    // End to end through the real export path: a JPEG of the cropped region at
+    // the requested size. Needs a GPU; skips quietly without one.
+    #[test]
+    fn exporting_writes_the_crop_at_the_requested_size() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        else {
+            eprintln!("no GPU adapter; skipping the export test");
+            return;
+        };
+        let Ok((device, queue)) = pollster::block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor::default(), None),
+        ) else {
+            eprintln!("no GPU device; skipping the export test");
+            return;
+        };
+        // Left half dark, right half bright.
+        let (w, h) = (64u32, 64u32);
+        let img = image::RgbaImage::from_fn(w, h, |x, _| {
+            let v = if x < 32 { 30u8 } else { 220 };
+            image::Rgba([v, v, v, 255])
+        });
+        let mut proc = Processor::new(&device);
+        proc.upload_rgba(&img, &device, &queue);
+        // Crop the bright half, then ask for a quarter of it.
+        proc.crop = super::crop_from_px((32.0, 0.0, 64.0, 64.0), (w, h));
+        let options = ExportOptions {
+            format: ExportFormat::Jpeg,
+            quality: 90,
+            max_dim: 16,
+        };
+        // The crop is 32x64; the longest side is what shrinks to 16.
+        assert_eq!(proc.export_size(&options), Some((8, 16)));
+
+        let path = std::env::temp_dir().join("image_processor_export_test.jpg");
+        let _ = std::fs::remove_file(&path);
+        proc.export(&path, &options, &device, &queue);
+        // The file is written on a detached thread.
+        let mut decoded = None;
+        for _ in 0..200 {
+            if let Ok(open) = image::open(&path) {
+                decoded = Some(open);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let decoded = decoded.expect("the export should have been written");
+        assert_eq!((decoded.width(), decoded.height()), (8, 16));
+        let gray = decoded.to_luma8();
+        let mean = gray.pixels().map(|p| f64::from(p[0])).sum::<f64>() / f64::from(8 * 16);
+        assert!(
+            mean > 150.0,
+            "the exported crop should be the bright half, mean was {mean}"
+        );
+
+        // A 16-bit PNG stays the full cropped size.
+        let png_path = std::env::temp_dir().join("image_processor_export_test.png");
+        let _ = std::fs::remove_file(&png_path);
+        let png_options = ExportOptions {
+            format: ExportFormat::Png16,
+            quality: 90,
+            max_dim: 0,
+        };
+        assert_eq!(proc.export_size(&png_options), Some((32, 64)));
+        proc.export(&png_path, &png_options, &device, &queue);
+        let mut png = None;
+        for _ in 0..200 {
+            if let Ok(open) = image::open(&png_path) {
+                png = Some(open);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let png = png.expect("the PNG should have been written");
+        assert_eq!((png.width(), png.height()), (32, 64));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&png_path);
     }
 
     // What reaches the file is exactly the crop rect, pixel for pixel.

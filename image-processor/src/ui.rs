@@ -25,6 +25,7 @@ pub(crate) struct UiRequests {
     pub similar_cull: bool,
     pub undo: bool,
     pub redo: bool,
+    pub show_export: bool,
     /// A dab to place: `[x, y, radius]`, all normalised to the image.
     pub retouch: Option<[f32; 3]>,
     /// Index of the dab to remove.
@@ -55,6 +56,7 @@ pub(crate) fn take_requests(ctx: &egui::Context) -> UiRequests {
         look_folder: take::<bool>(ctx, KEY_LOOK_FOLDER).is_some(),
         similar_cull: take::<bool>(ctx, KEY_SIMILAR_CULL).is_some(),
         undo: take::<bool>(ctx, KEY_UNDO).is_some(),
+        show_export: take::<bool>(ctx, KEY_SHOW_EXPORT).is_some(),
         redo: take::<bool>(ctx, KEY_REDO).is_some(),
         retouch: take(ctx, KEY_RETOUCH),
         retouch_remove: take(ctx, KEY_RETOUCH_REMOVE),
@@ -825,14 +827,14 @@ struct ImageView {
 }
 
 impl ImageView {
-    fn to_screen(&self, x: f32, y: f32) -> egui::Pos2 {
+    fn to_screen(self, x: f32, y: f32) -> egui::Pos2 {
         egui::pos2(
             self.rect.min.x + (x - self.uv[0]) / self.uv[2] * self.rect.width(),
             self.rect.min.y + (y - self.uv[1]) / self.uv[3] * self.rect.height(),
         )
     }
 
-    fn to_input(&self, p: egui::Pos2) -> [f32; 2] {
+    fn to_input(self, p: egui::Pos2) -> [f32; 2] {
         [
             self.uv[0] + (p.x - self.rect.min.x) / self.rect.width() * self.uv[2],
             self.uv[1] + (p.y - self.rect.min.y) / self.rect.height() * self.uv[3],
@@ -1141,6 +1143,7 @@ pub(crate) fn edit(
     let crop_active = &mut app.crop_active;
     let crop_aspect = &mut app.crop_aspect;
     let crop_drag = &mut app.crop_drag;
+    let export_progress = &app.export_progress;
     let thumbs = &app.thumbs;
     let view = &app.view;
     let image_tex_id = app.image_tex_id;
@@ -1943,15 +1946,16 @@ pub(crate) fn edit(
                             ui.add_space(8.0);
                             if ui.add_enabled(
                                 processor.has_image(),
-                                egui::Button::new("Export PNG…").min_size(egui::vec2(228.0, 0.0)),
+                                egui::Button::new("Export…").min_size(egui::vec2(228.0, 0.0)),
                             ).clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("PNG", &["png"])
-                                    .set_file_name("output.png")
-                                    .save_file()
-                                {
-                                    ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_EXPORT_PATH), path));
-                                }
+                                ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_SHOW_EXPORT), true));
+                            }
+                            if let Some((done, total)) = *export_progress {
+                                ui.label(
+                                    egui::RichText::new(format!("Exporting {done} of {total}…"))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(150, 190, 240)),
+                                );
                             }
                             // bottom_up layout: added after Export, so it sits above it
                             if ui.add_enabled(

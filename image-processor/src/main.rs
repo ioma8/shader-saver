@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use egui_wgpu::ScreenDescriptor;
-use processor::{EditState, LookProfile, Processor, RetouchSpot, MAX_RETOUCH_SPOTS};
+use processor::{
+    EditState, ExportFormat, ExportOptions, LookProfile, Processor, RetouchSpot, MAX_RETOUCH_SPOTS,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::WindowEvent;
@@ -59,6 +61,7 @@ const UI_FILTER_KEY: &str = "ui_browse_filter";
 const UI_SORT_KEY: &str = "ui_browse_sort";
 const UI_MIN_RATING_KEY: &str = "ui_min_rating";
 const KEY_UNDO: &str = "undo_edit";
+const KEY_SHOW_EXPORT: &str = "show_export_dialog";
 const KEY_REDO: &str = "redo_edit";
 // Undo history: how many steps an image keeps, how many images are remembered,
 // and how long a burst of changes (a slider drag, one change per frame) counts
@@ -66,6 +69,9 @@ const KEY_REDO: &str = "redo_edit";
 const HISTORY_STEPS: usize = 24;
 const HISTORY_IMAGES: usize = 8;
 const HISTORY_MERGE_SECS: f64 = 0.3;
+const UI_EXPORT_FORMAT_KEY: &str = "ui_export_format";
+const UI_EXPORT_QUALITY_KEY: &str = "ui_export_quality";
+const UI_EXPORT_MAX_KEY: &str = "ui_export_max_dim";
 const UI_WINDOW_W_KEY: &str = "ui_window_width";
 const UI_WINDOW_H_KEY: &str = "ui_window_height";
 const DEFAULT_WINDOW: (f32, f32) = (1600.0, 1000.0);
@@ -432,6 +438,7 @@ struct SavedUi {
     filter: BrowseFilter,
     sort: BrowseSort,
     min_rating: u8,
+    export: ExportOptions,
 }
 
 impl SavedUi {
@@ -449,6 +456,18 @@ impl SavedUi {
             min_rating: load_pref(db, UI_MIN_RATING_KEY)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            export: ExportOptions {
+                format: ExportFormat::from_key(
+                    &load_pref(db, UI_EXPORT_FORMAT_KEY).unwrap_or_default(),
+                ),
+                quality: load_pref(db, UI_EXPORT_QUALITY_KEY)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(90)
+                    .clamp(1, 100),
+                max_dim: load_pref(db, UI_EXPORT_MAX_KEY)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
+            },
         }
     }
 
@@ -463,6 +482,9 @@ impl SavedUi {
         save_pref(db, UI_FILTER_KEY, self.filter.key());
         save_pref(db, UI_SORT_KEY, self.sort.key());
         save_pref(db, UI_MIN_RATING_KEY, &self.min_rating.to_string());
+        save_pref(db, UI_EXPORT_FORMAT_KEY, self.export.format.key());
+        save_pref(db, UI_EXPORT_QUALITY_KEY, &self.export.quality.to_string());
+        save_pref(db, UI_EXPORT_MAX_KEY, &self.export.max_dim.to_string());
     }
 }
 
@@ -474,6 +496,7 @@ impl Default for SavedUi {
             filter: BrowseFilter::All,
             sort: BrowseSort::Name,
             min_rating: 0,
+            export: ExportOptions::default(),
         }
     }
 }
@@ -755,6 +778,12 @@ struct App {
     saved_ui: SavedUi,
     // Per-image undo/redo.
     history: Histories,
+    // Export: the settings dialog, and a batch walking out one image per frame.
+    show_export: bool,
+    export_opts: ExportOptions,
+    export_queue: Vec<PathBuf>,
+    export_dir: Option<PathBuf>,
+    export_progress: Option<(usize, usize)>,
 }
 
 impl App {
@@ -863,8 +892,13 @@ impl App {
             crop_active: false,
             crop_aspect: 0,
             crop_drag: None,
+            export_opts: saved_ui.export,
             saved_ui,
             history: Histories::default(),
+            show_export: false,
+            export_queue: Vec::new(),
+            export_dir: None,
+            export_progress: None,
         }
     }
 }
@@ -972,6 +1006,7 @@ impl ApplicationHandler for App {
             filter: self.filter,
             sort: self.sort,
             min_rating: self.min_rating,
+            export: self.export_opts,
         };
         if ui != self.saved_ui {
             ui.save(self.db.as_ref());
@@ -1157,6 +1192,90 @@ impl App {
             save_edits(db, path, &proc.edit_state());
         }
         self.flags.output_dirty = true;
+    }
+
+    /// Render `path` with the edits saved for it, so a batch export writes what
+    /// the editor would show rather than the camera's preview.
+    fn render_saved(&mut self, path: &Path) -> bool {
+        let state = self
+            .db
+            .as_ref()
+            .and_then(|db| load_edits(db, path))
+            .unwrap_or_default();
+        let Some(img) = imgload::load_edit_rgba(path) else {
+            return false;
+        };
+        let (Some(gpu), Some(proc)) = (self.gpu.as_ref(), self.processor.as_mut()) else {
+            return false;
+        };
+        proc.apply_edit_state(&state);
+        proc.upload_rgba(&img, &gpu.device, &gpu.queue);
+        if state.raw_isp_enabled && imgload::is_raw(path) {
+            let max_dim = proc.image_size.map_or(2048, |(w, h)| w.max(h));
+            if let Some(developed) = raw_develop::develop_raw_u16(path, max_dim) {
+                proc.replace_input_u16(
+                    developed.width(),
+                    developed.height(),
+                    developed.as_raw(),
+                    &gpu.queue,
+                );
+            }
+        }
+        proc.process(&gpu.device, &gpu.queue);
+        true
+    }
+
+    /// Put the open image back on the GPU after a batch export went through the
+    /// processor. Like opening it, but without disturbing its undo history.
+    fn reopen_current(&mut self) {
+        let Some(path) = self.current_path.clone() else {
+            return;
+        };
+        let state = self.processor.as_ref().map(Processor::edit_state);
+        let Some(img) = imgload::load_edit_rgba(&path) else {
+            return;
+        };
+        if let Some(gpu) = self.gpu.as_ref() {
+            if let Some(proc) = self.processor.as_mut() {
+                proc.upload_rgba(&img, &gpu.device, &gpu.queue);
+            }
+        }
+        if let Some(state) = state {
+            self.load_edit_state(&path, state);
+        }
+        self.rebind_image_textures();
+        self.flags.output_dirty = true;
+    }
+
+    /// Export one queued image. One per frame, so a folder export does not
+    /// freeze the window, and the open image is restored at the end.
+    fn step_export_queue(&mut self) {
+        if self.export_queue.is_empty() {
+            return;
+        }
+        let Some(dir) = self.export_dir.clone() else {
+            self.export_queue.clear();
+            return;
+        };
+        let path = self.export_queue.remove(0);
+        let options = self.export_opts;
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("image");
+        let target = dir.join(format!("{stem}.{}", options.format.extension()));
+        if self.render_saved(&path) {
+            if let (Some(proc), Some(gpu)) = (&self.processor, &self.gpu) {
+                proc.export(&target, &options, &gpu.device, &gpu.queue);
+            }
+        }
+        let (done, total) = self.export_progress.unwrap_or((0, 1));
+        self.export_progress = Some((done + 1, total));
+        if self.export_queue.is_empty() {
+            self.export_progress = None;
+            self.export_dir = None;
+            self.reopen_current();
+        }
     }
 
     fn apply_cull_action(&mut self, path: &Path, action: cull::CullAction) {
@@ -1615,9 +1734,13 @@ impl App {
         if let Some(path) = requests.open_path {
             self.register_image(&path);
         }
+        if requests.show_export {
+            self.show_export = true;
+        }
         if let Some(path) = requests.export_path {
+            let options = self.export_opts;
             if let (Some(proc), Some(gpu)) = (&self.processor, &self.gpu) {
-                proc.export(&path, &gpu.device, &gpu.queue);
+                proc.export(&path, &options, &gpu.device, &gpu.queue);
             }
         }
         if requests.classify_folder {
@@ -1849,6 +1972,7 @@ impl App {
             self.similar_progress = None;
             self.finish_similar_cull();
         }
+        self.step_export_queue();
         let mut visible: Vec<usize> = self
             .thumbs
             .iter()
@@ -1942,6 +2066,134 @@ impl App {
                             });
                         });
                 }
+                if self.show_export {
+                    let mut close = false;
+                    let mut export_path: Option<PathBuf> = None;
+                    let mut batch: Option<(Vec<PathBuf>, PathBuf)> = None;
+                    // Picks if there are any, otherwise everything on screen.
+                    let picks: Vec<PathBuf> = visible
+                        .iter()
+                        .map(|&i| self.thumbs[i].path.clone())
+                        .filter(|p| {
+                            self.meta
+                                .get(p)
+                                .is_some_and(|m| m.flag == cull::Flag::Pick)
+                        })
+                        .collect();
+                    let batch_paths: Vec<PathBuf> = if picks.is_empty() {
+                        visible
+                            .iter()
+                            .map(|&i| self.thumbs[i].path.clone())
+                            .collect()
+                    } else {
+                        picks.clone()
+                    };
+                    egui::Window::new("Export")
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                        .show(ctx, |ui| {
+                            ui.set_min_width(320.0);
+                            ui.horizontal(|ui| {
+                                for format in [ExportFormat::Png16, ExportFormat::Jpeg] {
+                                    ui.selectable_value(
+                                        &mut self.export_opts.format,
+                                        format,
+                                        format.label(),
+                                    );
+                                }
+                            });
+                            if self.export_opts.format == ExportFormat::Jpeg {
+                                ui.add(
+                                    egui::Slider::new(&mut self.export_opts.quality, 1..=100)
+                                        .text("Quality"),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label("Longest side");
+                                for (label, value) in
+                                    [("Original", 0u32), ("1024", 1024), ("2048", 2048), ("4096", 4096)]
+                                {
+                                    ui.selectable_value(&mut self.export_opts.max_dim, value, label);
+                                }
+                            });
+                            if let Some(proc) = self.processor.as_ref() {
+                                if let Some((w, h)) = proc.export_size(&self.export_opts) {
+                                    let cropped = proc
+                                        .image_size
+                                        .is_some_and(|size| !processor::is_full_crop(proc.crop, size));
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{w} × {h} px{}",
+                                            if cropped { " · cropped" } else { "" }
+                                        ))
+                                        .small()
+                                        .color(egui::Color32::from_gray(150)),
+                                    );
+                                }
+                            }
+                            ui.add_space(4.0);
+                            let has_image =
+                                self.processor.as_ref().is_some_and(Processor::has_image);
+                            ui.horizontal_wrapped(|ui| {
+                                if ui
+                                    .add_enabled(has_image, egui::Button::new("Export this image…"))
+                                    .clicked()
+                                {
+                                    let stem = self
+                                        .current_path
+                                        .as_ref()
+                                        .and_then(|p| p.file_stem())
+                                        .and_then(|s| s.to_str())
+                                        .unwrap_or("output")
+                                        .to_owned();
+                                    export_path = rfd::FileDialog::new()
+                                        .add_filter(
+                                            self.export_opts.format.label(),
+                                            &[self.export_opts.format.extension()],
+                                        )
+                                        .set_file_name(format!(
+                                            "{stem}.{}",
+                                            self.export_opts.format.extension()
+                                        ))
+                                        .save_file();
+                                }
+                                let label = if picks.is_empty() {
+                                    format!("Export {} visible…", batch_paths.len())
+                                } else {
+                                    format!("Export {} picked…", batch_paths.len())
+                                };
+                                if ui
+                                    .add_enabled(!batch_paths.is_empty(), egui::Button::new(label))
+                                    .clicked()
+                                {
+                                    if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                                        batch = Some((batch_paths.clone(), dir));
+                                    }
+                                }
+                                if ui.button("Close").clicked() {
+                                    close = true;
+                                }
+                            });
+                            if let Some((done, total)) = self.export_progress {
+                                ui.label(format!("Exporting {done} of {total}…"));
+                            }
+                        });
+                    if let Some(path) = export_path {
+                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_EXPORT_PATH), path));
+                        close = true;
+                    }
+                    if let Some((paths, dir)) = batch {
+                        // Driven one image per frame so the window stays live.
+                        self.export_progress = Some((0, paths.len()));
+                        self.export_dir = Some(dir);
+                        self.export_queue = paths;
+                        close = true;
+                    }
+                    if close {
+                        self.show_export = false;
+                    }
+                }
                 if !ctx.wants_keyboard_input() {
                     // Undo/redo. `command` is Cmd on macOS and Ctrl elsewhere,
                     // so both the platform conventions work; Ctrl+Y redoes for
@@ -1960,6 +2212,10 @@ impl App {
                     }
                     if redo {
                         ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_REDO), true));
+                    }
+                    if ctx.input(|i| (i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::E))
+                    {
+                        ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_SHOW_EXPORT), true));
                     }
                     let (left, right, up, down, enter, space) = ctx.input(|i| {
                         (
@@ -2337,7 +2593,7 @@ fn main() {
 mod tests {
     use super::{
         load_bool_pref, load_edits, load_look, look_reference_thumb, move_file, save_bool_pref,
-        Histories, ImageHistory, HISTORY_IMAGES, HISTORY_STEPS,
+        ExportFormat, ExportOptions, Histories, ImageHistory, HISTORY_IMAGES, HISTORY_STEPS,
         save_edits, save_f32_pref, save_look, save_pref, saved_window, BrowseFilter, BrowseSort,
         CapturedLook, SavedUi, DEFAULT_WINDOW, UI_FILTER_KEY, UI_MIN_RATING_KEY, UI_WINDOW_H_KEY,
         UI_WINDOW_W_KEY,
@@ -2460,6 +2716,11 @@ mod tests {
             filter: BrowseFilter::Picks,
             sort: BrowseSort::CaptureTime,
             min_rating: 4,
+            export: ExportOptions {
+                format: ExportFormat::Jpeg,
+                quality: 72,
+                max_dim: 2048,
+            },
         };
         saved.save(Some(&conn));
         assert_eq!(SavedUi::load(Some(&conn)), saved);
@@ -2589,6 +2850,27 @@ mod tests {
             histories.entry(&other);
         }
         assert!(histories.images.len() <= HISTORY_IMAGES);
+    }
+
+    // The export size is the crop, then the size limit -- both of which the
+    // dialog reports before anything is written.
+    #[test]
+    fn export_sizes_shrink_to_the_limit_and_keep_the_aspect() {
+        assert_eq!(super::processor::fit_within(6000, 4000, 0), (6000, 4000));
+        assert_eq!(super::processor::fit_within(6000, 4000, 2048), (2048, 1365));
+        assert_eq!(super::processor::fit_within(4000, 6000, 3000), (2000, 3000));
+        assert_eq!(super::processor::fit_within(800, 600, 2048), (800, 600));
+        assert_eq!(super::processor::fit_within(3000, 2000, 1000), (1000, 667));
+        // Never zero, however extreme the ratio.
+        assert_eq!(super::processor::fit_within(100000, 1, 1), (1, 1));
+    }
+
+    #[test]
+    fn export_format_keys_round_trip() {
+        for format in [ExportFormat::Png16, ExportFormat::Jpeg] {
+            assert_eq!(ExportFormat::from_key(format.key()), format);
+        }
+        assert_eq!(ExportFormat::from_key("nonsense"), ExportFormat::Png16);
     }
 
     #[test]
