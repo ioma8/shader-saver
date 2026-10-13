@@ -52,6 +52,11 @@ images.
   at the size the dialog reports. Picks (or the whole folder view) go out to a
   folder in one pass, one image per frame, each rendered from its own saved
   edits
+- **Print** — `Print…` beside Export: printer, the printer's own paper sizes,
+  orientation, quality, copies, fit-to-page, and a preview of the sheet with
+  the crop on it. Sends the crop through CUPS (`lp`) rather than the system
+  sheet, so no AppKit session under the event loop. See
+  [Printing](docs/print.md)
 - **Persistent edits** — every image's edit state is saved to SQLite
   (`~/.image-processor/edits.db`) and restored when reopened;
   Reset All Edits reverts to defaults
@@ -89,7 +94,7 @@ cargo run --release -- ~/Pictures    # browse a folder
 - 1–5: rate · 0: clear rating · P: pick · X: reject · 6–9: color label
 - Left/Right: previous/next image · Enter (Browse): open selected
 - ⌘/Ctrl+Z: undo · ⌘/Ctrl+Shift+Z (or Ctrl+Y): redo — per image, in memory
-- ⌘/Ctrl+E: export — [details](docs/undo-and-export.md)
+- ⌘/Ctrl+E: export — [details](docs/undo-and-export.md); `Print…` prints the crop
 - Double-click a slider: reset it
 - Crop: `⛶ Crop` in the right panel arms the crop tool; drag the corners or
   edges, or inside to move it — [details](docs/crop.md)

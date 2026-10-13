@@ -26,6 +26,7 @@ pub(crate) struct UiRequests {
     pub undo: bool,
     pub redo: bool,
     pub show_export: bool,
+    pub show_print: bool,
     /// A dab to place: `[x, y, radius]`, all normalised to the image.
     pub retouch: Option<[f32; 3]>,
     /// Index of the dab to remove.
@@ -57,6 +58,7 @@ pub(crate) fn take_requests(ctx: &egui::Context) -> UiRequests {
         similar_cull: take::<bool>(ctx, KEY_SIMILAR_CULL).is_some(),
         undo: take::<bool>(ctx, KEY_UNDO).is_some(),
         show_export: take::<bool>(ctx, KEY_SHOW_EXPORT).is_some(),
+        show_print: take::<bool>(ctx, KEY_SHOW_PRINT).is_some(),
         redo: take::<bool>(ctx, KEY_REDO).is_some(),
         retouch: take(ctx, KEY_RETOUCH),
         retouch_remove: take(ctx, KEY_RETOUCH_REMOVE),
@@ -881,6 +883,252 @@ fn crop_handle(rect: egui::Rect, p: egui::Pos2, reach: f32) -> Option<u8> {
         sides |= 8;
     }
     Some(sides)
+}
+
+/// The print dialog: what to send, and a preview of the sheet.
+///
+/// The sheet is drawn to the chosen paper's shape with the crop placed on it,
+/// because the two things that go wrong in printing are the wrong paper and an
+/// image that does not fit it. The command itself lives in `print.rs`.
+pub(crate) fn print_dialog(ctx: &egui::Context, app: &mut App) {
+    if !app.show_print {
+        return;
+    }
+    let mut close = false;
+    egui::Window::new("Print")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_min_width(360.0);
+
+            // Printer. CUPS names them; `None` is its own default.
+            let mut chosen_printer = None;
+            ui.horizontal(|ui| {
+                ui.label("Printer");
+                let selected = app
+                    .print_printer
+                    .clone()
+                    .unwrap_or_else(|| "System default".to_owned());
+                egui::ComboBox::from_id_salt("print-printer")
+                    .selected_text(selected)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(app.print_printer.is_none(), "System default")
+                            .clicked()
+                        {
+                            chosen_printer = Some(None);
+                        }
+                        for name in &app.print_printers {
+                            let picked = app.print_printer.as_deref() == Some(name.as_str());
+                            if ui.selectable_label(picked, name).clicked() {
+                                chosen_printer = Some(Some(name.clone()));
+                            }
+                        }
+                    });
+            });
+            if let Some(printer) = chosen_printer {
+                app.print_printer = printer;
+                // Paper belongs to the printer, so the list is fetched again.
+                app.print_papers = print::papers_for(app.print_printer.as_deref());
+                app.print_opts.paper = 0;
+                app.print_status = None;
+            }
+            if app.print_printers.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No printers reported — the system default will be used",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(150)),
+                );
+            }
+
+            // Paper, from the printer's own list.
+            let mut chosen_paper = None;
+            ui.horizontal(|ui| {
+                ui.label("Paper");
+                let selected = app
+                    .print_papers
+                    .get(app.print_opts.paper)
+                    .map(|paper| paper.label.clone())
+                    .unwrap_or_else(|| "Printer default".to_owned());
+                egui::ComboBox::from_id_salt("print-paper")
+                    .selected_text(selected)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for (index, paper) in app.print_papers.iter().enumerate() {
+                            if ui
+                                .selectable_label(app.print_opts.paper == index, &paper.label)
+                                .clicked()
+                            {
+                                chosen_paper = Some(index);
+                            }
+                        }
+                    });
+            });
+            if let Some(index) = chosen_paper {
+                app.print_opts.paper = index;
+            }
+
+            ui.horizontal(|ui| {
+                ui.label("Orientation");
+                for orientation in [
+                    print::Orientation::Printer,
+                    print::Orientation::Portrait,
+                    print::Orientation::Landscape,
+                ] {
+                    ui.selectable_value(
+                        &mut app.print_opts.orientation,
+                        orientation,
+                        orientation.label(),
+                    );
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Quality");
+                for quality in [print::Quality::Draft, print::Quality::Normal, print::Quality::High]
+                {
+                    ui.selectable_value(&mut app.print_opts.quality, quality, quality.label());
+                }
+                ui.add(
+                    egui::DragValue::new(&mut app.print_opts.copies)
+                        .range(1..=99)
+                        .prefix("× "),
+                );
+            });
+            ui.checkbox(&mut app.print_opts.fit_to_page, "Fit to page");
+
+            ui.separator();
+
+            // What will be sent, and on what.
+            let paper = app
+                .print_papers
+                .get(app.print_opts.paper)
+                .cloned()
+                .unwrap_or_else(print::Paper::printer_default);
+            let landscape = app.print_opts.orientation.landscape();
+            let (box_w, box_h) = print::page_box(&paper, landscape, print::PRINT_DPI);
+            let (send_w, send_h) = match app.processor.as_ref().and_then(|p| p.image_size) {
+                Some((w, h)) => {
+                    let crop = app
+                        .processor
+                        .as_ref()
+                        .map(|p| processor::crop_px(p.crop, (w, h)))
+                        .unwrap_or((0, 0, w, h));
+                    print::fit_inside(crop.2, crop.3, (box_w, box_h))
+                }
+                None => (1, 1),
+            };
+
+            let (sheet_area, _) =
+                ui.allocate_exact_size(egui::vec2(220.0, 170.0), egui::Sense::hover());
+            let scale = (190.0 / box_w as f32).min(160.0 / box_h as f32);
+            let sheet = egui::Rect::from_center_size(
+                sheet_area.center(),
+                egui::vec2(box_w as f32 * scale, box_h as f32 * scale),
+            );
+            let painter = ui.painter();
+            painter.rect_filled(sheet, 1.0, egui::Color32::WHITE);
+            // The image on the sheet: the crop, drawn from the same texture the
+            // panel shows, so the preview is the actual photograph.
+            let image = egui::Rect::from_center_size(
+                sheet.center(),
+                egui::vec2(
+                    send_w as f32 / box_w as f32 * sheet.width(),
+                    send_h as f32 / box_h as f32 * sheet.height(),
+                ),
+            );
+            match app.image_tex_id {
+                Some(texture) => {
+                    let uv = match app.processor.as_ref().and_then(|p| p.image_size) {
+                        Some((w, h)) => {
+                            let crop = app
+                                .processor
+                                .as_ref()
+                                .map(|p| processor::crop_px(p.crop, (w, h)))
+                                .unwrap_or((0, 0, w, h));
+                            processor::crop_fractions(crop, (w, h))
+                        }
+                        None => [0.0, 0.0, 1.0, 1.0],
+                    };
+                    painter.image(
+                        texture,
+                        image,
+                        egui::Rect::from_min_max(
+                            egui::pos2(uv[0], uv[1]),
+                            egui::pos2(uv[0] + uv[2], uv[1] + uv[3]),
+                        ),
+                        egui::Color32::WHITE,
+                    );
+                }
+                None => {
+                    painter.rect_filled(image, 0.0, egui::Color32::from_gray(70));
+                }
+            }
+            painter.rect_stroke(
+                sheet,
+                1.0,
+                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90)),
+            );
+
+            ui.label(
+                egui::RichText::new(format!(
+                    "Sending {send_w} × {send_h} px · {} · {}",
+                    paper.label,
+                    app.print_opts.orientation.label()
+                ))
+                .small()
+                .color(egui::Color32::from_gray(150)),
+            );
+            if paper.mm.is_none() {
+                // Some of a printer's entries carry no size we can read (its
+                // own custom-size placeholder, say), so do not pretend to know
+                // what sheet that is.
+                ui.label(
+                    egui::RichText::new("size not recognised — the printer decides the sheet")
+                        .small()
+                        .color(egui::Color32::from_gray(130)),
+                );
+            } else if send_w < box_w && send_h < box_h {
+                ui.label(
+                    egui::RichText::new("smaller than the page: the printer scales it up")
+                        .small()
+                        .color(egui::Color32::from_gray(130)),
+                );
+            }
+
+            if let Some((message, failed)) = &app.print_status {
+                ui.label(
+                    egui::RichText::new(message.as_str())
+                        .small()
+                        .color(if *failed {
+                            egui::Color32::from_rgb(230, 140, 130)
+                        } else {
+                            egui::Color32::from_rgb(150, 190, 240)
+                        }),
+                );
+            }
+
+            ui.horizontal(|ui| {
+                let ready = app.print_pending.is_none()
+                    && app.processor.as_ref().is_some_and(Processor::has_image);
+                if ui
+                    .add_enabled(ready, egui::Button::new("Print"))
+                    .on_hover_text("Print the crop on the chosen paper")
+                    .clicked()
+                {
+                    app.start_print();
+                }
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        });
+    if close {
+        app.show_print = false;
+    }
 }
 
 /// The crop tool's geometry for one frame.
@@ -1961,12 +2209,24 @@ pub(crate) fn edit(
 
                         ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                             ui.add_space(8.0);
-                            if ui.add_enabled(
-                                processor.has_image(),
-                                egui::Button::new("Export…").min_size(egui::vec2(228.0, 0.0)),
-                            ).clicked() {
-                                ctx.data_mut(|d| d.insert_temp(egui::Id::new(KEY_SHOW_EXPORT), true));
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(
+                                    processor.has_image(),
+                                    egui::Button::new("Export…").min_size(egui::vec2(110.0, 0.0)),
+                                ).clicked() {
+                                    ctx.data_mut(|d| {
+                                        d.insert_temp(egui::Id::new(KEY_SHOW_EXPORT), true)
+                                    });
+                                }
+                                if ui.add_enabled(
+                                    processor.has_image(),
+                                    egui::Button::new("Print…").min_size(egui::vec2(110.0, 0.0)),
+                                ).clicked() {
+                                    ctx.data_mut(|d| {
+                                        d.insert_temp(egui::Id::new(KEY_SHOW_PRINT), true)
+                                    });
+                                }
+                            });
                             if let Some((done, total)) = *export_progress {
                                 ui.label(
                                     egui::RichText::new(format!("Exporting {done} of {total}…"))

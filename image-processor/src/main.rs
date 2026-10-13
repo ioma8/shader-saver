@@ -10,6 +10,7 @@ mod imgload;
 mod judge;
 mod look_model;
 mod presets;
+mod print;
 mod processor;
 mod rate;
 mod raw_develop;
@@ -62,6 +63,7 @@ const UI_SORT_KEY: &str = "ui_browse_sort";
 const UI_MIN_RATING_KEY: &str = "ui_min_rating";
 const KEY_UNDO: &str = "undo_edit";
 const KEY_SHOW_EXPORT: &str = "show_export_dialog";
+const KEY_SHOW_PRINT: &str = "show_print_dialog";
 const KEY_REDO: &str = "redo_edit";
 // Undo history: how many steps an image keeps, how many images are remembered,
 // and how long a burst of changes (a slider drag, one change per frame) counts
@@ -69,6 +71,9 @@ const KEY_REDO: &str = "redo_edit";
 const HISTORY_STEPS: usize = 24;
 const HISTORY_IMAGES: usize = 8;
 const HISTORY_MERGE_SECS: f64 = 0.3;
+const UI_PRINT_ORIENTATION_KEY: &str = "ui_print_orientation";
+const UI_PRINT_QUALITY_KEY: &str = "ui_print_quality";
+const UI_PRINT_FIT_KEY: &str = "ui_print_fit";
 const UI_EXPORT_FORMAT_KEY: &str = "ui_export_format";
 const UI_EXPORT_QUALITY_KEY: &str = "ui_export_quality";
 const UI_EXPORT_MAX_KEY: &str = "ui_export_max_dim";
@@ -470,6 +475,7 @@ struct SavedUi {
     sort: BrowseSort,
     min_rating: u8,
     export: ExportOptions,
+    print: print::PrintOptions,
 }
 
 impl SavedUi {
@@ -487,6 +493,17 @@ impl SavedUi {
             min_rating: load_pref(db, UI_MIN_RATING_KEY)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            print: print::PrintOptions {
+                orientation: print::Orientation::from_key(
+                    &load_pref(db, UI_PRINT_ORIENTATION_KEY).unwrap_or_default(),
+                ),
+                quality: print::Quality::from_key(
+                    &load_pref(db, UI_PRINT_QUALITY_KEY).unwrap_or_default(),
+                ),
+                fit_to_page: load_bool_pref(db, UI_PRINT_FIT_KEY, true),
+                // The paper depends on the printer, so it is chosen each time.
+                ..print::PrintOptions::default()
+            },
             export: ExportOptions {
                 format: ExportFormat::from_key(
                     &load_pref(db, UI_EXPORT_FORMAT_KEY).unwrap_or_default(),
@@ -513,6 +530,9 @@ impl SavedUi {
         save_pref(db, UI_FILTER_KEY, self.filter.key());
         save_pref(db, UI_SORT_KEY, self.sort.key());
         save_pref(db, UI_MIN_RATING_KEY, &self.min_rating.to_string());
+        save_pref(db, UI_PRINT_ORIENTATION_KEY, self.print.orientation.key());
+        save_pref(db, UI_PRINT_QUALITY_KEY, self.print.quality.key());
+        save_bool_pref(db, UI_PRINT_FIT_KEY, self.print.fit_to_page);
         save_pref(db, UI_EXPORT_FORMAT_KEY, self.export.format.key());
         save_pref(db, UI_EXPORT_QUALITY_KEY, &self.export.quality.to_string());
         save_pref(db, UI_EXPORT_MAX_KEY, &self.export.max_dim.to_string());
@@ -528,6 +548,7 @@ impl Default for SavedUi {
             sort: BrowseSort::Name,
             min_rating: 0,
             export: ExportOptions::default(),
+            print: print::PrintOptions::default(),
         }
     }
 }
@@ -825,6 +846,16 @@ struct App {
     /// Signalled by the worker when a file is written. Only one export is ever
     /// in flight: each job holds the whole frame's readback.
     export_done: Option<std::sync::mpsc::Receiver<()>>,
+    // Print: the dialog, what CUPS said it has, and the last job's outcome.
+    show_print: bool,
+    print_opts: print::PrintOptions,
+    /// `None` means whatever CUPS has as its default.
+    print_printer: Option<String>,
+    print_printers: Vec<String>,
+    print_papers: Vec<print::Paper>,
+    print_pending: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// The last thing to report, and whether it went wrong.
+    print_status: Option<(String, bool)>,
 }
 
 impl App {
@@ -935,6 +966,7 @@ impl App {
             crop_aspect: 0,
             crop_drag: None,
             export_opts: saved_ui.export,
+            print_opts: saved_ui.print,
             saved_ui,
             history: Histories::default(),
             show_export: false,
@@ -942,6 +974,12 @@ impl App {
             export_dir: None,
             export_progress: None,
             export_done: None,
+            show_print: false,
+            print_printer: None,
+            print_printers: Vec::new(),
+            print_papers: Vec::new(),
+            print_pending: None,
+            print_status: None,
         }
     }
 }
@@ -1050,6 +1088,7 @@ impl ApplicationHandler for App {
             sort: self.sort,
             min_rating: self.min_rating,
             export: self.export_opts,
+            print: self.print_opts,
         };
         if ui != self.saved_ui {
             ui.save(self.db.as_ref());
@@ -1293,6 +1332,75 @@ impl App {
         self.load_edit_state(&path, state);
         self.rebind_image_textures();
         self.flags.output_dirty = true;
+    }
+
+    /// Open the print dialog, asking CUPS what it has first.
+    ///
+    /// `lpstat` and `lpoptions` are one-off queries, so they run here rather
+    /// than every frame. The paper list belongs to a printer, so it is fetched
+    /// per printer and the choice starts again at the printer's own default.
+    fn open_print_dialog(&mut self) {
+        let (printers, default) = print::available_printers();
+        self.print_printer = default.or_else(|| printers.first().cloned());
+        self.print_papers = print::papers_for(self.print_printer.as_deref());
+        self.print_printers = printers;
+        self.print_opts.paper = 0;
+        self.print_status = None;
+        self.show_print = true;
+    }
+
+    /// Render the crop and hand it to CUPS, on a thread: the render and encode
+    /// take a moment, and the outcome comes back through a channel so the
+    /// dialog can report what `lp` said.
+    fn start_print(&mut self) {
+        let Some(dir) = app_dir() else {
+            self.print_status = Some(("No place to write the print file".to_owned(), true));
+            return;
+        };
+        let Some((w, h)) = self.processor.as_ref().and_then(|p| p.image_size) else {
+            return;
+        };
+        let options = self.print_opts;
+        let paper = self
+            .print_papers
+            .get(options.paper)
+            .cloned()
+            .unwrap_or_else(print::Paper::printer_default);
+        // Render at most what the paper can use: this is a bound on the spool
+        // file, not a claim about the printed resolution -- the printer scales
+        // what it is given onto the page.
+        let box_px = print::page_box(&paper, options.orientation.landscape(), print::PRINT_DPI);
+        let (_, _, cw, ch) = self
+            .processor
+            .as_ref()
+            .map(|p| processor::crop_px(p.crop, (w, h)))
+            .unwrap_or((0, 0, w, h));
+        let (tw, th) = print::fit_inside(cw, ch, box_px);
+        let export = ExportOptions {
+            format: ExportFormat::Jpeg,
+            quality: 92,
+            max_dim: tw.max(th),
+        };
+        let path = dir.join("print.jpg");
+        let job = match (self.processor.as_ref(), self.gpu.as_ref()) {
+            (Some(proc), Some(gpu)) => {
+                proc.export_job(&path, &export, &gpu.device, &gpu.queue)
+            }
+            _ => None,
+        };
+        let Some(job) = job else {
+            self.print_status = Some(("Could not render the image".to_owned(), true));
+            return;
+        };
+        let printer = self.print_printer.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            job.write();
+            // Whatever CUPS says, including its own error text.
+            let _ = tx.send(print::send(printer.as_deref(), &options, &paper, &path));
+        });
+        self.print_pending = Some(rx);
+        self.print_status = Some(("Sending to the printer…".to_owned(), false));
     }
 
     /// A batch export is running: the processor is being driven through other
@@ -1821,6 +1929,9 @@ impl App {
         if requests.show_export {
             self.show_export = true;
         }
+        if requests.show_print {
+            self.open_print_dialog();
+        }
         if let Some(path) = requests.export_path {
             let options = self.export_opts;
             if let (Some(proc), Some(gpu)) = (&self.processor, &self.gpu) {
@@ -2059,6 +2170,15 @@ impl App {
             self.finish_similar_cull();
         }
         self.step_export_queue();
+        // Whatever `lp` had to say about the last job.
+        if let Some(pending) = self.print_pending.take() {
+            match pending.try_recv() {
+                Ok(Ok(said)) => self.print_status = Some((said, false)),
+                Ok(Err(why)) => self.print_status = Some((why, true)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.print_pending = Some(pending),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
         let mut visible: Vec<usize> = self
             .thumbs
             .iter()
@@ -2289,6 +2409,7 @@ impl App {
                         self.show_export = false;
                     }
                 }
+                ui::print_dialog(ctx, self);
                 if self.exporting() && !self.show_export {
                     // Say so: the processor is being driven through other
                     // images, and edits made now are deliberately not kept.
@@ -2715,7 +2836,7 @@ fn main() {
 mod tests {
     use super::{
         load_bool_pref, load_edits, load_look, look_reference_thumb, move_file, save_bool_pref,
-        export_targets, ExportFormat, ExportOptions, Histories, ImageHistory, HISTORY_IMAGES,
+        export_targets, print, ExportFormat, ExportOptions, Histories, ImageHistory, HISTORY_IMAGES,
         HISTORY_STEPS,
         save_edits, save_f32_pref, save_look, save_pref, saved_window, BrowseFilter, BrowseSort,
         CapturedLook, SavedUi, DEFAULT_WINDOW, UI_FILTER_KEY, UI_MIN_RATING_KEY, UI_WINDOW_H_KEY,
@@ -2844,6 +2965,13 @@ mod tests {
                 quality: 72,
                 max_dim: 2048,
             },
+            print: print::PrintOptions {
+                paper: 0,
+                orientation: print::Orientation::Landscape,
+                quality: print::Quality::High,
+                copies: 1,
+                fit_to_page: false,
+            },
         };
         saved.save(Some(&conn));
         assert_eq!(SavedUi::load(Some(&conn)), saved);
@@ -2855,6 +2983,14 @@ mod tests {
         };
         cleared.save(Some(&conn));
         assert_eq!(SavedUi::load(Some(&conn)), cleared);
+
+        // The paper is a per-printer choice, so it is deliberately not
+        // remembered: an index saved against one printer's list would name a
+        // different sheet on another's.
+        let mut with_paper = saved.clone();
+        with_paper.print.paper = 5;
+        with_paper.save(Some(&conn));
+        assert_eq!(SavedUi::load(Some(&conn)).print.paper, 0);
 
         // Garbage in the numeric rows is ignored, and an absurd window size is
         // refused.
