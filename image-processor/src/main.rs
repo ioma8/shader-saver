@@ -52,6 +52,15 @@ const KEY_RETOUCH: &str = "retouch_dab";
 const KEY_RETOUCH_REMOVE: &str = "retouch_remove";
 const KEY_RETOUCH_CLEAR: &str = "retouch_clear";
 const CULL_HELP_KEY: &str = "browse_cull_help_visible";
+// UI state that survives a restart (see `SavedUi`).
+const UI_DIR_KEY: &str = "ui_last_dir";
+const UI_ZOOM_FIT_KEY: &str = "ui_zoom_fit";
+const UI_FILTER_KEY: &str = "ui_browse_filter";
+const UI_SORT_KEY: &str = "ui_browse_sort";
+const UI_MIN_RATING_KEY: &str = "ui_min_rating";
+const UI_WINDOW_W_KEY: &str = "ui_window_width";
+const UI_WINDOW_H_KEY: &str = "ui_window_height";
+const DEFAULT_WINDOW: (f32, f32) = (1600.0, 1000.0);
 const RAW_DEFAULT_SHARPEN: f32 = 0.65;
 const RAW_DEFAULT_SHARPEN_RADIUS: f32 = 2.0;
 
@@ -263,27 +272,128 @@ fn load_look_input(path: &Path, max_dim: u32) -> Option<image::RgbaImage> {
     }
 }
 
-fn load_bool_pref(conn: &rusqlite::Connection, key: &str, default: bool) -> bool {
+/// Generic `app_kv` access. A missing or unparsable row always falls back to
+/// the caller's default, so a stale preference can never fail a launch.
+fn load_pref(conn: &rusqlite::Connection, key: &str) -> Option<String> {
     conn.query_row(
         "SELECT value FROM app_kv WHERE key = ?1",
         rusqlite::params![key],
         |row| row.get::<_, String>(0),
     )
     .ok()
-    .and_then(|v| match v.as_str() {
-        "0" => Some(false),
-        "1" => Some(true),
-        _ => None,
-    })
-    .unwrap_or(default)
 }
 
-fn save_bool_pref(conn: &rusqlite::Connection, key: &str, value: bool) {
+fn save_pref(conn: &rusqlite::Connection, key: &str, value: &str) {
     let _ = conn.execute(
         "INSERT INTO app_kv (key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        rusqlite::params![key, if value { "1" } else { "0" }],
+        rusqlite::params![key, value],
     );
+}
+
+fn load_bool_pref(conn: &rusqlite::Connection, key: &str, default: bool) -> bool {
+    load_pref(conn, key)
+        .and_then(|v| match v.as_str() {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => None,
+        })
+        .unwrap_or(default)
+}
+
+fn save_bool_pref(conn: &rusqlite::Connection, key: &str, value: bool) {
+    save_pref(conn, key, if value { "1" } else { "0" });
+}
+
+fn load_f32_pref(conn: &rusqlite::Connection, key: &str, default: f32) -> f32 {
+    load_pref(conn, key)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn save_f32_pref(conn: &rusqlite::Connection, key: &str, value: f32) {
+    save_pref(conn, key, &value.to_string());
+}
+
+/// The bits of UI state that survive a restart, gathered into one value so a
+/// single comparison each frame decides when to write them back -- mutating a
+/// filter somewhere deep in the browse view still gets saved, without every
+/// call site having to remember.
+#[derive(Clone, PartialEq, Debug)]
+struct SavedUi {
+    dir: Option<PathBuf>,
+    zoom_fit: bool,
+    filter: BrowseFilter,
+    sort: BrowseSort,
+    min_rating: u8,
+}
+
+impl SavedUi {
+    fn load(db: Option<&rusqlite::Connection>) -> Self {
+        let Some(db) = db else {
+            return Self::default();
+        };
+        Self {
+            dir: load_pref(db, UI_DIR_KEY)
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
+            zoom_fit: load_bool_pref(db, UI_ZOOM_FIT_KEY, true),
+            filter: BrowseFilter::from_key(&load_pref(db, UI_FILTER_KEY).unwrap_or_default()),
+            sort: BrowseSort::from_key(&load_pref(db, UI_SORT_KEY).unwrap_or_default()),
+            min_rating: load_pref(db, UI_MIN_RATING_KEY)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        }
+    }
+
+    fn save(&self, db: Option<&rusqlite::Connection>) {
+        let Some(db) = db else { return };
+        // A missing key clears the stored value rather than leaving a stale one.
+        match self.dir.as_deref().and_then(Path::to_str) {
+            Some(dir) => save_pref(db, UI_DIR_KEY, dir),
+            None => save_pref(db, UI_DIR_KEY, ""),
+        }
+        save_bool_pref(db, UI_ZOOM_FIT_KEY, self.zoom_fit);
+        save_pref(db, UI_FILTER_KEY, self.filter.key());
+        save_pref(db, UI_SORT_KEY, self.sort.key());
+        save_pref(db, UI_MIN_RATING_KEY, &self.min_rating.to_string());
+    }
+}
+
+impl Default for SavedUi {
+    fn default() -> Self {
+        Self {
+            dir: None,
+            zoom_fit: true,
+            filter: BrowseFilter::All,
+            sort: BrowseSort::Name,
+            min_rating: 0,
+        }
+    }
+}
+
+/// Window size, in logical points, as it was on the last clean exit.
+fn saved_window(db: Option<&rusqlite::Connection>) -> (f32, f32) {
+    let Some(db) = db else {
+        return DEFAULT_WINDOW;
+    };
+    let (w, h) = (
+        load_f32_pref(db, UI_WINDOW_W_KEY, DEFAULT_WINDOW.0),
+        load_f32_pref(db, UI_WINDOW_H_KEY, DEFAULT_WINDOW.1),
+    );
+    // Guard against a corrupt or absurd row making the window unusable.
+    if (400.0..=10000.0).contains(&w) && (300.0..=10000.0).contains(&h) {
+        (w, h)
+    } else {
+        DEFAULT_WINDOW
+    }
+}
+
+fn save_window(db: Option<&rusqlite::Connection>, w: f32, h: f32) {
+    if let Some(db) = db {
+        save_f32_pref(db, UI_WINDOW_W_KEY, w);
+        save_f32_pref(db, UI_WINDOW_H_KEY, h);
+    }
 }
 
 
@@ -293,7 +403,7 @@ enum View {
     Edit,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum BrowseFilter {
     All,
     Picks,
@@ -301,11 +411,47 @@ enum BrowseFilter {
     Unflagged,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+impl BrowseFilter {
+    fn key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Picks => "picks",
+            Self::Rejects => "rejects",
+            Self::Unflagged => "unflagged",
+        }
+    }
+    fn from_key(key: &str) -> Self {
+        match key {
+            "picks" => Self::Picks,
+            "rejects" => Self::Rejects,
+            "unflagged" => Self::Unflagged,
+            _ => Self::All,
+        }
+    }
+}
+
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum BrowseSort {
     Name,
     Date,
     CaptureTime,
+}
+
+impl BrowseSort {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Date => "date",
+            Self::CaptureTime => "capture_time",
+        }
+    }
+    fn from_key(key: &str) -> Self {
+        match key {
+            "date" => Self::Date,
+            "capture_time" => Self::CaptureTime,
+            _ => Self::Name,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -493,6 +639,9 @@ struct App {
     retouch_status: Option<(String, f64)>,
     // Two-step guard on "clear every dab".
     retouch_confirm_clear: bool,
+    // The UI state as it was last written to the database, so a change made
+    // anywhere can be detected in one comparison.
+    saved_ui: SavedUi,
 }
 
 impl App {
@@ -523,6 +672,7 @@ impl App {
             .as_deref()
             .map(look_model::load_examples)
             .unwrap_or_default();
+        let saved_ui = SavedUi::load(db.as_ref());
         let tags = db.as_ref().map(tags::load_all_tags).unwrap_or_default();
         let (classify_tx, classify_rx) = std::sync::mpsc::channel();
         let (rate_tx, rate_rx) = std::sync::mpsc::channel();
@@ -540,7 +690,7 @@ impl App {
             reference_tex: None,
             flags: AppFlags {
                 output_dirty: false,
-                zoom_fit: true,
+                zoom_fit: saved_ui.zoom_fit,
                 strip_scroll: false,
                 grid_scroll: false,
                 confirm_trash: false,
@@ -552,15 +702,15 @@ impl App {
             levels_drag: None,
             curve_drag: None,
             view: View::Browse,
-            browse_dir: None,
+            browse_dir: saved_ui.dir.clone(),
             thumbs: Vec::new(),
             thumb_rx: None,
             current_path: None,
             selected: None,
             meta,
-            filter: BrowseFilter::All,
-            min_rating: 0,
-            sort: BrowseSort::Name,
+            filter: saved_ui.filter,
+            min_rating: saved_ui.min_rating,
+            sort: saved_ui.sort,
             grid_cols: 1,
             tree_expanded,
             db,
@@ -597,15 +747,17 @@ impl App {
             brush_radius: 40.0,
             retouch_status: None,
             retouch_confirm_clear: false,
+            saved_ui,
         }
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let (width, height) = saved_window(self.db.as_ref());
         let attrs = Window::default_attributes()
             .with_title("Image Processor")
-            .with_inner_size(LogicalSize::new(1600.0, 1000.0))
+            .with_inner_size(LogicalSize::new(width, height))
             .with_min_inner_size(LogicalSize::new(900.0, 700.0));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
@@ -658,7 +810,13 @@ impl ApplicationHandler for App {
         }
 
         match &event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(window) = &self.window {
+                    let size = window.inner_size().to_logical::<f32>(window.scale_factor());
+                    save_window(self.db.as_ref(), size.width, size.height);
+                }
+                event_loop.exit()
+            }
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.physical_key == PhysicalKey::Code(KeyCode::Escape)
@@ -689,6 +847,19 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+        // Write the UI state back when it changes, rather than from every call
+        // site that can change it.
+        let ui = SavedUi {
+            dir: self.browse_dir.clone(),
+            zoom_fit: self.flags.zoom_fit,
+            filter: self.filter,
+            sort: self.sort,
+            min_rating: self.min_rating,
+        };
+        if ui != self.saved_ui {
+            ui.save(self.db.as_ref());
+            self.saved_ui = ui;
+        }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -974,7 +1145,8 @@ impl App {
             .unwrap_or_default();
 
         self.flags.output_dirty = true;
-        self.flags.zoom_fit = true;
+        // Whatever zoom mode was last used, not always fit.
+        self.flags.zoom_fit = self.saved_ui.zoom_fit;
         self.retouch_status = None;
         self.retouch_confirm_clear = false;
         self.view = View::Edit;
@@ -1948,8 +2120,11 @@ fn main() {
 mod tests {
     use super::{
         load_bool_pref, load_edits, load_look, look_reference_thumb, move_file, save_bool_pref,
-        save_edits, save_look, CapturedLook,
+        save_edits, save_f32_pref, save_look, save_pref, saved_window, BrowseFilter, BrowseSort,
+        CapturedLook, SavedUi, DEFAULT_WINDOW, UI_FILTER_KEY, UI_MIN_RATING_KEY, UI_WINDOW_H_KEY,
+        UI_WINDOW_W_KEY,
     };
+    use std::path::PathBuf;
     use crate::processor::{EditState, LookProfile};
 
     #[test]
@@ -2047,9 +2222,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // The UI state has to come back the way it was left, and a row that is
+    // missing or garbage must fall back to defaults rather than fail a launch.
     #[test]
-    fn bool_pref_roundtrip() {
+    fn ui_state_round_trips_and_survives_a_bad_row() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE app_kv (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        assert_eq!(SavedUi::load(Some(&conn)), SavedUi::default());
+
+        let saved = SavedUi {
+            dir: Some(PathBuf::from("/Users/someone/Pictures")),
+            zoom_fit: false,
+            filter: BrowseFilter::Picks,
+            sort: BrowseSort::CaptureTime,
+            min_rating: 4,
+        };
+        saved.save(Some(&conn));
+        assert_eq!(SavedUi::load(Some(&conn)), saved);
+
+        // A cleared directory stays cleared rather than resurrecting the old one.
+        let cleared = SavedUi {
+            dir: None,
+            ..saved
+        };
+        cleared.save(Some(&conn));
+        assert_eq!(SavedUi::load(Some(&conn)), cleared);
+
+        // Garbage in the numeric rows is ignored, and an absurd window size is
+        // refused.
+        save_pref(&conn, UI_MIN_RATING_KEY, "not a number");
+        save_pref(&conn, UI_FILTER_KEY, "nonsense");
+        assert_eq!(SavedUi::load(Some(&conn)).min_rating, 0);
+        assert_eq!(SavedUi::load(Some(&conn)).filter, BrowseFilter::All);
+        save_f32_pref(&conn, UI_WINDOW_W_KEY, -5.0);
+        assert_eq!(saved_window(Some(&conn)), DEFAULT_WINDOW);
+        save_f32_pref(&conn, UI_WINDOW_W_KEY, 1280.0);
+        save_f32_pref(&conn, UI_WINDOW_H_KEY, 800.0);
+        assert_eq!(saved_window(Some(&conn)), (1280.0, 800.0));
+        // No database at all is not an error.
+        assert_eq!(SavedUi::load(None), SavedUi::default());
+        assert_eq!(saved_window(None), DEFAULT_WINDOW);
+    }
+
+    #[test]
+    fn browse_filter_and_sort_keys_round_trip() {
+        for filter in [
+            BrowseFilter::All,
+            BrowseFilter::Picks,
+            BrowseFilter::Rejects,
+            BrowseFilter::Unflagged,
+        ] {
+            assert_eq!(BrowseFilter::from_key(filter.key()), filter);
+        }
+        for sort in [BrowseSort::Name, BrowseSort::Date, BrowseSort::CaptureTime] {
+            assert_eq!(BrowseSort::from_key(sort.key()), sort);
+        }
+    }
+
+    #[test]
+    fn bool_pref_roundtrip() {        let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE app_kv (
                 key   TEXT PRIMARY KEY,
